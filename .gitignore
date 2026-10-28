@@ -1,0 +1,42 @@
+# Research checkouts of the reference projects. Never committed.
+.refs/
+
+# Rust
+/target/
+# Second build dir, used when target/ is locked by a running instance.
+/target-verify/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build output
+/dist/
+/gen/
+# Packaging leftovers from a local run of .github/workflows/release.yml
+/shaiwin-*-win64/
+/shaiwin-*-win64.zip
+/SHA256SUMS.txt
+
+# Local state / scratch
+*.log
+*.tmp
+.vscode/
+.idea/
+.DS_Store
+
+# Design / testing / changelog notes produced while building this repo.
+# They are working records, not part of the product.
+/docs/
+
+# Assistant workspaces. Whatever an agent remembers about this machine belongs
+# on this machine; committing it would overwrite the next person's own notes.
+.workbuddy-ai/
+.qoder/
+.qoder-cn/
+.claude/
+.cursor/
+.workbuddy/
+AGENTS.md
+QODER.md
+CLAUDE.md
+MEMORY.md
+memory/

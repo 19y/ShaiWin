@@ -1,0 +1,171 @@
+name: Release
+
+# Push a version tag to publish a release:
+#   git tag v0.1.2 && git push origin v0.1.2
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.1.2"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Build & publish (windows-x64)
+    runs-on: windows-latest
+    env:
+      # Rust links the MSVC CRT dynamically by default, which makes the exe
+      # import VCRUNTIME140.dll. That file is not part of Windows -- it comes
+      # from the VC++ redistributable -- so a machine that has never installed a
+      # C++ program would fail to start this one. The README promises "no
+      # runtime needed", and static CRT is what makes that true.
+      RUSTFLAGS: -C target-feature=+crt-static
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # The flag above changes every fingerprint, so it belongs in the key:
+          # a cache built with the default flags would be restored and then
+          # thrown away, rebuilding everything on every run.
+          key: ${{ runner.os }}-cargo-release-static-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build -p shaiwin --release
+
+      # build.rs treats a missing resource compiler as a warning, because a
+      # build without an icon still runs. That is the right call for a developer
+      # laptop and the wrong one for a release: the zip would go out with the
+      # default Windows icon and nobody would notice until someone downloaded
+      # it. Two separate steps, so a failure in either one fails the run --
+      # GitHub's pwsh wrapper only checks the exit code of the last command.
+      - name: Check the exe wears the icon
+        run: node scripts/check-exe-icon.mjs target/release/shaiwin.exe assets/shaiwin.ico
+
+      - name: Check the icon group table
+        run: node scripts/check-exe-group.mjs target/release/shaiwin.exe assets/shaiwin.ico
+
+      # The import table is plain ASCII inside the binary, so this needs no PE
+      # parser. Without it, dropping the flag above would only be noticed by
+      # whoever downloaded the zip onto a machine with no C++ runtime.
+      - name: Check the exe carries its own runtime
+        shell: pwsh
+        run: |
+          $text = [System.Text.Encoding]::ASCII.GetString(
+            [System.IO.File]::ReadAllBytes("target/release/shaiwin.exe"))
+          if ($text.Contains("VCRUNTIME140.dll")) {
+            throw "the exe imports VCRUNTIME140.dll, so RUSTFLAGS did not reach the build"
+          }
+          "no VC++ runtime import"
+
+      - name: Package
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          if (-not $tag) { throw "No tag to publish." }
+          $version = $tag.TrimStart("v")
+
+          $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($cargoVersion -ne $version) {
+            Write-Warning "Tag $tag does not match workspace version $cargoVersion"
+          }
+
+          $stage = "shaiwin-$version-win64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/shaiwin.exe $stage/
+          Copy-Item LICENSE $stage/
+          Copy-Item README.md $stage/
+
+          $zip = "$stage.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -FilePath SHA256SUMS.txt -Encoding utf8 -NoNewline
+
+          "TAG=$tag"           | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZIP=$zip"           | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VERSION=$version"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Get-Item $zip | Select-Object Name, Length
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaiwin-${{ env.VERSION }}-win64
+          path: |
+            ${{ env.ZIP }}
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:TAG
+          $zip = $env:ZIP
+
+          $sha = (Get-Content SHA256SUMS.txt -Raw).Trim()
+          $body = (@(
+            'Windows 10 1809+ / 11 x64. Single executable, no installer, no admin rights needed.'
+            ''
+            'Download the zip, unzip it anywhere, run shaiwin.exe.'
+            'The clothesline at the top of the screen is the program: drag a window title bar up to it.'
+            ''
+            'SHA256:'
+            ''
+            '    ' + $sha
+            ''
+            'Licensed under the MIT License with the Commons Clause.'
+            'Use it for anything, including at work. Do not sell it.'
+            'See LICENSE in the zip.'
+          ) -join "`n")
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag $zip SHA256SUMS.txt `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "ShaiWin $tag" `
+              --notes $body
+          }

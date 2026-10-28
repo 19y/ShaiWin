@@ -1,0 +1,6 @@
+module CShaiWin {
+    // Relative to this file: platform/macos/Sources/CShaiWin/
+    header "../../../../include/shaiwin.h"
+    link "shaiwin"
+    export *
+}

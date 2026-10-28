@@ -1,0 +1,9 @@
+[package]
+name = "shaiwin-core"
+description = "Platform-agnostic model, layout, physics and hit testing for ShaiWin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
