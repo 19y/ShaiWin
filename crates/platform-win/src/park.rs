@@ -18,14 +18,17 @@
 //! to be parked" and startup recovery simply puts it back where it was.
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED,
+};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowPlacement, IsIconic, IsWindow, IsZoomed, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SetWindowPlacement, SetWindowPos, ShowWindow,
-    WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
+    SetWindowPlacement, SetWindowPos, ShowWindow, HWND_TOP, WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,
 };
 
 use crate::window;
@@ -217,7 +220,25 @@ pub fn execute(hwnd: HWND, plan: &ParkPlan) -> Result<Parked, ParkError> {
             return Err(ParkError::Gone);
         }
         if plan.was_maximized {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            // A maximized window is not moved at all: SetWindowPos drops it out
+            // of the maximized state on the way, and what comes back is a window
+            // that Windows *reports* as maximized at the size of its normal
+            // rectangle - the "it opens twice, once small" the user sees.
+            // Minimizing is the one way to take it off screen without touching
+            // its state; the placement still says "maximized", so it comes back
+            // full screen. The compositor's minimize animation is disabled for
+            // the trip, so it simply disappears.
+            let animate = !transitions(hwnd, false);
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            if animate {
+                let _ = transitions(hwnd, true);
+            }
+            if IsIconic(hwnd).as_bool() {
+                let parked = Rect { left: ICONIC, top: ICONIC, right: ICONIC, bottom: ICONIC };
+                return Ok(Parked { placement: plan.placement, parked, was_maximized: true });
+            }
+            // Minimizing was refused (an elevated window refuses every call from
+            // here); the move below is what reports the refusal properly.
         }
         let target = plan.target;
         let moved = SetWindowPos(
@@ -314,29 +335,35 @@ pub fn restore(hwnd: HWND, parked: &Parked) -> bool {
         // out as well as on the way in.
         let mut placement = parked.placement;
         placement.show_cmd = visible_show_cmd(placement.flags, placement.show_cmd);
-        // SetWindowPlacement answers a minimized window with a minimized window:
-        // the show state it restores is the one in the record, not "un-minimize
-        // this". Un-minimize first, so the placement decides how it looks.
-        if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-        }
+        // One call sets the position, the size and the show state. Moving the
+        // window on screen first and then maximizing it showed the user the
+        // window twice: once at the size we put it, once at the size Windows
+        // made it. Let DWM's animation go too - even a correct maximize is
+        // animated on screen, and the whole point is that the window is simply
+        // there when the card comes down.
+        let animate = !transitions(hwnd, false);
         let applied = placement.apply(hwnd);
         // A window that is off screen (or busy) can ignore SetWindowPlacement.
         // Verify, then move it by hand: silently leaving it parked while the
         // card disappears would strand it.
-        if !at_target(hwnd, &placement) {
-            let target = placement.normal;
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                target.left,
-                target.top,
-                target.width(),
-                target.height(),
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-        }
         if !applied {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            if placement.show_cmd == SW_SHOWMAXIMIZED_CMD && !at_target(hwnd, &placement) {
+                let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+            } else if !at_target(hwnd, &placement) {
+                let target = placement.normal;
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    target.left,
+                    target.top,
+                    target.width(),
+                    target.height(),
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         // The last resort for a window that refused both: put it where a monitor
@@ -354,9 +381,80 @@ pub fn restore(hwnd: HWND, parked: &Parked) -> bool {
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         }
+        // Raise it above the other windows before asking for the focus. The
+        // focus can be refused (Windows only hands it to the foreground process)
+        // but the z-order cannot, so the worst case is a window the user can see
+        // and click, instead of nothing at all.
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         window::force_foreground(hwnd);
+        if animate {
+            let _ = transitions(hwnd, true);
+        }
         at_target(hwnd, &placement) && !IsIconic(hwnd).as_bool() && window::on_screen(hwnd)
     }
+}
+
+/// Turns DWM's window transitions on or off for one window, and says whether it
+/// was on to begin with.
+///
+/// A restored window has to arrive in one step. Every show-state change is
+/// animated by the compositor otherwise: a maximize grows out of the old
+/// rectangle, a restore fades in - and on a window coming back from the line
+/// that animation *is* the "it opened twice" the user sees, because the frame
+/// before the animation still shows the window at its old size.
+fn transitions(hwnd: HWND, on: bool) -> bool {
+    unsafe {
+        let mut current = 0u32;
+        let size = std::mem::size_of::<u32>() as u32;
+        // Read first. If the window has no DWM attributes at all there is
+        // nothing to restore later, so it is left untouched rather than left
+        // without animations for the rest of its life.
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &mut current as *mut u32 as *mut core::ffi::c_void,
+            size,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let was_on = current == 0;
+        let value: u32 = u32::from(!on);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &value as *const u32 as *const core::ffi::c_void,
+            size,
+        );
+        was_on
+    }
+}
+
+/// The window's size, cut down to `work` if it does not fit, centred in it.
+///
+/// Used for windows that were hung up by dragging them onto the line: the drag
+/// says "put it away for now", so the window comes back in the middle of the
+/// screen it was hung from rather than wherever it happened to sit before.
+pub fn centre_in(rect: Rect, work: Rect) -> Rect {
+    let width = rect.width().min(work.width().max(1));
+    let height = rect.height().min(work.height().max(1));
+    let x = work.left + (work.width() - width) / 2;
+    let y = work.top + (work.height() - height) / 2;
+    Rect { left: x, top: y, right: x + width, bottom: y + height }
+}
+
+/// The record moved to the middle of `work`, keeping its size and its show
+/// state. A window that was maximized has no meaningful centre: applying the
+/// normal rectangle would bring it back as a window in the middle instead of
+/// full screen, so the record is left exactly as it was.
+pub fn centred_on(parked: &Parked, work: Rect) -> Parked {
+    let mut next = *parked;
+    if next.placement.show_cmd == SW_SHOWMAXIMIZED_CMD {
+        return next;
+    }
+    next.placement.normal = centre_in(next.placement.normal, work);
+    next
 }
 
 /// Quietly leaves a parked window minimized.
@@ -431,9 +529,11 @@ fn on_screen_spot(target: Rect, hwnd: HWND) -> Rect {
 /// restored window look like it came back somewhere else.
 fn at_target(hwnd: HWND, placement: &Placement) -> bool {
     unsafe {
-        if placement.show_cmd == 3 {
-            // SW_SHOWMAXIMIZED: the normal rect is not where it is drawn.
-            return IsZoomed(hwnd).as_bool();
+        if placement.show_cmd == SW_SHOWMAXIMIZED_CMD {
+            // `IsZoomed` alone is not enough: a window that was moved while it
+            // was maximized comes back flagged as zoomed while Windows draws it
+            // at its normal size. It has to actually fill the monitor.
+            return IsZoomed(hwnd).as_bool() && fills_monitor(hwnd);
         }
         match window::rect_of(hwnd) {
             Some(now) => {
@@ -442,6 +542,16 @@ fn at_target(hwnd: HWND, placement: &Placement) -> bool {
             None => false,
         }
     }
+}
+
+/// Whether the window is drawn across the work area of the monitor it is on.
+fn fills_monitor(hwnd: HWND) -> bool {
+    let Some(now) = window::rect_of(hwnd) else { return false };
+    let work = work_area(hwnd);
+    // A maximized window's frame extends a few pixels past the work area for the
+    // resize border, so the comparison is allowed to be generous in that
+    // direction and not at all in the other.
+    now.width() >= work.width() - 16 && now.height() >= work.height() - 16
 }
 
 /// The monitor's work area, which the overlay must respect (taskbar).
@@ -453,6 +563,28 @@ pub fn work_area(hwnd: HWND) -> Rect {
             Rect { left: info.rcWork.left, top: info.rcWork.top, right: info.rcWork.right, bottom: info.rcWork.bottom }
         } else {
             virtual_bounds()
+        }
+    }
+}
+
+/// Whether the record brings the window back maximized.
+pub fn opens_maximized(placement: &Placement) -> bool {
+    visible_show_cmd(placement.flags, placement.show_cmd) == SW_SHOWMAXIMIZED_CMD
+}
+
+/// Where a maximized window is drawn when its normal rect lives on `monitor`:
+/// the monitor's work area. Used for the ghost of a maximized card, which has
+/// to fly to the size the window will really have - flying to the normal rect
+/// is what made a maximized window look like it opened small first.
+pub fn maximized_rect(normal: Rect) -> Rect {
+    unsafe {
+        let rect = RECT { left: normal.left, top: normal.top, right: normal.right, bottom: normal.bottom };
+        let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            Rect { left: info.rcWork.left, top: info.rcWork.top, right: info.rcWork.right, bottom: info.rcWork.bottom }
+        } else {
+            normal
         }
     }
 }
@@ -514,6 +646,50 @@ mod tests {
         assert_ne!(stowed.flags & WPF_RESTORETOMAXIMIZED, 0);
         // An ordinary window must not come back maximized.
         assert_eq!(minimized_placement(&record).flags & WPF_RESTORETOMAXIMIZED, 0);
+    }
+
+    #[test]
+    fn a_centred_record_keeps_its_size_and_lands_in_the_middle() {
+        let record = Parked {
+            placement: Placement {
+                flags: 0,
+                show_cmd: 1,
+                min_x: -1,
+                min_y: -1,
+                max_x: -2,
+                max_y: -2,
+                normal: Rect { left: 100, top: 200, right: 900, bottom: 800 },
+            },
+            parked: Rect { left: 2624, top: 20, right: 3424, bottom: 620 },
+            was_maximized: false,
+        };
+        let work = Rect { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let centred = centred_on(&record, work);
+        assert_eq!(centred.placement.normal, Rect { left: 560, top: 220, right: 1360, bottom: 820 });
+        // The place it is parked while hidden does not move.
+        assert_eq!(centred.parked, record.parked);
+        assert_eq!(centred.placement.show_cmd, record.placement.show_cmd);
+    }
+
+    #[test]
+    fn a_window_bigger_than_the_work_area_is_cut_down_to_fit() {
+        let work = Rect { left: 100, top: 0, right: 900, bottom: 700 };
+        let big = Rect { left: 0, top: 0, right: 1600, bottom: 1200 };
+        assert_eq!(centre_in(big, work), work);
+    }
+
+    #[test]
+    fn a_maximized_record_is_not_centred() {
+        // Maximized has no centre: changing the normal rect would make the
+        // window come back as a box in the middle of the screen.
+        let normal = Rect { left: 10, top: 20, right: 810, bottom: 620 };
+        let record = Parked {
+            placement: Placement { flags: 0, show_cmd: 3, min_x: -1, min_y: -1, max_x: -2, max_y: -2, normal },
+            parked: Rect { left: 2624, top: 20, right: 3424, bottom: 620 },
+            was_maximized: true,
+        };
+        let work = Rect { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(centred_on(&record, work).placement.normal, normal);
     }
 
     #[test]

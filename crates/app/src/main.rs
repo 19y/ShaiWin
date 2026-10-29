@@ -15,6 +15,7 @@ mod log;
 mod render;
 mod settings;
 mod settings_ui;
+mod text;
 mod tray;
 mod worker;
 

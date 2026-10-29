@@ -42,6 +42,11 @@ use crate::{ico, settings_ui, tray};
 const CLASS: PCWSTR = w!("ShaiWin.Line");
 const TIMER_FRAME: usize = 1;
 const TIMER_POLL: usize = 2;
+/// Frame intervals, in milliseconds. The fast one is what smoothness wants; the
+/// slower ones are what a frame that costs more than its slot can afford.
+const FRAME_MS: u32 = 16;
+const FRAME_MS_HALF: u32 = 33;
+const FRAME_MS_SLOW: u32 = 50;
 const HOTKEY_HANG: i32 = 1;
 const HOTKEY_TOGGLE: i32 = 2;
 
@@ -70,6 +75,24 @@ const WM_UNHOOK_HWND: u32 = WM_APP + 14;
 /// The sentinel hit rectangle for the "show the line" pill (see `peek`).
 pub const PEEK_ID: u64 = u64::MAX;
 
+/// Where a hang request came from, which decides where the window opens again.
+///
+/// A window dragged onto the line was put away by hand, and comes back in the
+/// middle of the screen the line is on. A window hung up by hotkey or from the
+/// tray is in the way rather than placed somewhere, so it goes back exactly
+/// where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HangSource {
+    Drag,
+    Command,
+}
+
+impl HangSource {
+    fn centred(self) -> bool {
+        matches!(self, HangSource::Drag)
+    }
+}
+
 /// How long the cursor rests at the top edge before the line comes down.
 const DWELL: Duration = Duration::from_millis(180);
 /// The same, while the line is empty. A little longer, so a cursor that merely
@@ -91,11 +114,13 @@ const REHANG_GRACE: Duration = Duration::from_millis(650);
 /// for a moment still brings it back.
 const PARK_FOREGROUND_GRACE: Duration = Duration::from_millis(1200);
 /// How often to retry handing the focus away from a parked window that took it
-/// from a hand-over and is still holding it.
+/// from a hand-over and is still holding it. Each attempt activates another
+/// window, and the shell repaints the taskbar for every activation, so there is
+/// exactly one retry and it is quick.
 const STUCK_RETRY: Duration = Duration::from_millis(300);
 /// How long to keep retrying before leaving the focus where it is. Showing the
 /// window instead would be the random card popping open again, which is worse.
-const STUCK_GIVE_UP: Duration = Duration::from_secs(3);
+const STUCK_GIVE_UP: Duration = Duration::from_millis(700);
 /// How long the little "show the line" pill stays when the pointer leaves it.
 const PEEK_AWAY: Duration = Duration::from_millis(500);
 const PEEK_LIFE: Duration = Duration::from_secs(6);
@@ -209,6 +234,9 @@ pub struct App {
     painter: Painter,
     worker: Worker,
     dib: Option<Dib>,
+    /// The frame being composed. Reused between frames: a fresh full-width
+    /// pixmap sixty times a second is a bill paid in proportion to the screen.
+    canvas: Option<Pixmap>,
 
     monitor: Monitor,
     layout: LineLayout,
@@ -229,6 +257,12 @@ pub struct App {
     anim_running: bool,
     dirty: bool,
     last_frame: Instant,
+    /// Smoothed cost of composing and presenting one frame, and the frame
+    /// interval that cost has earned. A machine that cannot afford 60 redraws a
+    /// second of a screen-wide layered window is better served by a calm 30 than
+    /// by a 60 Hz stutter that holds the whole desktop up with it.
+    frame_cost: f32,
+    frame_ms: u32,
 
     hover: Option<u64>,
     hits: Vec<(u64, WRect)>,
@@ -278,6 +312,9 @@ pub struct App {
     /// surface has to rescale one of them into a different-looking icon.
     window_icon: HICON,
     tray_icon: HICON,
+    /// Text last given to the shell. Sending an unchanged tooltip is a shell
+    /// round trip that redraws the notification area for nothing.
+    tray_tip: String,
     settings_wnd: HWND,
     last_poll: Instant,
     polls: u32,
@@ -351,11 +388,12 @@ impl App {
                 hwnd,
                 self_pid: std::process::id(),
                 self_elevated: window::self_elevated(),
-                painter: Painter::new(&load_font_bytes(), 0),
+                painter: Painter::new(),
                 settings,
                 line: Line::new(),
                 worker,
                 dib: None,
+                canvas: None,
                 monitor,
                 layout,
                 panel,
@@ -369,6 +407,8 @@ impl App {
                 anim_running: false,
                 dirty: true,
                 last_frame: Instant::now(),
+                frame_cost: 0.0,
+                frame_ms: FRAME_MS,
                 hover: None,
                 hits: Vec::new(),
                 click_through: true,
@@ -391,6 +431,7 @@ impl App {
                 recent_park: None,
                 window_icon,
                 tray_icon,
+                tray_tip: crate::i18n::tray_tip(0),
                 settings_wnd: HWND::default(),
                 last_poll: Instant::now(),
                 polls: 0,
@@ -411,7 +452,8 @@ impl App {
 
     fn start(&mut self) {
         if !self.tray_icon.is_invalid() {
-            tray::add(self.hwnd, self.tray_icon, &crate::i18n::tray_tip(0));
+            self.tray_tip = crate::i18n::tray_tip(0);
+            tray::add(self.hwnd, self.tray_icon, &self.tray_tip);
         }
         unsafe {
             if !self.window_icon.is_invalid() {
@@ -569,6 +611,7 @@ impl App {
                 placement: entry.placement,
                 parked: entry.parked,
                 window_rect: if entry.hooked_away { now } else { entry.placement.normal },
+                centred: entry.centred,
                 thumb: None,
                 thumb_version: 0,
                 icon,
@@ -579,10 +622,6 @@ impl App {
                 sway: Spring::new(0.0, 0.0, 0.0),
                 scale: 1.0,
                 scale_goal: 1.0,
-                flight: None,
-                ghost_from: entry.parked.parked,
-                ghost_to: entry.parked.parked,
-                ghost_angle: (0.0, 0.0),
                 anchor: entry.anchor,
                 leaving: false,
                 away: entry.hooked_away,
@@ -624,7 +663,7 @@ impl App {
                 match wp.0 as i32 {
                     HOTKEY_HANG => {
                         if let Some(hwnd) = window::foreground() {
-                            self.request_hang(window::raw_of(hwnd));
+                            self.request_hang(window::raw_of(hwnd), HangSource::Command);
                         }
                     }
                     HOTKEY_TOGGLE => self.toggle_reveal(),
@@ -635,7 +674,7 @@ impl App {
             WM_HANG_HWND => {
                 let raw = lp.0;
                 if raw != 0 {
-                    self.request_hang(raw);
+                    self.request_hang(raw, HangSource::Command);
                 }
                 LRESULT(0)
             }
@@ -814,7 +853,8 @@ impl App {
             }
             m if m == taskbar_created() => {
                 if !self.tray_icon.is_invalid() {
-                    tray::add(self.hwnd, self.tray_icon, &crate::i18n::tray_tip(self.line.live_count()));
+                    self.tray_tip = crate::i18n::tray_tip(self.line.live_count());
+                    tray::add(self.hwnd, self.tray_icon, &self.tray_tip);
                 }
                 LRESULT(0)
             }
@@ -888,7 +928,7 @@ impl App {
         match id {
             CMD_HANG => {
                 if let Some(hwnd) = window::foreground() {
-                    self.request_hang(window::raw_of(hwnd));
+                    self.request_hang(window::raw_of(hwnd), HangSource::Command);
                 }
             }
             CMD_TAKE_ALL => self.take_all(),
@@ -918,7 +958,7 @@ impl App {
 
     // MARK: Hanging a window
 
-    fn request_hang(&mut self, hwnd: isize) {
+    fn request_hang(&mut self, hwnd: isize, source: HangSource) {
         let h = window::hwnd_of(hwnd);
         let info = match window::check(h, self.self_pid) {
             Ok(info) => info,
@@ -939,17 +979,23 @@ impl App {
         // dead end the user cannot get out of.
         if let Some(id) = self.line.cards.iter().find(|c| c.hwnd == hwnd && c.away).map(|c| c.id) {
             crate::log!("hang {hwnd}: hooked window put back on the line");
-            self.rehang(id);
+            self.rehang(id, Some(source));
             return;
         }
         if self.line.contains_hwnd(hwnd) {
             self.complain(t("already_hung").to_string());
             return;
         }
-        self.worker.send(Job::Prepare { info });
+        self.worker.send(Job::Prepare { info, source });
     }
 
-    fn on_prepared(&mut self, info: WindowInfo, image: Option<shaiwin_platform_win::Image>, plan: Result<shaiwin_platform_win::park::ParkPlan, ParkError>) {
+    fn on_prepared(
+        &mut self,
+        info: WindowInfo,
+        image: Option<shaiwin_platform_win::Image>,
+        plan: Result<shaiwin_platform_win::park::ParkPlan, ParkError>,
+        source: HangSource,
+    ) {
         let plan = match plan {
             Ok(plan) => plan,
             Err(error) => {
@@ -971,7 +1017,6 @@ impl App {
         let id = self.line.next_id();
         let exe = info.exe.clone();
         let accent = accent_for(&exe);
-        let ghost_from = self.ghost_start(info.rect);
         let icon = self.icon_for(&exe).cloned();
         let thumb = image.and_then(|img| to_pixmap(&img));
 
@@ -987,6 +1032,7 @@ impl App {
             placement: plan.placement,
             parked: Parked { placement: plan.placement, parked: plan.target, was_maximized: plan.was_maximized },
             window_rect: info.rect,
+            centred: source.centred(),
             thumb,
             thumb_version: 1,
             icon,
@@ -997,10 +1043,6 @@ impl App {
             sway: Spring::new(0.0, 0.0, 0.0),
             scale: 1.0,
             scale_goal: 1.0,
-            flight: None,
-            ghost_from,
-            ghost_to: ghost_from,
-            ghost_angle: (-6.0, 0.0),
             anchor,
             leaving: false,
             away: false,
@@ -1041,37 +1083,16 @@ impl App {
         }
     }
 
-    fn ghost_start(&self, rect: WRect) -> WRect {
-        // Starting from the whole window would mean covering the desktop with a
-        // layered window for half a second. Capping the ghost keeps the effect
-        // and the cost reasonable.
-        let max_w = (self.monitor.bounds.width() as f32 * 0.55) as i32;
-        let max_h = (self.monitor.bounds.height() as f32 * 0.55) as i32;
-        let w = rect.width().min(max_w).max(160);
-        let h = rect.height().min(max_h).max(110);
-        let (cx, cy) = rect.center();
-        let bounds = self.monitor.bounds;
-        WRect {
-            left: (cx - w / 2).clamp(bounds.left, bounds.right - w),
-            top: (cy - h / 2).clamp(bounds.top, bounds.bottom - h),
-            right: (cx - w / 2).clamp(bounds.left, bounds.right - w) + w,
-            bottom: (cy - h / 2).clamp(bounds.top, bounds.bottom - h) + h,
-        }
-    }
-
     // MARK: Taking a window down
 
+    /// Puts the window back in the same frame as the click.
+    ///
+    /// There is no animation on the way down on purpose: anything between the
+    /// click and the window being in front reads as "the click did nothing",
+    /// and the card is gone by then, so the user has nothing left to click.
     fn take_down(&mut self, id: u64) {
-        // A line that is tucked away has no card to fly from: the ghost would
-        // start at a spot that is not on screen, and forcing the overlay up to
-        // draw it is the line showing itself when the user asked it to stay
-        // hidden. The window is restored right away instead.
-        let no_flight = self.settings.reduced_motion || !self.revealed;
-        if self.line.take_down(id, &self.layout, no_flight) {
-            self.invalidate();
-            if no_flight {
-                self.finish_take_down(id);
-            }
+        if self.line.take_down(id) {
+            self.finish_take_down(id);
         }
     }
 
@@ -1094,7 +1115,7 @@ impl App {
     fn finish_take_down(&mut self, id: u64) {
         let Some(card) = self.line.get(id) else { return };
         let hwnd = card.hwnd;
-        let parked = card.parked;
+        let parked = restore_record(card, self.monitor.work);
         let unhook = card.unhook;
         let before = window::rect_of(window::hwnd_of(hwnd));
         let ok = park::restore(window::hwnd_of(hwnd), &parked);
@@ -1106,7 +1127,7 @@ impl App {
         if !ok {
             // Keep the card: the window is still off screen, and hiding the
             // only way to get it back would strand it.
-            self.line.cancel_take_down(id, &self.layout);
+            self.line.cancel_take_down(id);
             self.complain(t("restore_failed").to_string());
             self.invalidate();
             return;
@@ -1177,8 +1198,13 @@ impl App {
     /// belongs. A window that refuses to minimize is put back instead: leaving it
     /// off screen with nothing pointing at it would strand it.
     fn stow_all_now(&mut self) {
-        let cards: Vec<(u64, isize, Parked, bool)> =
-            self.line.cards.iter().map(|c| (c.id, c.hwnd, c.parked, c.away)).collect();
+        let work = self.monitor.work;
+        let cards: Vec<(u64, isize, Parked, bool)> = self
+            .line
+            .cards
+            .iter()
+            .map(|c| (c.id, c.hwnd, restore_record(c, work), c.away))
+            .collect();
         for (id, hwnd, parked, away) in cards {
             if !away
                 && window::is_alive(hwnd)
@@ -1202,7 +1228,7 @@ impl App {
         }
         for reply in replies {
             match reply {
-                Reply::Prepared { info, image, plan } => self.on_prepared(info, image, plan),
+                Reply::Prepared { info, image, plan, source } => self.on_prepared(info, image, plan, source),
                 Reply::Snapshotted { id, image } => {
                     if let Some(card) = self.line.get_mut(id) {
                         if let Some(img) = image {
@@ -1307,10 +1333,17 @@ impl App {
             } else if now.duration_since(stuck.since) >= STUCK_GIVE_UP {
                 crate::log!("foreground: hwnd={} would not give up the focus; leaving it there", stuck.hwnd);
                 self.stuck_foreground = None;
-            } else if now.duration_since(stuck.last_try) >= STUCK_RETRY
-                && self.hand_focus_off(window::hwnd_of(stuck.hwnd), now)
-            {
-                crate::log!("foreground: handed the focus away from the parked hwnd={} on retry", stuck.hwnd);
+            } else if now.duration_since(stuck.last_try) >= STUCK_RETRY {
+                // Only hand it to a real window this time. Activating the
+                // desktop, or switching through candidates, repaints the
+                // taskbar for every step and that is the flicker the user sees.
+                if window::hand_off_foreground(window::hwnd_of(stuck.hwnd), self.self_pid) {
+                    self.last_foreground = window::foreground().map(window::raw_of).unwrap_or(0);
+                    self.stuck_foreground = None;
+                    crate::log!("foreground: handed the focus away from the parked hwnd={} on retry", stuck.hwnd);
+                } else {
+                    self.stuck_foreground = Some(StuckFocus { last_try: now, ..stuck });
+                }
             }
         }
 
@@ -1558,7 +1591,7 @@ impl App {
                         );
                     } else if on_line {
                         crate::log!("drag {:#x}: released on the line at y={cy}{where_}", watch.hwnd);
-                        self.request_hang(watch.hwnd);
+                        self.request_hang(watch.hwnd, HangSource::Drag);
                     } else {
                         crate::log!("drag {:#x}: released off the line at y={cy}{where_}", watch.hwnd);
                     }
@@ -1821,24 +1854,24 @@ impl App {
             .filter(|c| c.away || !park::parked_minimized(&c.parked))
             .filter(|c| window::is_alive(c.hwnd) && window::minimized(window::hwnd_of(c.hwnd)))
             .count();
-        let on_line: Vec<(u64, isize, u32, u64, Parked)> = self
+        let on_line: Vec<(u64, isize, u32, Parked)> = self
             .line
             .cards
             .iter()
             .filter(|c| !c.leaving && !c.away)
-            .map(|c| (c.id, c.hwnd, c.pid, c.process_start, c.parked))
+            .map(|c| (c.id, c.hwnd, c.pid, c.parked))
             .collect();
-        let away: Vec<(u64, isize, u32, u64, Option<Instant>)> = self
+        let away: Vec<(u64, isize, u32, Option<Instant>)> = self
             .line
             .cards
             .iter()
             .filter(|c| !c.leaving && c.away)
-            .map(|c| (c.id, c.hwnd, c.pid, c.process_start, c.away_at))
+            .map(|c| (c.id, c.hwnd, c.pid, c.away_at))
             .collect();
 
         let mut changed = false;
-        for (id, hwnd, pid, start, parked) in on_line {
-            if !window::still_same_window(hwnd, pid, start) {
+        for (id, hwnd, pid, parked) in on_line {
+            if !window::same_window(hwnd, pid) {
                 crate::log!("card {id}: window {hwnd} closed");
                 self.painter.forget(id);
                 self.line.remove(id);
@@ -1873,8 +1906,8 @@ impl App {
                 }
             }
         }
-        for (id, hwnd, pid, start, away_at) in away {
-            if !window::still_same_window(hwnd, pid, start) {
+        for (id, hwnd, pid, away_at) in away {
+            if !window::same_window(hwnd, pid) {
                 crate::log!("card {id}: hooked window {hwnd} closed");
                 self.painter.forget(id);
                 self.line.remove(id);
@@ -1884,7 +1917,7 @@ impl App {
             let h = window::hwnd_of(hwnd);
             let settled = away_at.is_none_or(|t| now.duration_since(t) >= REHANG_GRACE);
             if window::minimized(h) && iconic <= 1 && settled {
-                self.rehang(id);
+                self.rehang(id, None);
             }
         }
         if changed {
@@ -1939,7 +1972,14 @@ impl App {
     /// animate its card back onto the line. The old thumbnail is kept: the
     /// window has not been drawn on screen long enough for a fresh, reliable
     /// snapshot, and a black one would be worse.
-    fn rehang(&mut self, id: u64) {
+    /// Puts a hooked window back on the line, keeping its record.
+    ///
+    /// `source` is the request that asked for it, when a request did: hanging a
+    /// window again is a fresh decision about where it opens, so a window
+    /// dragged onto the line now comes back centred even if it was hooked by
+    /// hotkey before. `None` is the automatic re-hang when the user minimizes
+    /// the window, which is not a new choice and keeps the old one.
+    fn rehang(&mut self, id: u64, source: Option<HangSource>) {
         let Some(card) = self.line.get(id) else { return };
         if !card.away {
             return;
@@ -2000,6 +2040,9 @@ impl App {
             card.placement = placement;
             card.parked = parked;
             card.window_rect = before;
+            if let Some(source) = source {
+                card.centred = source.centred();
+            }
         }
         if self.line.rehang(id, &self.layout) {
             if park::parked_minimized(&parked) {
@@ -2220,7 +2263,7 @@ impl App {
         self.dirty = true;
         if !self.anim_running {
             unsafe {
-                SetTimer(Some(self.hwnd), TIMER_FRAME, 16, None);
+                SetTimer(Some(self.hwnd), TIMER_FRAME, self.frame_ms, None);
             }
             self.anim_running = true;
             self.last_frame = Instant::now();
@@ -2249,19 +2292,20 @@ impl App {
         }
 
         self.ensure_panel();
-        let flying = self.line.cards.iter().any(|c| c.flying());
         // The frame timer should only run while something is actually moving.
         // A line that is simply down is static: it is redrawn on demand (hover,
         // new thumbnails, polls) by `invalidate`, not sixty times a second.
-        let animating = self.line.animating() || flying || (self.slide - target).abs() > 0.0005;
+        let animating = self.line.animating() || (self.slide - target).abs() > 0.0005;
         let visible = self.slide > 0.001 || self.peek;
-        if visible || flying {
+        if visible {
             // The timer only runs while something is moving or a redraw was
             // asked for, so every tick paints. In particular the tick that
             // lands a flight has to paint the resting card: the frame before it
             // still showed the ghost, and skipping that tick left the ghost on
             // screen until some unrelated event asked again.
+            let started = Instant::now();
             self.redraw();
+            self.pace_frame(started.elapsed().as_secs_f32());
             self.set_shown(true);
         } else {
             self.set_shown(false);
@@ -2273,6 +2317,37 @@ impl App {
                 let _ = KillTimer(Some(self.hwnd), TIMER_FRAME);
             }
             self.anim_running = false;
+        }
+    }
+
+    /// Slows the frame timer when a frame costs more than its slot.
+    ///
+    /// Ten milliseconds of work cannot keep a sixteen-millisecond rhythm once
+    /// the timer and Windows' own delivery are counted, and a screen-wide
+    /// layered window uploaded faster than the machine can blend it holds up
+    /// every other window on the desktop. Half the frame rate costs a little
+    /// smoothness and gives the desktop back.
+    fn pace_frame(&mut self, cost: f32) {
+        self.frame_cost = if self.frame_cost <= 0.0 {
+            cost
+        } else {
+            self.frame_cost * 0.8 + cost * 0.2
+        };
+        let want = if self.frame_cost > 0.018 {
+            FRAME_MS_SLOW
+        } else if self.frame_cost > 0.009 {
+            FRAME_MS_HALF
+        } else {
+            FRAME_MS
+        };
+        if want == self.frame_ms {
+            return;
+        }
+        self.frame_ms = want;
+        if self.anim_running {
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_FRAME, want, None);
+            }
         }
     }
 
@@ -2347,9 +2422,7 @@ impl App {
         let s = self.layout.scale;
         let fit = self.line.fit(&self.layout);
         for card in &self.line.cards {
-            if let Some(ghost) = Line::ghost_rect(card) {
-                rect = union(rect, ghost);
-            } else {
+            if !card.away && !card.leaving {
                 // A card the user has made taller hangs below the strip. The
                 // panel only draws what fits in it, so it has to grow, or the
                 // bottom of the card would be cut off.
@@ -2391,20 +2464,22 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        let canvas = self.compose();
-        if let Some(canvas) = canvas {
-            if self.dump_request {
-                self.dump_request = false;
-                if let Some(dir) = &self.dump_dir {
-                    let _ = std::fs::create_dir_all(dir);
-                    self.dump_seq += 1;
-                    let path = dir.join(format!("frame-{}-{:02}.png", std::process::id(), self.dump_seq));
-                    let _ = canvas.save_png(&path);
-                    self.dump_hits(dir);
-                }
-            }
-            self.present(&canvas);
+        if !self.compose() {
+            return;
         }
+        if self.dump_request {
+            self.dump_request = false;
+            if let Some(dir) = &self.dump_dir {
+                let _ = std::fs::create_dir_all(dir);
+                self.dump_seq += 1;
+                let path = dir.join(format!("frame-{}-{:02}.png", std::process::id(), self.dump_seq));
+                if let Some(canvas) = self.canvas.as_ref() {
+                    let _ = canvas.save_png(&path);
+                }
+                self.dump_hits(dir);
+            }
+        }
+        self.present();
     }
 
     /// Debug aid for the regression tests: the clickable rectangles of the cards
@@ -2423,47 +2498,69 @@ impl App {
         let _ = std::fs::write(&path, text);
     }
 
-    fn compose(&mut self) -> Option<Pixmap> {
-        if self.peek && self.slide <= 0.001 {
-            return self.compose_peek();
+    /// Composes the frame into `self.canvas`. Returns false when the canvas
+    /// cannot be sized, which is a state that cannot last.
+    fn compose(&mut self) -> bool {
+        let w = self.panel.width().max(1) as u32;
+        let h = self.panel.height().max(1) as u32;
+        if self.canvas.as_ref().is_none_or(|c| c.width() != w || c.height() != h) {
+            let Some(canvas) = Pixmap::new(w, h) else { return false };
+            self.canvas = Some(canvas);
         }
-        let hot = self.band_hot && self.drag.is_some();
-        let hint: Option<String> = if self.line.live_count() == 0 {
-            Some(crate::i18n::empty_hint(&self.settings.hang_label()))
+        let Some(mut canvas) = self.canvas.take() else { return false };
+        let frame = if self.peek && self.slide <= 0.001 {
+            let hot = self.peek_hover;
+            self.painter.compose_peek_into(&mut canvas, &self.layout, hot)
         } else {
-            None
+            let hot = self.band_hot && self.drag.is_some();
+            let hint: Option<String> = if self.line.live_count() == 0 {
+                Some(crate::i18n::empty_hint(&self.settings.hang_label()))
+            } else {
+                None
+            };
+            let ui = Ui {
+                hover: self.hover,
+                y_off: (self.slide - 1.0) * self.layout.panel_height(),
+                hint: hint.as_deref(),
+                hot,
+            };
+            self.painter
+                .compose_into(&mut canvas, &self.line, &self.layout, &ui)
         };
-        let hint = hint.as_deref();
-        let App { painter, line, layout, origin, panel, hover, hits, slide, .. } = self;
-        let y_off = (*slide - 1.0) * layout.panel_height();
-        let ui = Ui { hover: *hover, y_off, hint, hot };
-        let size = (panel.width().max(1) as u32, panel.height().max(1) as u32);
-        let frame = painter.compose(line, layout, *origin, size, &ui)?;
-        *hits = frame.hits;
-        Some(frame.canvas)
-    }
-
-    fn compose_peek(&mut self) -> Option<Pixmap> {
-        let hot = self.peek_hover;
-        let size = (self.panel.width().max(1) as u32, self.panel.height().max(1) as u32);
-        let frame = self.painter.compose_peek(&self.layout, size, hot)?;
+        self.canvas = Some(canvas);
         self.hits = frame.hits;
-        Some(frame.canvas)
+        true
     }
 
-    fn present(&mut self, canvas: &Pixmap) {
+    fn present(&mut self) {
+        let Some(canvas) = self.canvas.as_ref() else { return };
         let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-        if self.dib.as_ref().is_none_or(|d| d.w != w || d.h != h) {
+        // Grow the DIB only when the frame no longer fits in it. A flight makes
+        // the panel grow and shrink with every frame; allocating the GDI bitmap
+        // each time is a cost the frame rate pays for no visible reason.
+        let reuse = self.dib.as_ref().is_some_and(|d| {
+            let area = (d.w * d.h) as i64;
+            let want = (w * h) as i64;
+            d.w >= w && d.h >= h && area <= want * 5 / 2
+        });
+        if !reuse {
             self.dib = Dib::new(w, h);
         }
         let Some(dib) = self.dib.as_ref() else { return };
+        let stride = (dib.w * 4) as usize;
+        let row = (w * 4) as usize;
         unsafe {
-            let dst = std::slice::from_raw_parts_mut(dib.bits, (w * h * 4) as usize);
-            for (out, px) in dst.chunks_exact_mut(4).zip(canvas.data().chunks_exact(4)) {
-                out[0] = px[2];
-                out[1] = px[1];
-                out[2] = px[0];
-                out[3] = px[3];
+            let dst = std::slice::from_raw_parts_mut(dib.bits, stride * dib.h as usize);
+            // tiny-skia speaks RGBA, the layered window wants BGRA. One 32-bit
+            // swap per pixel, a row at a time, because the DIB may be wider
+            // than this frame.
+            for (y, src) in canvas.data().chunks_exact(row).enumerate() {
+                let out = &mut dst[y * stride..y * stride + row];
+                for (to, from) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    let v = u32::from_ne_bytes([from[0], from[1], from[2], from[3]]);
+                    let swapped = (v & 0xFF00_FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+                    to.copy_from_slice(&swapped.to_ne_bytes());
+                }
             }
         }
         let origin = POINT { x: self.origin.0, y: self.origin.1 };
@@ -2660,7 +2757,14 @@ impl App {
     fn sync_journal(&mut self) {
         self.write_journal();
         if !self.tray_icon.is_invalid() {
-            tray::set_tip(self.hwnd, self.tray_icon, &crate::i18n::tray_tip(self.line.live_count()));
+            let tip = crate::i18n::tray_tip(self.line.live_count());
+            // The count is what the tip says, and it only changes on a hang or a
+            // take-down. Sending the same text again makes the shell redraw the
+            // notification area, which looks like the taskbar flickering.
+            if tip != self.tray_tip {
+                self.tray_tip = tip;
+                tray::set_tip(self.hwnd, &self.tray_tip);
+            }
         }
     }
 
@@ -2684,6 +2788,20 @@ impl App {
     }
 }
 
+/// The record a card's window comes back to.
+///
+/// A window that was dragged onto the line opens in the middle of the screen
+/// the line is on; a window hung up by hotkey or from the tray goes back
+/// exactly where it was. Both keep their size, and a maximized window is left
+/// alone: it comes back full screen either way.
+fn restore_record(card: &Card, work: WRect) -> Parked {
+    if card.centred {
+        park::centred_on(&card.parked, work)
+    } else {
+        card.parked
+    }
+}
+
 fn journal_entry(card: &Card) -> journal::Entry {
     journal::Entry {
         hwnd: card.hwnd,
@@ -2698,15 +2816,7 @@ fn journal_entry(card: &Card) -> journal::Entry {
         zoom: card.zoom,
         zoom_y: card.zoom_y,
         offset: card.offset,
-    }
-}
-
-fn union(a: WRect, b: WRect) -> WRect {
-    WRect {
-        left: a.left.min(b.left),
-        top: a.top.min(b.top),
-        right: a.right.max(b.right),
-        bottom: a.bottom.max(b.bottom),
+        centred: card.centred,
     }
 }
 
@@ -2750,16 +2860,6 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
-fn load_font_bytes() -> Vec<u8> {
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    let fonts = PathBuf::from(windir).join("Fonts");
-    let names: &[&str] = if crate::i18n::is_chinese() {
-        &["msyh.ttc", "segoeui.ttf", "arial.ttf"]
-    } else {
-        &["segoeui.ttf", "arial.ttf"]
-    };
-    names.iter().find_map(|n| std::fs::read(fonts.join(n)).ok()).unwrap_or_default()
-}
 
 fn client_point(lp: LPARAM) -> (i32, i32) {
     let x = (lp.0 & 0xFFFF) as i16 as i32;

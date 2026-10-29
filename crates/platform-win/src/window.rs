@@ -8,6 +8,7 @@ use std::os::windows::ffi::OsStrExt;
 
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HWND, LPARAM, RECT};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromWindow};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
@@ -17,9 +18,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GUI_INMOVESIZE, GUITHREADINFO, GW_HWNDNEXT, GWL_EXSTYLE, GA_PARENT, GetAncestor,
-    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetWindow, GetWindowLongPtrW,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetTopWindow, GetWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    SW_RESTORE, SetForegroundWindow, ShowWindow, SwitchToThisWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     WindowFromPoint,
 };
 
@@ -34,7 +35,6 @@ const IGNORED_CLASSES: &[&str] = &[
     "DV2ControlHost",
     "SysShadow",
     "Windows.UI.Core.CoreWindow",
-    "TaskManagerWindow",
 ];
 
 fn from_wide(buf: &[u16]) -> String {
@@ -168,9 +168,12 @@ pub fn process_elevated(pid: u32) -> Option<bool> {
     }
 }
 
-/// Whether *we* run elevated. Cached by the caller; this is a syscall.
+/// Whether *we* run elevated. Cached: this is a syscall, and `check` — which
+/// runs on every poll while a window is being dragged — must not make four of
+/// them per call.
 pub fn self_elevated() -> bool {
-    process_elevated(std::process::id()).unwrap_or(false)
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| process_elevated(std::process::id()).unwrap_or(false))
 }
 
 /// UWP windows and windows on another virtual desktop are "cloaked": they
@@ -375,20 +378,38 @@ pub fn moving_on(thread: u32) -> Option<HWND> {
 }
 
 /// Restores a parked window to the foreground. Windows only lets the foreground
-/// process steal focus, so we attach to whatever is in front for the call.
+/// process steal focus, so the plain call is retried with the two input queues
+/// joined to ours.
 pub fn force_foreground(hwnd: HWND) {
     unsafe {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
+        let _ = SetForegroundWindow(hwnd);
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        // Attaching threads serialises the input queues for as long as it lasts.
+        // Both ends are needed: joining the foreground thread is not enough for
+        // Windows to accept the switch any more, but with the target thread in
+        // the same queue the activation goes through. Worth it to get the focus
+        // back, not worth doing when the plain call was going to work.
         let fg = GetForegroundWindow();
         let our_thread = GetCurrentThreadId();
         let fg_thread = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
-        let attached = fg_thread != 0
-            && fg_thread != our_thread
+        let target_thread = GetWindowThreadProcessId(hwnd, None);
+        let attach_fg = fg_thread != 0 && fg_thread != our_thread
             && AttachThreadInput(our_thread, fg_thread, true).as_bool();
+        let attach_target = target_thread != 0
+            && target_thread != our_thread
+            && target_thread != fg_thread
+            && AttachThreadInput(our_thread, target_thread, true).as_bool();
+        let _ = SetActiveWindow(hwnd);
         let _ = SetForegroundWindow(hwnd);
-        if attached {
+        if attach_target {
+            let _ = AttachThreadInput(our_thread, target_thread, false);
+        }
+        if attach_fg {
             let _ = AttachThreadInput(our_thread, fg_thread, false);
         }
     }
@@ -403,38 +424,54 @@ pub fn force_foreground(hwnd: HWND) {
 /// first turns that same click into a real activation, which the shell notices
 /// and answers by bringing the window back.
 ///
-/// Doing it needs a window that will take the focus: the next one down the
-/// z-order that looks like something the user could have been using. Returns
-/// `false` when there is none, so the caller can decide what happens to the
-/// window that is still holding the focus.
+/// Doing it needs a window that will take the focus. The search starts just
+/// below the parked window, where the window the user came from usually sits,
+/// and then walks the whole stack from the top: a topmost window is above the
+/// parked one, so a downward walk alone could miss every real window and leave
+/// the focus on the desktop, which Windows refuses to hand out. Returns `false`
+/// when nothing will take the focus, so the caller can decide what happens to
+/// the window that is still holding it.
 pub fn hand_off_foreground(avoid: HWND, self_pid: u32) -> bool {
     unsafe {
         if GetForegroundWindow() != avoid {
             return false;
         }
-        let mut candidate = next_window(avoid);
-        for _ in 0..64 {
-            if candidate.0.is_null() {
-                return false;
-            }
-            if is_foreground_material(candidate, avoid, self_pid) {
-                force_foreground(candidate);
-                if GetForegroundWindow() == candidate {
+        let mut tried = 0;
+        let walks = [next_window(avoid), GetTopWindow(None).unwrap_or_default()];
+        for start in walks {
+            let mut candidate = start;
+            for _ in 0..96 {
+                if candidate.0.is_null() {
+                    break;
+                }
+                if !is_foreground_material(candidate, avoid, self_pid) {
+                    candidate = next_window(candidate);
+                    continue;
+                }
+                if take_foreground(candidate) {
                     return true;
                 }
-                // SetForegroundWindow is refused when this process did not
-                // receive the last input event, which is exactly the case here:
-                // the user clicked somebody else's window. The shell's own
-                // switching call is not subject to that rule.
-                SwitchToThisWindow(candidate, false);
-                if GetForegroundWindow() == candidate {
-                    return true;
+                // Every activation makes the shell repaint the taskbar, so a
+                // window that refuses is not followed by an endless walk. The
+                // refusals are the shell's helper windows; the real one is a
+                // step or two further down.
+                tried += 1;
+                if tried >= HAND_OFF_TRIES {
+                    return false;
                 }
+                candidate = next_window(candidate);
             }
-            candidate = next_window(candidate);
         }
         false
     }
+}
+
+/// How many windows a hand-over tries to focus before giving up.
+const HAND_OFF_TRIES: usize = 3;
+
+fn take_foreground(hwnd: HWND) -> bool {
+    force_foreground(hwnd);
+    unsafe { GetForegroundWindow() == hwnd }
 }
 
 /// Whether a foreground change away from `previous` is the shell's own doing,
@@ -529,15 +566,24 @@ pub fn on_screen(hwnd: HWND) -> bool {
     !unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) }.0.is_null()
 }
 
+/// True when the handle is still a window of `pid`.
+///
+/// The cheaper half of [`still_same_window`], for the per-poll check: an HWND
+/// that is still alive with the same pid cannot be another process's window,
+/// and the process-instance question only matters across a restart, which is
+/// where the full check belongs.
+pub fn same_window(hwnd: isize, pid: u32) -> bool {
+    if !is_alive(hwnd) {
+        return false;
+    }
+    pid == 0 || pid_of(hwnd_of(hwnd)) == pid
+}
+
 /// True when the window still belongs to the process instance we recorded.
 /// This is what keeps a recycled HWND (or pid) from being "restored" wrongly
 /// after a reboot.
 pub fn still_same_window(hwnd: isize, pid: u32, process_start: u64) -> bool {
-    if !is_alive(hwnd) {
-        return false;
-    }
-    let h = hwnd_of(hwnd);
-    if pid_of(h) != pid {
+    if !same_window(hwnd, pid) {
         return false;
     }
     if process_start == 0 {

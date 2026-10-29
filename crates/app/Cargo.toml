@@ -39,5 +39,4 @@ windows = { workspace = true, features = [
 ] }
 windows-core = { workspace = true }
 tiny-skia = { workspace = true }
-fontdue = { workspace = true }
 winreg = { workspace = true }

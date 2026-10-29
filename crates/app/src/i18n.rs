@@ -68,7 +68,7 @@ table! {
     "rej_tool" => "Tool windows and palettes cannot be hung." | "工具窗口和浮动面板不能挂起。",
     "rej_cloaked" => "That window is on another desktop or is not visible." | "这个窗口在其他虚拟桌面，或当前不可见。",
     "rej_minimized" => "Restore the window before hanging it up." | "请先把窗口还原，再挂起。",
-    "rej_elevated" => "That window runs as administrator, and Windows blocks a normal app from moving it." | "这个窗口以管理员权限运行，普通权限的晒窗无法移动它。",
+    "rej_elevated" => "That window runs as administrator, and Windows blocks a normal app from moving it. Restart ShaiWin with “Run as administrator” to hang it." | "这个窗口以管理员权限运行，普通权限的晒窗无法移动它。用“以管理员身份运行”重新打开晒窗就能挂起它。",
     "rej_small" => "That window is too small to make a useful card." | "这个窗口太小了，做不出有用的卡片。",
     "rej_excluded" => "That app is on your exclusion list." | "这个应用在排除列表里。",
     "howto_title" => "ShaiWin is running" | "晒窗已在后台运行",

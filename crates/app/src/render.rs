@@ -57,22 +57,18 @@ pub struct Ui<'a> {
 }
 
 pub struct Frame {
-    pub canvas: Pixmap,
-    /// Each interactive card's rectangle in canvas coordinates.
     pub hits: Vec<(u64, WRect)>,
 }
 
 pub struct Painter {
-    font: Option<fontdue::Font>,
+    text: Option<crate::text::Text>,
     labels: HashMap<String, Pixmap>,
     sprites: HashMap<u64, (SpriteKey, Sprite)>,
 }
 
 impl Painter {
-    pub fn new(font_bytes: &[u8], collection_index: u32) -> Painter {
-        let settings = fontdue::FontSettings { collection_index, ..Default::default() };
-        let font = fontdue::Font::from_bytes(font_bytes, settings).ok();
-        Painter { font, labels: HashMap::new(), sprites: HashMap::new() }
+    pub fn new() -> Painter {
+        Painter { text: crate::text::Text::new(), labels: HashMap::new(), sprites: HashMap::new() }
     }
 
     pub fn forget(&mut self, id: u64) {
@@ -83,19 +79,20 @@ impl Painter {
     fn label(&mut self, text: &str, px: f32, rgb: (u8, u8, u8)) -> Option<&Pixmap> {
         let key = format!("{text}|{px:.2}|{rgb:?}");
         if !self.labels.contains_key(&key) {
-            let pix = rasterize(self.font.as_ref()?, text, px, rgb)?;
+            let (rgba, width, height) = self.text.as_mut()?.render(text, px, rgb)?;
+            let mut pix = Pixmap::new(width, height)?;
+            pix.data_mut().copy_from_slice(&rgba);
             self.labels.insert(key.clone(), pix);
         }
         self.labels.get(&key)
     }
 
-    fn text_width(&self, text: &str, px: f32) -> f32 {
-        let Some(font) = self.font.as_ref() else { return text.chars().count() as f32 * px * 0.5 };
-        text.chars().map(|c| font.metrics(c, px).advance_width).sum()
+    fn text_width(&mut self, text: &str, px: f32) -> f32 {
+        self.text.as_mut().and_then(|t| t.width(text, px)).unwrap_or(text.chars().count() as f32 * px * 0.5)
     }
 
     /// Shortens `text` with an ellipsis until it fits `max_w`.
-    fn elide(&self, text: &str, px: f32, max_w: f32) -> String {
+    fn elide(&mut self, text: &str, px: f32, max_w: f32) -> String {
         if self.text_width(text, px) <= max_w {
             return text.to_string();
         }
@@ -249,18 +246,22 @@ impl Painter {
         Some(Sprite { pix, pivot: (cx, m), card: (x0, y0, card_w, card_h) })
     }
 
-    /// Draws the rope, the cards and any hint into a fresh frame.
-    pub fn compose(
+    /// Draws the rope, the cards and any hint into `canvas`, which the caller
+    /// sizes and owns.
+    ///
+    /// Reusing one canvas matters on a weak machine: a fresh full-width pixmap
+    /// per frame means allocating and first-touching megabytes sixty times a
+    /// second, and that cost grows with the screen, not with the line.
+    pub fn compose_into(
         &mut self,
+        canvas: &mut Pixmap,
         line: &Line,
         layout: &LineLayout,
-        origin: (i32, i32),
-        size: (u32, u32),
         ui: &Ui,
-    ) -> Option<Frame> {
+    ) -> Frame {
+        canvas.fill(Color::TRANSPARENT);
         let s = layout.scale;
-        let mut canvas = Pixmap::new(size.0.max(1), size.1.max(1))?;
-        draw_rope(&mut canvas, layout, ui.y_off, ui.hot);
+        draw_rope(canvas, layout, ui.y_off, ui.hot);
         // A full line shrinks every card by the same factor; the sprites are
         // built at the user's zoom, so this is just a draw-time scale.
         let fit = line.fit(layout);
@@ -275,32 +276,9 @@ impl Painter {
             }
         }
         for card in ordered {
+            // A leaving card has already had its window put back; its place on
+            // the line is empty until the card is removed this same frame.
             if card.leaving {
-                if let Some(rect) = Line::ghost_rect(card) {
-                    let local = WRect {
-                        left: rect.left - origin.0,
-                        top: rect.top - origin.1,
-                        right: rect.right - origin.0,
-                        bottom: rect.bottom - origin.1,
-                    };
-                    let flight = card.flight.as_ref();
-                    let angle = flight.map(|f| f.angle(card.ghost_angle.0, card.ghost_angle.1)).unwrap_or(0.0);
-                    draw_ghost(&mut canvas, card.thumb.as_ref(), card.icon.as_ref(), card.accent, local, angle, s);
-                }
-                continue;
-            }
-            if let Some(rect) = Line::ghost_rect(card) {
-                // In the air: the snapshot, growing or shrinking, plus a hint
-                // of rotation so it banks into the line.
-                let local = WRect {
-                    left: rect.left - origin.0,
-                    top: rect.top - origin.1,
-                    right: rect.right - origin.0,
-                    bottom: rect.bottom - origin.1,
-                };
-                let flight = card.flight.as_ref();
-                let angle = flight.map(|f| f.angle(-7.0, card.sway.x * 0.4)).unwrap_or(0.0);
-                draw_ghost(&mut canvas, card.thumb.as_ref(), card.icon.as_ref(), card.accent, local, angle, s);
                 continue;
             }
             let sprite = match self.sprite(card, s) {
@@ -317,7 +295,7 @@ impl Painter {
             canvas.draw_pixmap(0, 0, sprite.pix.as_ref(), &PixmapPaint::default(), transform, None);
 
             if ui.hover == Some(card.id) {
-                draw_hover_ring(&mut canvas, sprite, s, transform);
+                draw_hover_ring(canvas, sprite, s, transform);
             }
 
             // Clickable from the first frame it hangs: a card you can see is a
@@ -345,28 +323,25 @@ impl Painter {
             let center_x = layout.width / 2.0;
             let center_y = layout.rope_y(center_x) + ui.y_off + 36.0 * s;
             if let Some(label) = self.label(hint, 12.0 * s, (238, 241, 248)) {
-                draw_hint(&mut canvas, center_x, center_y, label, s, false);
+                draw_hint(canvas, center_x, center_y, label, s, false);
             }
         }
 
-        Some(Frame { canvas, hits })
+        Frame { hits }
     }
 
     /// The alternative to hover-to-open: a small pill at the top of the
     /// screen that the user can click. It is the only thing drawn, so the rest
     /// of the strip stays click-through.
-    pub fn compose_peek(
-        &mut self,
-        layout: &LineLayout,
-        size: (u32, u32),
-        hot: bool,
-    ) -> Option<Frame> {
+    pub fn compose_peek_into(&mut self, canvas: &mut Pixmap, layout: &LineLayout, hot: bool) -> Frame {
         let s = layout.scale;
-        let mut canvas = Pixmap::new(size.0.max(1), size.1.max(1))?;
-        let label = self.label(crate::i18n::t("peek_open"), 13.0 * s, (240, 243, 250))?;
+        canvas.fill(Color::TRANSPARENT);
+        let Some(label) = self.label(crate::i18n::t("peek_open"), 13.0 * s, (240, 243, 250)) else {
+            return Frame { hits: Vec::new() };
+        };
         let cx = layout.width / 2.0;
         let cy = 44.0 * s;
-        draw_hint(&mut canvas, cx, cy, label, s, hot);
+        draw_hint(canvas, cx, cy, label, s, hot);
         let w = label.width() as f32 + 28.0 * s;
         let h = label.height() as f32 + 16.0 * s;
         let rect = WRect {
@@ -375,7 +350,7 @@ impl Painter {
             right: (cx + w / 2.0).round() as i32,
             bottom: (cy + h / 2.0).round() as i32,
         };
-        Some(Frame { canvas, hits: vec![(crate::app::PEEK_ID, rect)] })
+        Frame { hits: vec![(crate::app::PEEK_ID, rect)] }
     }
 }
 
@@ -432,83 +407,6 @@ fn accent_gradient(accent: Rgb, y0: f32, y1: f32) -> Paint<'static> {
     let shader = LinearGradient::new(Point::from_xy(0.0, y0), Point::from_xy(0.0, y1), stops, SpreadMode::Pad, Transform::identity())
         .unwrap_or(Shader::SolidColor(Color::TRANSPARENT));
     Paint { shader, anti_alias: true, ..Default::default() }
-}
-
-/// The window's snapshot while it flies: a rounded pane that morphs between the
-/// window's rectangle and the card's rectangle.
-fn draw_ghost(
-    canvas: &mut Pixmap,
-    thumb: Option<&Pixmap>,
-    icon: Option<&Pixmap>,
-    accent: Rgb,
-    rect: WRect,
-    angle: f32,
-    s: f32,
-) {
-    let w = rect.width().max(2) as f32;
-    let h = rect.height().max(2) as f32;
-    let radius = (14.0 * s).min(w.min(h) * 0.18);
-    let cx = w / 2.0;
-    let cy = h / 2.0;
-    let transform = Transform::from_translate(rect.left as f32, rect.top as f32)
-        .post_translate(cx, cy)
-        .post_rotate(angle)
-        .post_translate(-cx, -cy);
-
-    // Shadow and pane behind the picture.
-    if let Some(path) = rrect_path(2.0, 4.0, w - 4.0, h - 4.0, radius) {
-        let mut paint = solid(0, 0, 0, 0.18);
-        paint.anti_alias = true;
-        canvas.fill_path(&path, &paint, FillRule::Winding, transform, None);
-    }
-    if let Some(path) = rrect_path(0.0, 0.0, w, h, radius) {
-        canvas.fill_path(&path, &solid(250, 250, 252, 1.0), FillRule::Winding, transform, None);
-    }
-
-    match thumb {
-        Some(thumb) => {
-            // A mask is applied in canvas space, so the picture is composed in a
-            // small pixmap of its own, where the rounded mask sits at the
-            // origin, and only then placed (and banked) on the canvas. Masking
-            // the placed picture clipped it away as soon as the ghost left the
-            // top-left corner, which made the first hang a plain white pane.
-            let (gw, gh) = (w.max(1.0) as u32, h.max(1.0) as u32);
-            if let Some(mut face) = Pixmap::new(gw, gh) {
-                let mut mask = Mask::new(gw, gh);
-                if let Some(mask) = mask.as_mut() {
-                    if let Some(path) = rrect_path(0.0, 0.0, w, h, radius) {
-                        mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
-                    }
-                    let (tw, th) = (thumb.width() as f32, thumb.height() as f32);
-                    let k = (w / tw).max(h / th);
-                    let local = Transform::from_translate((w - tw * k) / 2.0, (h - th * k) / 2.0).pre_scale(k, k);
-                    let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
-                    face.draw_pixmap(0, 0, thumb.as_ref(), &paint, local, Some(mask));
-                }
-                canvas.draw_pixmap(0, 0, face.as_ref(), &PixmapPaint::default(), transform, None);
-            }
-        }
-        None => {
-            // No picture: the same tinted pane and icon the card itself falls
-            // back to. A plain white rectangle reads as a broken window, and
-            // that is exactly what the first hang looked like when the
-            // snapshot was missing or painted in the wrong DPI space.
-            if let Some(path) = rrect_path(0.0, 0.0, w, h, radius) {
-                canvas.fill_path(&path, &accent_gradient(accent, 0.0, h), FillRule::Winding, transform, None);
-            }
-            if let Some(icon) = icon {
-                let size = (w.min(h) * 0.42).max(16.0);
-                let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
-                let scale = size / icon.width() as f32;
-                let local =
-                    Transform::from_translate((w - size) / 2.0, (h - size) / 2.0).pre_scale(scale, scale);
-                canvas.draw_pixmap(0, 0, icon.as_ref(), &paint, transform.post_concat(local), None);
-            }
-        }
-    }
-    if let Some(path) = rrect_path(1.0, 1.0, w - 2.0, h - 2.0, radius) {
-        stroke_path(canvas, &path, solid(255, 255, 255, 0.55), 2.0 * s, transform);
-    }
 }
 
 fn draw_hover_ring(canvas: &mut Pixmap, sprite: &Sprite, s: f32, transform: Transform) {
@@ -663,67 +561,5 @@ fn blur_axis(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizonta
                 sum -= at(p as isize - r as isize);
             }
         }
-    }
-}
-
-/// Renders a string as a premultiplied RGBA image, one glyph at a time.
-fn rasterize(font: &fontdue::Font, text: &str, px: f32, rgb: (u8, u8, u8)) -> Option<Pixmap> {
-    let lines = font.horizontal_line_metrics(px)?;
-    let glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = text.chars().map(|c| font.rasterize(c, px)).collect();
-    let advance: f32 = glyphs.iter().map(|(m, _)| m.advance_width).sum();
-    let width = advance.ceil() as u32 + 4;
-    let height = (lines.ascent - lines.descent).ceil() as u32 + 4;
-    let mut pix = Pixmap::new(width, height)?;
-    let baseline = lines.ascent.ceil() + 2.0;
-    let data = pix.data_mut();
-
-    let mut pen = 2.0f32;
-    for (m, bitmap) in &glyphs {
-        let left = (pen + m.xmin as f32).round() as i32;
-        let top = (baseline - (m.ymin as f32 + m.height as f32)).round() as i32;
-        for row in 0..m.height {
-            for col in 0..m.width {
-                let coverage = bitmap[row * m.width + col] as f32 / 255.0;
-                if coverage <= 0.0 {
-                    continue;
-                }
-                let x = left + col as i32;
-                let y = top + row as i32;
-                if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-                    continue;
-                }
-                let i = (y as usize * width as usize + x as usize) * 4;
-                let (sr, sg, sb) = (rgb.0 as f32 * coverage, rgb.1 as f32 * coverage, rgb.2 as f32 * coverage);
-                let inv = 1.0 - coverage;
-                data[i] = (sr + data[i] as f32 * inv).round().min(255.0) as u8;
-                data[i + 1] = (sg + data[i + 1] as f32 * inv).round().min(255.0) as u8;
-                data[i + 2] = (sb + data[i + 2] as f32 * inv).round().min(255.0) as u8;
-                data[i + 3] = (coverage * 255.0 + data[i + 3] as f32 * inv).round().min(255.0) as u8;
-            }
-        }
-        pen += m.advance_width;
-    }
-    Some(pix)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tiny_skia::Color;
-
-    #[test]
-    fn a_flying_card_keeps_its_picture_where_it_is() {
-        // The ghost is placed far from the canvas origin. Its rounded mask used
-        // to be applied in canvas space, so the picture was clipped away and the
-        // first hang sat on the line as a plain white pane.
-        let mut canvas = Pixmap::new(800, 400).unwrap();
-        let mut thumb = Pixmap::new(40, 30).unwrap();
-        thumb.fill(Color::from_rgba8(0, 0, 255, 255));
-        let rect = WRect { left: 500, top: 120, right: 660, bottom: 260 };
-        draw_ghost(&mut canvas, Some(&thumb), None, Rgb(200, 120, 40), rect, 0.0, 1.0);
-
-        let center = canvas.pixel(580, 190).unwrap();
-        assert_eq!((center.red(), center.green(), center.blue()), (0, 0, 255));
-        assert_eq!(canvas.pixel(100, 50).unwrap().alpha(), 0);
     }
 }

@@ -53,10 +53,18 @@ pub fn monitors() -> Vec<Monitor> {
 
 unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, lparam: LPARAM) -> BOOL {
     let list = unsafe { &mut *(lparam.0 as *mut Vec<Monitor>) };
+    if let Some(monitor) = unsafe { read(hmon) } {
+        list.push(monitor);
+    }
+    true.into()
+}
+
+/// One monitor from its handle, without enumerating every display.
+unsafe fn read(hmon: HMONITOR) -> Option<Monitor> {
     unsafe {
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if !GetMonitorInfoW(hmon, &mut info).as_bool() {
-            return true.into();
+            return None;
         }
         let mut sx = 96u32;
         let mut sy = 96u32;
@@ -64,7 +72,7 @@ unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, l
             Ok(()) if sx > 0 => sx as f32 / 96.0,
             _ => 1.0,
         };
-        list.push(Monitor {
+        Some(Monitor {
             handle: hmon.0 as isize,
             bounds: Rect {
                 left: info.rcMonitor.left,
@@ -75,16 +83,18 @@ unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, l
             work: Rect { left: info.rcWork.left, top: info.rcWork.top, right: info.rcWork.right, bottom: info.rcWork.bottom },
             scale,
             primary: info.dwFlags & 1 != 0,
-        });
+        })
     }
-    true.into()
 }
 
 /// The monitor containing a screen point.
 pub fn at_point(x: i32, y: i32) -> Monitor {
     unsafe {
         let hmon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
-        find(hmon).unwrap_or_else(|| monitors()[0])
+        // Asking the handle it named is enough: enumerating every display and
+        // its DPI to find the same one again is a cost paid on every hang and
+        // every line toggle.
+        read(hmon).unwrap_or_else(|| monitors()[0])
     }
 }
 
@@ -97,18 +107,14 @@ pub fn for_window(hwnd: isize) -> Monitor {
             return primary();
         }
         let hmon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
-        find(hmon).unwrap_or_else(primary)
+        read(hmon).unwrap_or_else(primary)
     }
-}
-
-fn find(hmon: HMONITOR) -> Option<Monitor> {
-    monitors().into_iter().find(|m| m.handle == hmon.0 as isize)
 }
 
 pub fn primary() -> Monitor {
     unsafe {
         let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        find(hmon).unwrap_or_else(|| monitors()[0])
+        read(hmon).unwrap_or_else(|| monitors()[0])
     }
 }
 

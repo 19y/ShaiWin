@@ -1,14 +1,14 @@
 //! The line: which cards hang on it, where they sit, and how they move.
 //!
 //! The physics is a damped spring per value, stepped in fixed substeps by
-//! `shaiwin-core`. A card that is in the air is driven by an `ArcFlight`
-//! instead, so hanging a window and taking it down are the same code path
-//! played in opposite directions.
+//! `shaiwin-core`. Everything a card does happens where the card is: there is
+//! no snapshot flying across the desktop, because a window-sized sheet sweeping
+//! over the screen is what made hanging and taking down feel slow.
 
 use std::time::{Duration, Instant};
 
 use shaiwin_core::layout::EDGE_PAD;
-use shaiwin_core::{ArcFlight, LineLayout, Rgb, Spring, anim::lerp_rect};
+use shaiwin_core::{LineLayout, Rgb, Spring};
 use shaiwin_platform_win::Rect as WRect;
 use shaiwin_platform_win::park::{Parked, Placement};
 use tiny_skia::Pixmap;
@@ -16,15 +16,13 @@ use tiny_skia::Pixmap;
 /// Where a card's rectangle sits relative to the hanging point, in logical px.
 pub const CARD_W: f32 = 168.0;
 pub const CARD_H: f32 = 118.0;
-/// How much of the clothespin overlaps the card.
-pub const PIN_OVERLAP: f32 = 12.0;
 const GUST_MIN: f32 = 9.0;
 const GUST_MAX: f32 = 18.0;
 
-/// How long the snapshot takes to travel. Kept short on purpose: the flight is
-/// a pointer to where the window went, not a show.
-const HANG_FLIGHT: f32 = 0.30;
-const TAKE_FLIGHT: f32 = 0.22;
+/// How big a card is when it appears on the line, before it settles. The
+/// window is already off screen by then; a card that pops in at its slot reads
+/// as "the window is on the line" without anything crossing the desktop.
+const HANG_SCALE: f32 = 0.62;
 /// The card slides to its slot this quickly after it lands or is released.
 const SLOT_RESPONSE: f32 = 0.32;
 const SLOT_DAMPING: f32 = 0.9;
@@ -193,6 +191,10 @@ pub struct Card {
     pub parked: Parked,
     /// Where the window was on screen when it was hung up.
     pub window_rect: WRect,
+    /// The window was hung up by dragging it onto the line, so it opens in the
+    /// middle of the screen when it comes back. A window hung up by hotkey or
+    /// from the tray opens exactly where it was.
+    pub centred: bool,
     pub thumb: Option<Pixmap>,
     /// Bumped whenever `thumb` changes, so the sprite cache knows to rebuild.
     pub thumb_version: u64,
@@ -217,13 +219,6 @@ pub struct Card {
     /// is resting on is enlarged, and it is still at rest there.
     pub scale_goal: f32,
 
-    /// In the air: from a window-sized rectangle to its slot, or the reverse.
-    pub flight: Option<ArcFlight>,
-    /// Screen rectangles the flight travels between.
-    pub ghost_from: WRect,
-    pub ghost_to: WRect,
-    /// Bank angle at the start and end of the flight, in degrees.
-    pub ghost_angle: (f32, f32),
     /// Where the line should reopen on the next launch, if this card is the
     /// reason the line moved to another monitor.
     pub anchor: (i32, i32),
@@ -241,10 +236,6 @@ pub struct Card {
 }
 
 impl Card {
-    pub fn flying(&self) -> bool {
-        self.flight.is_some()
-    }
-
     /// The card's width in device pixels. The strip packs by width; height is
     /// the user's business and does not re-pack the line.
     pub fn width(&self, s: f32) -> f32 {
@@ -254,20 +245,6 @@ impl Card {
     /// The card's height in device pixels, pin excluded.
     pub fn height(&self, s: f32) -> f32 {
         CARD_H * s * self.zoom_y
-    }
-
-    /// The card's rectangle on screen at rest, given its slot. `fit` is the
-    /// factor the packed line had to shrink every card by to make them fit.
-    pub fn rest_rect(&self, slot_x: f32, rope_y: f32, s: f32, fit: f32) -> WRect {
-        let w = self.width(s) * fit;
-        let h = self.height(s) * fit;
-        let top = rope_y + PIN_OVERLAP * s;
-        WRect {
-            left: (slot_x - w / 2.0).round() as i32,
-            top: top.round() as i32,
-            right: (slot_x + w / 2.0).round() as i32,
-            bottom: (top + h).round() as i32,
-        }
     }
 }
 
@@ -436,41 +413,31 @@ impl Line {
         true
     }
 
-    /// Adds a card that has just been hung up and starts its flight in.
+    /// Adds a card that has just been hung up. It appears at its slot rather
+    /// than flying in from the window: the window is already gone, and a sheet
+    /// the size of the window crossing the desktop is exactly the "it jumps to
+    /// the left and comes back" the user was seeing.
     pub fn hang(&mut self, card: Card, layout: &LineLayout, reduced_motion: bool) -> u64 {
         let id = card.id;
         let mut card = card;
         card.away = false;
         card.away_at = None;
         card.unhook = false;
-        card.flight = None;
         self.cards.push(card);
         let index = self.cards.iter().position(|c| c.id == id).expect("just pushed");
         let position = self.cards[..index].iter().filter(|c| !c.away && !c.leaving).count();
-        let fit = self.fit(layout);
         let slot = self.targets(layout)[position];
         let sway = self.random(-1.6, 1.6);
         let card = self.get_mut(id).expect("just pushed");
         card.x = Spring::responsive(slot, SLOT_RESPONSE, SLOT_DAMPING);
+        card.x.snap(slot);
         card.sway = tilt(sway);
-        let rope = layout.rope_y(slot);
-        card.ghost_to = card.rest_rect(slot, rope, layout.scale, fit);
         if reduced_motion {
-            card.x.snap(slot);
+            card.scale = 1.0;
+            card.scale_goal = 1.0;
         } else {
-            let lift = (90.0 * layout.scale).max(40.0);
-            card.flight = Some(ArcFlight::new(
-                (
-                    (card.ghost_from.left + card.ghost_from.right) as f32 / 2.0,
-                    (card.ghost_from.top + card.ghost_from.bottom) as f32 / 2.0,
-                ),
-                (
-                    (card.ghost_to.left + card.ghost_to.right) as f32 / 2.0,
-                    (card.ghost_to.top + card.ghost_to.bottom) as f32 / 2.0,
-                ),
-                lift,
-                HANG_FLIGHT,
-            ));
+            card.scale = HANG_SCALE;
+            card.scale_goal = 1.0;
         }
         id
     }
@@ -482,7 +449,6 @@ impl Line {
         let id = card.id;
         card.x = Spring::new(0.0, 0.0, 0.0);
         card.sway = tilt(0.0);
-        card.flight = None;
         card.away_at = None;
         card.unhook = false;
         self.cards.push(card);
@@ -512,7 +478,6 @@ impl Line {
             card.away_at = None;
             card.unhook = false;
             card.leaving = false;
-            card.flight = None;
             card.sway = tilt(sway0);
             // A fresh snapshot arrives shortly; until then the old thumbnail
             // is better than a blank pane.
@@ -521,11 +486,9 @@ impl Line {
         let Some(index) = self.cards.iter().position(|c| c.id == id) else { return false };
         let position = self.cards[..index].iter().filter(|c| !c.away && !c.leaving).count();
         let slot = self.targets(layout)[position];
-        let fit = self.fit(layout);
         if let Some(card) = self.get_mut(id) {
             card.x = Spring::responsive(slot, SLOT_RESPONSE, SLOT_DAMPING);
             card.x.snap(slot);
-            card.ghost_to = card.rest_rect(slot, layout.rope_y(slot), layout.scale, fit);
         }
         true
     }
@@ -537,7 +500,6 @@ impl Line {
             card.away = true;
             card.away_at = Some(now);
             card.leaving = false;
-            card.flight = None;
         }
     }
 
@@ -562,60 +524,32 @@ impl Line {
         self.cards = others;
     }
 
-    /// Sends a card back to its window. The window is only restored once the
-    /// flight has finished, so the user never sees it jump. With `no_flight`
-    /// there is no animation to wait for: the caller restores immediately.
-    pub fn take_down(&mut self, id: u64, layout: &LineLayout, no_flight: bool) -> bool {
-        let Some(index) = self.cards.iter().position(|c| c.id == id) else { return false };
-        if self.cards[index].leaving || self.cards[index].away {
+    /// Takes the card off the line. The window is restored in the same frame by
+    /// the caller: the click has to put the window in front now, not after an
+    /// animation, or it reads as "nothing happened" until the taskbar is used.
+    pub fn take_down(&mut self, id: u64) -> bool {
+        let Some(card) = self.get_mut(id) else { return false };
+        if card.leaving || card.away {
             return false;
         }
-        let slot_x = {
-            let position = self.cards[..index].iter().filter(|c| !c.leaving && !c.away).count();
-            self.targets(layout)[position]
-        };
-        let fit = self.fit(layout);
-        let card = &mut self.cards[index];
         card.leaving = true;
-        card.flight = None;
-        let rope = layout.rope_y(slot_x);
-        card.ghost_from = card.rest_rect(slot_x, rope, layout.scale, fit);
-        card.ghost_to = card.window_rect;
-        card.ghost_angle = (card.sway.x * 0.5, 0.0);
-        if no_flight {
-            return true;
-        }
-        let lift = (60.0 * layout.scale).max(30.0);
-        card.flight = Some(ArcFlight::new(
-            (
-                (card.ghost_from.left + card.ghost_from.right) as f32 / 2.0,
-                (card.ghost_from.top + card.ghost_from.bottom) as f32 / 2.0,
-            ),
-            (
-                (card.ghost_to.left + card.ghost_to.right) as f32 / 2.0,
-                (card.ghost_to.top + card.ghost_to.bottom) as f32 / 2.0,
-            ),
-            lift,
-            TAKE_FLIGHT,
-        ));
         true
     }
 
     /// Puts a leaving card back on the line. Used when the window refuses to
     /// come back: losing the card would leave the window stranded off screen.
-    pub fn cancel_take_down(&mut self, id: u64, _layout: &LineLayout) {
+    pub fn cancel_take_down(&mut self, id: u64) {
         let Some(card) = self.get_mut(id) else { return };
         card.leaving = false;
-        card.flight = None;
     }
 
-    /// Advances every animation. Returns the ids of cards that have finished
-    /// flying back and are ready for their window to be restored.
+    /// Advances every animation. Returns the ids of cards that are leaving and
+    /// ready for their window to be restored.
     pub fn step(&mut self, dt: f32, now: Instant, layout: &LineLayout, hover: Option<u64>) -> Vec<u64> {
         if self.gust_back.is_some_and(|t| now >= t) {
             self.gust_back = None;
             for card in &mut self.cards {
-                if !card.flying() {
+                if !card.leaving {
                     card.sway.retarget(0.0);
                 }
             }
@@ -630,19 +564,10 @@ impl Line {
                 continue;
             }
             if card.leaving {
-                let done = match card.flight.as_mut() {
-                    Some(flight) => !flight.step(dt),
-                    None => true,
-                };
-                if done {
-                    // Keep the card until the app has restored the window (or
-                    // put the card back if it refused). Dropping it here would
-                    // leave the window parked with nothing on the line.
-                    finished.push(card.id);
-                    keep.push(card);
-                    continue;
-                }
-                card.sway.step(dt);
+                // Keep the card until the app has restored the window (or put
+                // the card back if it refused). Dropping it here would leave
+                // the window parked with nothing on the line.
+                finished.push(card.id);
                 keep.push(card);
                 continue;
             }
@@ -654,18 +579,6 @@ impl Line {
                 card.x.retarget(target_x);
             }
             card.x.step(dt);
-            if card.flight.is_some() {
-                let landed = match card.flight.as_mut() {
-                    Some(flight) => !flight.step(dt),
-                    None => false,
-                };
-                if landed {
-                    // The flight is over: put the card exactly on its slot, so
-                    // it does not slide after the snapshot has already landed.
-                    card.flight = None;
-                    card.x.settle();
-                }
-            }
             card.sway.step(dt);
             card.scale_goal = if hover == Some(card.id) { HOVER_SCALE } else { 1.0 };
             card.scale = shaiwin_core::spring::approach(card.scale, card.scale_goal, dt, 16.0);
@@ -678,40 +591,15 @@ impl Line {
         finished
     }
 
-    /// True while anything is in the air, which keeps the frame timer running.
+    /// True while anything is still moving, which keeps the frame timer running.
     /// Everything here must be able to come back to rest, or this stays true for
     /// the whole session and the app redraws at 60Hz forever.
     pub fn animating(&self) -> bool {
         self.cards.iter().any(|c| {
             !c.away
-                && (c.flying()
-                    || !c.x.at_rest()
+                && (!c.x.at_rest()
                     || !c.sway.at_rest()
                     || (c.scale - c.scale_goal).abs() > 0.001)
-        })
-    }
-
-    /// The rectangle a card's ghost covers right now, in screen coordinates.
-    pub fn ghost_rect(card: &Card) -> Option<WRect> {
-        let flight = card.flight.as_ref()?;
-        let (x, y) = flight.position();
-        let t = flight.raw();
-        let r = lerp_rect(
-            (
-                card.ghost_from.left as f32,
-                card.ghost_from.top as f32,
-                card.ghost_from.width() as f32,
-                card.ghost_from.height() as f32,
-            ),
-            (card.ghost_to.left as f32, card.ghost_to.top as f32, card.ghost_to.width() as f32, card.ghost_to.height() as f32),
-            t,
-        );
-        // The flight drives the centre; keep the rectangle centred on it.
-        Some(WRect {
-            left: (x - r.2 / 2.0).round() as i32,
-            top: (y - r.3 / 2.0).round() as i32,
-            right: (x + r.2 / 2.0).round() as i32,
-            bottom: (y + r.3 / 2.0).round() as i32,
         })
     }
 
@@ -723,7 +611,7 @@ impl Line {
         }
         let angles: Vec<f32> = (0..self.cards.len()).map(|_| self.random(1.2, 2.6)).collect();
         for (card, angle) in self.cards.iter_mut().zip(angles) {
-            if !card.leaving && !card.away && !card.flying() {
+            if !card.leaving && !card.away {
                 card.sway.retarget(angle);
             }
         }
@@ -739,6 +627,20 @@ mod tests {
 
     fn rect(l: i32, t: i32, r: i32, b: i32) -> WRect {
         WRect { left: l, top: t, right: r, bottom: b }
+    }
+
+    /// A card's rectangle on screen at rest, given its slot. Matches how the
+    /// renderer places the card body under the pin.
+    fn card_rect(card: &Card, slot_x: f32, rope_y: f32, s: f32) -> WRect {
+        let w = card.width(s);
+        let h = card.height(s);
+        let top = rope_y + 12.0 * s;
+        WRect {
+            left: (slot_x - w / 2.0).round() as i32,
+            top: top.round() as i32,
+            right: (slot_x + w / 2.0).round() as i32,
+            bottom: (top + h).round() as i32,
+        }
     }
 
     fn card(id: u64) -> Card {
@@ -763,6 +665,7 @@ mod tests {
             placement,
             parked: Parked { placement, parked: rect(3000, 0, 3500, 400), was_maximized: false },
             window_rect: rect(100, 100, 600, 500),
+            centred: false,
             thumb: None,
             thumb_version: 0,
             icon: None,
@@ -773,10 +676,6 @@ mod tests {
             sway: Spring::new(0.0, 0.0, 0.0),
             scale: 1.0,
             scale_goal: 1.0,
-            flight: None,
-            ghost_from: rect(0, 0, 10, 10),
-            ghost_to: rect(0, 0, 10, 10),
-            ghost_angle: (0.0, 0.0),
             anchor: (0, 0),
             leaving: false,
             away: false,
@@ -846,7 +745,7 @@ mod tests {
         assert_eq!(live_ids(&line), vec![2]);
 
         // A card that is not on the line cannot be taken down again.
-        assert!(!line.take_down(1, &l, true));
+        assert!(!line.take_down(1));
 
         // Minimizing the window puts it back; the hook is what makes this possible.
         assert!(line.rehang(1, &l));
@@ -931,7 +830,6 @@ mod tests {
 
         assert!(line.rehang(2, &l));
         let card = line.get(2).unwrap();
-        assert!(!card.flying());
         let slot = expected_slots(&line, &l).into_iter().find(|(id, _)| *id == 2).unwrap().1;
         assert!((card.x.x - slot).abs() < 0.5, "card 2 sits at {}, belongs at {slot}", card.x.x);
 
@@ -1022,17 +920,21 @@ mod tests {
     }
 
     #[test]
-    fn a_hang_lands_without_leaving_anything_moving() {
+    fn a_hang_appears_at_its_slot_and_settles_there() {
         let l = layout();
         let mut line = Line::new();
-        let mut first = card(1);
-        first.ghost_from = rect(400, 300, 1400, 900);
-        assert!(line.hang(first, &l, false) > 0);
-        assert!(line.get(1).unwrap().flying());
-
-        run(&mut line, &l, 2.0);
+        let first = card(1);
+        line.hang(first, &l, false);
+        // The card is on the line from the first frame: it does not travel, so
+        // there is no window-sized sheet sweeping the desktop.
+        let slot = line.targets(&l)[0];
         let card1 = line.get(1).unwrap();
-        assert!(!card1.flying());
+        assert!((card1.x.x - slot).abs() < 0.5, "the card starts away from its slot");
+        assert!(card1.scale < 1.0, "the card did not get its settle-in");
+
+        run(&mut line, &l, 1.0);
+        let card1 = line.get(1).unwrap();
+        assert_eq!(card1.scale, 1.0);
         assert!(card1.x.at_rest());
         assert!(!line.animating());
     }
@@ -1043,9 +945,9 @@ mod tests {
         let mut line = Line::new();
         hung(&mut line, &[1], &l);
         let s = l.scale;
-        let before = line.get(1).unwrap().rest_rect(500.0, 40.0, s, 1.0);
+        let before = card_rect(line.get(1).unwrap(), 500.0, 40.0, s);
         assert!(line.set_zoom_y(1, 1.6));
-        let after = line.get(1).unwrap().rest_rect(500.0, 40.0, s, 1.0);
+        let after = card_rect(line.get(1).unwrap(), 500.0, 40.0, s);
         assert_eq!(before.top, after.top, "the big card moved its top edge");
         assert_eq!(before.left, after.left, "resizing height changed the width");
         let grown = (after.bottom - after.top) as f32;

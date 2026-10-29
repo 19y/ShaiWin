@@ -42,6 +42,9 @@ pub struct Entry {
     /// How far the card was dragged from its packed place, in logical pixels.
     /// Positive is right. Recorded so a card stays where the user put it.
     pub offset: f32,
+    /// The window was dragged onto the line, so it opens in the middle of the
+    /// screen instead of where it was. Recorded so a restart keeps that promise.
+    pub centred: bool,
 }
 
 fn file() -> PathBuf {
@@ -80,6 +83,9 @@ fn parse(line: &str) -> Option<Entry> {
     // Appended last so a record written before the height existed still has its
     // zoom and offset read from the same fields.
     let zoom_y = f.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    // Records written before the drag/hotkey distinction have no 17th field;
+    // they open where they were, which is what every hang did back then.
+    let centred = f.next() == Some("1");
     Some(Entry {
         hwnd,
         pid,
@@ -101,6 +107,7 @@ fn parse(line: &str) -> Option<Entry> {
         zoom,
         zoom_y,
         offset,
+        centred,
     })
 }
 
@@ -130,7 +137,7 @@ fn unescape(s: &str) -> String {
 fn line(entry: &Entry) -> String {
     let p = &entry.placement;
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{}\t{},{}\t{},{}\t{},{},{},{}\t{},{}\t{}\t{:.3}\t{:.1}\t{:.3}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{}\t{},{}\t{},{}\t{},{},{},{}\t{},{}\t{}\t{:.3}\t{:.1}\t{:.3}\t{}\n",
         entry.hwnd,
         entry.pid,
         entry.process_start,
@@ -156,6 +163,7 @@ fn line(entry: &Entry) -> String {
         entry.zoom,
         entry.offset,
         entry.zoom_y,
+        u8::from(entry.centred),
     )
 }
 
@@ -215,6 +223,7 @@ mod tests {
             zoom: 1.35,
             zoom_y: 1.6,
             offset: -42.0,
+            centred: true,
         };
         let text = line(&entry);
         let back = parse(text.trim_end()).expect("parses");
@@ -224,6 +233,7 @@ mod tests {
         assert_eq!(back.parked.parked, entry.parked.parked);
         assert_eq!(back.anchor, entry.anchor);
         assert_eq!(back.hooked_away, entry.hooked_away);
+        assert!(back.centred);
         assert!((back.zoom - entry.zoom).abs() < 0.001);
         assert!((back.zoom_y - entry.zoom_y).abs() < 0.001);
         assert!((back.offset - entry.offset).abs() < 0.1);
@@ -265,15 +275,17 @@ mod tests {
             zoom: 1.0,
             zoom_y: 1.0,
             offset: 0.0,
+            centred: false,
         };
         // An old record is today's line with the fields added since removed.
         let full = line(&entry).trim_end().to_string();
         let mut head = full.as_str();
-        for _ in 0..4 {
+        for _ in 0..5 {
             head = head.rsplit_once('\t').expect("more than one field").0;
         }
         let back = parse(head).expect("parses");
         assert!(!back.hooked_away);
+        assert!(!back.centred);
         assert_eq!(back.hwnd, entry.hwnd);
         assert_eq!(back.anchor, entry.anchor);
         assert_eq!(back.zoom, 1.0);
@@ -283,8 +295,9 @@ mod tests {
 
     #[test]
     fn a_record_from_before_the_height_still_keeps_its_zoom_and_offset() {
-        // The height is the last field, so an old record's zoom and offset are
-        // still read from where they were, and only the height defaults.
+        // The height and the centring flag are the last fields, so an old
+        // record's zoom and offset are still read from where they were, and
+        // only those last two default.
         let entry = Entry {
             hwnd: 7,
             pid: 8,
@@ -318,13 +331,16 @@ mod tests {
             zoom: 1.45,
             zoom_y: 1.6,
             offset: -37.0,
+            centred: true,
         };
         let full = line(&entry).trim_end().to_string();
         let old = full.rsplit_once('\t').expect("more than one field").0;
+        let old = old.rsplit_once('\t').expect("more than one field").0;
         let back = parse(old).expect("parses");
         assert_eq!(back.zoom, 1.45);
         assert_eq!(back.offset, -37.0);
         assert_eq!(back.zoom_y, 1.0);
+        assert!(!back.centred);
         assert!(back.hooked_away);
     }
 }

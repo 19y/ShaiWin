@@ -14,10 +14,11 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::WM_EVENT;
+use crate::app::HangSource;
 
 pub enum Job {
     /// Take the picture, then work out how to park the window. Mutates nothing.
-    Prepare { info: WindowInfo },
+    Prepare { info: WindowInfo, source: HangSource },
     /// Re-take a picture of a window that is already parked (startup recovery).
     Snapshot { id: u64, hwnd: isize },
     /// Pull an application icon out of its executable.
@@ -25,7 +26,7 @@ pub enum Job {
 }
 
 pub enum Reply {
-    Prepared { info: WindowInfo, image: Option<Image>, plan: Result<ParkPlan, ParkError> },
+    Prepared { info: WindowInfo, image: Option<Image>, plan: Result<ParkPlan, ParkError>, source: HangSource },
     Snapshotted { id: u64, image: Option<Image> },
     Iconed { id: u64, image: Option<Image> },
 }
@@ -45,7 +46,7 @@ impl Worker {
                 let target = shaiwin_platform_win::window::hwnd_of(hwnd);
                 while let Ok(job) = job_rx.recv() {
                     let reply = match job {
-                        Job::Prepare { info } => {
+                        Job::Prepare { info, source } => {
                             let shot = capture::snapshot(info.hwnd);
                             match shot.image.as_ref() {
                                 Some(image) => crate::log!(
@@ -64,7 +65,7 @@ impl Worker {
                                 ),
                             }
                             let plan = park::plan(shaiwin_platform_win::window::hwnd_of(info.hwnd));
-                            Reply::Prepared { info, image: shot.image, plan }
+                            Reply::Prepared { info, image: shot.image, plan, source }
                         }
                         Job::Snapshot { id, hwnd } => {
                             let shot = capture::snapshot(hwnd);

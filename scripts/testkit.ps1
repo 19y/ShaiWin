@@ -25,10 +25,12 @@ public static class W {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+  [DllImport("user32.dll")] public static extern bool SystemParametersInfoW(uint action, uint param, out RECT rect, uint winIni);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
   [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
+  [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   public struct RECT { public int Left, Top, Right, Bottom; }
@@ -118,6 +120,15 @@ function Get-VirtualBounds {
   $w = [W]::GetSystemMetrics(78)
   $h = [W]::GetSystemMetrics(79)
   return New-Object W+RECT -Property @{ Left = $x; Top = $y; Right = ($x + $w); Bottom = ($y + $h) }
+}
+
+# The primary monitor's work area: the rectangle the line centres a dragged
+# window in, taskbar excluded. The app reads the same thing (rcWork) for the
+# monitor the line is on, which is the primary one in the test sandbox.
+function Get-WorkArea {
+  $r = New-Object W+RECT
+  if (-not [W]::SystemParametersInfoW(0x0030, 0, [ref]$r, 0)) { return $null }   # SPI_GETWORKAREA
+  return $r
 }
 
 function Move-Cursor([int]$x, [int]$y) {
@@ -284,6 +295,9 @@ function Read-Journal([string]$path) {
       Hwnd = [long]$f[0]
       Pid = [long]$f[1]
       Hooked = ($f.Length -ge 13 -and $f[12] -eq "1")
+      # True when the window was dragged onto the line, so it comes back in the
+      # middle of the screen rather than where it was grabbed.
+      Centred = ($f.Length -ge 17 -and $f[16] -eq "1")
       Fields = $f
     }
   })

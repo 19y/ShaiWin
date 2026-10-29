@@ -20,10 +20,9 @@ repository = "https://github.com/19y/ShaiWin"
 [workspace.dependencies]
 shaiwin-core = { path = "crates/core" }
 
-# Rendering. tiny-skia is pure Rust (no GPU context, no Direct2D boilerplate)
-# and fontdue rasterises the labels we cache as sprites.
+# Rendering. tiny-skia is pure Rust (no GPU context, no Direct2D boilerplate);
+# the labels come from GDI, see crates/app/src/text.rs.
 tiny-skia = "0.12"
-fontdue = "0.9"
 
 # Win32 bindings. Pinned to the version the reference port was verified with.
 windows = "0.62"

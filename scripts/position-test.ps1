@@ -11,10 +11,16 @@
 # pushed into, and a window hung up while minimized keeps a position Windows
 # keeps for itself.
 #
+# The one exception is a window dragged onto the line: it comes back in the
+# middle of the screen the line is on, so its record asks for the centre rather
+# than the rectangle it was grabbed at. Case 7 is that path, drag and all.
+#
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/position-test.ps1
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\testkit.ps1"
+
+$canPointer = Test-CursorControl
 
 $root = Join-Path $env:TEMP "shaiwin-position"
 $state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nhover_open=0`nalways_on=1`nexcluded=`n"
@@ -52,6 +58,12 @@ function Invoke-Case([string]$name, [IntPtr]$h, [bool]$wantZoomed) {
 
   Invoke-Wm (Get-Overlay) $script:KitHang ([IntPtr]::Zero) ([IntPtr]$h)
   if (-not (Wait-Until ({ Test-Parked $h }) 6000)) { Fail "${name}: the window never went up to the line" }
+  # A window hung up by hotkey (or by message, which is the same path) comes
+  # back where it was, so its record must not ask for the middle of the screen.
+  if (-not (Wait-Until ({ Get-Record $journal $h }) 4000)) { Fail "${name}: no journal record after hanging" }
+  if ((Get-Record $journal $h).Centred) {
+    Fail "${name}: a hotkey-hung window was recorded as centred - it must reopen where it was"
+  }
 
   Invoke-Wm (Get-Overlay) $script:KitTakeOne ([IntPtr]::Zero) ([IntPtr]$h)
   if (-not (Wait-Until ({ Test-OnDesktop $h -or [W]::IsZoomed($h) }) 6000)) {
@@ -71,6 +83,27 @@ function Invoke-Case([string]$name, [IntPtr]$h, [bool]$wantZoomed) {
   }
   Write-Host ("  $($back.Detail)")
   Write-Host "  ok"
+}
+
+# Grabs a fixture by its title bar, carries it into the hang band and lets go -
+# the gesture the user makes to put a window on the line. Returns the rectangle
+# the window had before it was grabbed.
+function Drag-ToLine([IntPtr]$h) {
+  $r = Get-Rect $h
+  if (-not $r) { Fail "the fixture has no window to drag" }
+  $grabX = [int](($r.Left + $r.Right) / 2)
+  $grabY = [int]($r.Top + 18)
+  if (-not (Move-Cursor $grabX $grabY)) { Fail "lost cursor control" }
+  [W]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)   # LEFTDOWN
+  Start-Sleep -Milliseconds 200
+  $v = Get-VirtualBounds
+  $bandY = [int]($v.Top + 60)
+  for ($i = 1; $i -le 8; $i++) {
+    [void](Move-Cursor $grabX ($grabY + [int](($bandY - $grabY) * $i / 8)))
+  }
+  Start-Sleep -Milliseconds 400
+  [W]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)   # LEFTUP
+  return $r
 }
 
 try {
@@ -172,7 +205,108 @@ try {
   Write-Host "  $($eBack.Detail)"
   Write-Host "  ok"
 
-  Write-Host "== 7. take everything down =="
+  # 7. a window dragged onto the line comes back in the middle of the screen the
+  #    line is on, not where it was grabbed - that is the difference between
+  #    "put it away" and "hang it up by hand". It has to survive a restart too,
+  #    because the journal is what remembers the choice.
+  if ($canPointer) {
+    Write-Host "== 7. dragged onto the line, comes back centred =="
+    $g = New-Fixture "G" 6
+    $gBefore = Get-Rect $g
+    if (-not $gBefore) { Fail "7. the fixture has no window to drag" }
+    $work = Get-WorkArea
+    if (-not $work) { Fail "7. the work area could not be read" }
+    $centre = Get-Center $work
+    Write-Host ("  grabbed at {0},{1} {2}x{3}, work area centre {4},{5}" -f `
+      $gBefore.Left, $gBefore.Top, ($gBefore.Right - $gBefore.Left), ($gBefore.Bottom - $gBefore.Top), $centre.X, $centre.Y)
+
+    $cursorHome = New-Object W+POINT
+    [void][W]::GetCursorPos([ref]$cursorHome)
+    [void](Drag-ToLine $g)
+    if (-not (Wait-Until ({ Test-Parked $g }) 6000)) {
+      Fail "7. letting go in the band did not hang the window up by the drag"
+    }
+    [void][W]::SetCursorPos($cursorHome.X, $cursorHome.Y)
+    if (-not (Wait-Until ({ Get-Record $journal $g }) 4000)) { Fail "7. no journal record after the drag" }
+    if (-not (Get-Record $journal $g).Centred) {
+      Fail "7. a window hung up by dragging was not recorded as centred"
+    }
+    Write-Host "  hung up by the drag"
+
+    # The choice lives in the journal, so a restart must not turn a centred
+    # window back into one that reopens where it was grabbed.
+    Stop-Process -Id $proc.Id -Force
+    Start-Sleep -Milliseconds 800
+    $proc = Start-Shaiwin (Join-Path $PSScriptRoot "..\target\release\shaiwin.exe") $state
+    Start-Sleep -Milliseconds 2500
+    $overlay = Get-Overlay
+    if (-not (Wait-Until ({ (Get-Record $journal $g) }) 6000)) { Fail "7. the restart lost the record" }
+    Invoke-Wm $overlay $script:KitTakeOne ([IntPtr]::Zero) ([IntPtr]$g)
+    if (-not (Wait-Until ({ Test-OnDesktop $g }) 6000)) { Fail "7. the dragged window never came back down" }
+    Start-Sleep -Milliseconds 600
+
+    $gBack = Get-Rect $g
+    if (-not $gBack) { Fail "7. the dragged window has no rectangle" }
+    $got = Get-Center $gBack
+    $offX = [Math]::Abs($got.X - $centre.X)
+    $offY = [Math]::Abs($got.Y - $centre.Y)
+    $dw = [Math]::Abs(($gBack.Right - $gBack.Left) - ($gBefore.Right - $gBefore.Left))
+    $dh = [Math]::Abs(($gBack.Bottom - $gBack.Top) - ($gBefore.Bottom - $gBefore.Top))
+    Write-Host ("  came back at {0},{1} {2}x{3}, centre {4},{5} - off centre by {6},{7} px" -f `
+      $gBack.Left, $gBack.Top, ($gBack.Right - $gBack.Left), ($gBack.Bottom - $gBack.Top), $got.X, $got.Y, $offX, $offY)
+    if ($offX -gt 10 -or $offY -gt 10) {
+      Fail "7. a dragged window came back off centre by $offX,$offY px - wanted the work area centre $($centre.X),$($centre.Y)"
+    }
+    if ($dw -gt 4 -or $dh -gt 4) {
+      Fail "7. centring changed the window's size (off by $dw,$dh px)"
+    }
+    if ([W]::IsZoomed($g)) { Fail "7. a plain dragged window came back maximized" }
+    Write-Host "  ok"
+
+    # 7b. the same window, but hooked by hotkey first. Dragging the window back
+    #     onto the line is a new decision, so it has to come back centred even
+    #     though its record was written by the hotkey path.
+    Write-Host "== 7b. a hotkey-hung window dragged back up comes back centred =="
+    $hb = New-Fixture "H" 7
+    Invoke-Wm (Get-Overlay) $script:KitHang ([IntPtr]::Zero) ([IntPtr]$hb)
+    if (-not (Wait-Until ({ Test-Parked $hb }) 6000)) { Fail "7b. the fixture never went up by hotkey" }
+    Invoke-Wm (Get-Overlay) $script:KitTakeOne ([IntPtr]::Zero) ([IntPtr]$hb)
+    if (-not (Wait-Until ({ Test-OnDesktop $hb }) 6000)) { Fail "7b. the hotkey-hung window never came back down" }
+    Start-Sleep -Milliseconds 600
+    if ((Get-Record $journal $hb).Centred) { Fail "7b. the hotkey hang was already centred - the test lost its premise" }
+
+    # Park it somewhere clear of the line and of the screen edges: a later
+    # fixture index lands mostly below the screen on a scaled display, and the
+    # title bar has to be on screen for the drag to reach it.
+    [void][W]::SetWindowPos($hb, [IntPtr]::Zero, 300, 400, 690, 480, 0x0010)
+    Start-Sleep -Milliseconds 500
+    $beforeH = Get-Rect $hb
+    [void](Drag-ToLine $hb)
+    if (-not (Wait-Until ({ Test-Parked $hb }) 6000)) { Fail "7b. dragging the hooked window back up did not hang it" }
+    [void][W]::SetCursorPos($cursorHome.X, $cursorHome.Y)
+    if (-not (Wait-Until ({ (Get-Record $journal $hb).Centred }) 4000)) {
+      Fail "7b. a hotkey-hung window dragged back onto the line was not recorded as centred"
+    }
+
+    Invoke-Wm (Get-Overlay) $script:KitTakeOne ([IntPtr]::Zero) ([IntPtr]$hb)
+    if (-not (Wait-Until ({ Test-OnDesktop $hb }) 6000)) { Fail "7b. the re-hung window never came back down" }
+    Start-Sleep -Milliseconds 600
+    $hBack = Get-Rect $hb
+    $hGot = Get-Center $hBack
+    $hOffX = [Math]::Abs($hGot.X - $centre.X)
+    $hOffY = [Math]::Abs($hGot.Y - $centre.Y)
+    Write-Host ("  grabbed at {0},{1}, came back at {2},{3} - off centre by {4},{5} px" -f `
+      $beforeH.Left, $beforeH.Top, $hBack.Left, $hBack.Top, $hOffX, $hOffY)
+    if ($hOffX -gt 10 -or $hOffY -gt 10) {
+      Fail ("7b. dragging a hooked window back onto the line left it at {0},{1} instead of the centre {2},{3}" -f `
+        $hBack.Left, $hBack.Top, $centre.X, $centre.Y)
+    }
+    Write-Host "  ok"
+  } else {
+    Write-Host "== 7. SKIPPED: this session has no pointer to move =="
+  }
+
+  Write-Host "== 8. take everything down =="
   Invoke-Wm (Get-Overlay) $script:KitTakeAll ([IntPtr]::Zero) ([IntPtr]::Zero)
   if (-not (Wait-Until ({ -not (Test-Path $journal) }) 8000)) { Fail "the journal survived taking everything down" }
   Write-Host "PASS"

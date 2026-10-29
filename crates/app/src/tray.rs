@@ -52,9 +52,19 @@ pub fn remove(hwnd: HWND) {
     }
 }
 
-pub fn set_tip(hwnd: HWND, icon: HICON, tip: &str) {
+/// Changes only the tooltip. The other flags are deliberately left out: a
+/// NIM_MODIFY that carries NIF_ICON re-publishes the icon, and the shell
+/// redraws the notification area every time it happens, which reads as the
+/// taskbar flickering while the line is being used.
+pub fn set_tip(hwnd: HWND, tip: &str) {
     unsafe {
-        let mut data = nid(hwnd, Some(icon));
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_TIP | NIF_SHOWTIP,
+            ..Default::default()
+        };
         let mut text = [0u16; 128];
         set_text(&mut data, &mut text, tip);
         let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
