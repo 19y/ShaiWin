@@ -18,18 +18,19 @@ use shaiwin_platform_win::park::{self, ParkError, Parked};
 use shaiwin_platform_win::window::{self, Rejection, WindowInfo};
 use shaiwin_platform_win::Rect as WRect;
 use tiny_skia::{IntSize, Pixmap};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC, HGDIOBJ, SelectObject, ValidateRect,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, ValidateRect,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+    HBITMAP, HDC, HGDIOBJ,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture,
-    UnregisterHotKey, VK_LBUTTON,
+    GetAsyncKeyState, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
+    HOT_KEY_MODIFIERS, MOD_NOREPEAT, VK_ESCAPE, VK_LBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
 
 use crate::i18n::t;
 use crate::journal;
@@ -40,6 +41,11 @@ use crate::worker::{Job, Reply, Worker};
 use crate::{ico, settings_ui, tray};
 
 const CLASS: PCWSTR = w!("ShaiWin.Line");
+/// The rope's own layer. It outlives a card layer that has sunk behind the
+/// user's work: the line must stay visible enough to reach for, even when the
+/// cards are no longer on top. It is always click-through, so it never steals a
+/// click from the window underneath.
+const ROPE_CLASS: PCWSTR = w!("ShaiWin.Rope");
 const TIMER_FRAME: usize = 1;
 const TIMER_POLL: usize = 2;
 /// Frame intervals, in milliseconds. The fast one is what smoothness wants; the
@@ -50,7 +56,6 @@ const FRAME_MS_SLOW: u32 = 50;
 const HOTKEY_HANG: i32 = 1;
 const HOTKEY_TOGGLE: i32 = 2;
 
-const CMD_HANG: u32 = 1;
 const CMD_TAKE_ALL: u32 = 2;
 const CMD_TOGGLE: u32 = 3;
 const CMD_LOGIN: u32 = 4;
@@ -58,6 +63,10 @@ const CMD_QUIT: u32 = 5;
 const CMD_TAKE_ONE: u32 = 6;
 const CMD_SETTINGS: u32 = 7;
 const CMD_UNHOOK: u32 = 8;
+/// Opens the tag editor for the card under the menu.
+const CMD_TAG_EDIT: u32 = 9;
+/// Removes the card's tag without opening the editor.
+const CMD_TAG_CLEAR: u32 = 10;
 
 /// Automation hook: `PostMessage(hwnd, WM_HANG_HWND, 0, hwnd)`. Used by the
 /// smoke test and by external scripts; the CLI may grow a wrapper later.
@@ -71,6 +80,20 @@ const WM_DUMP_FRAME: u32 = WM_APP + 12;
 const WM_TAKE_HWND: u32 = WM_APP + 13;
 /// Automation hook: stop managing one window by HWND in lParam.
 const WM_UNHOOK_HWND: u32 = WM_APP + 14;
+/// Automation hook: open the settings window, so a script can look at it.
+const WM_OPEN_SETTINGS: u32 = WM_APP + 15;
+/// Automation hook: open the tag editor for the card of the HWND in lParam.
+const WM_OPEN_TAG: u32 = WM_APP + 16;
+/// Automation hook: answer every pointer question from (`wParam`, `lParam`)
+/// instead of the real cursor, until `wParam == u32::MAX` puts it back. The
+/// z-order rule is entirely "where is the pointer", and a headless test
+/// session is not allowed to move the real one.
+const WM_POINT_AT: u32 = WM_APP + 17;
+/// Automation hook: pretend a window of the user's is being dragged, the way
+/// the system's move loop reports one, until sent again with `wParam == 0`.
+/// A headless session cannot start a real move loop, and the rule under test -
+/// a drag never brings the cards up - is the poll's, not the loop's.
+const WM_PRETEND_DRAG: u32 = WM_APP + 18;
 
 /// The sentinel hit rectangle for the "show the line" pill (see `peek`).
 pub const PEEK_ID: u64 = u64::MAX;
@@ -93,17 +116,17 @@ impl HangSource {
     }
 }
 
-/// How long the cursor rests at the top edge before the line comes down.
-const DWELL: Duration = Duration::from_millis(180);
-/// The same, while the line is empty. A little longer, so a cursor that merely
-/// grazes the top edge on its way somewhere else does not summon an empty line.
-const DWELL_EMPTY: Duration = Duration::from_millis(450);
-/// How long after leaving the line before it tucks away.
-const AWAY: Duration = Duration::from_millis(420);
-/// How long an empty line waits after the last card comes off before it goes
-/// away on its own. Long enough to read the hint, short enough to stay out of
-/// the way. A line the user asked for is pinned and never hides by itself.
-const EMPTY_GRACE: Duration = Duration::from_millis(900);
+/// How long the pointer has to rest **on the pill** before it opens the line by
+/// itself, the alternative being to click it. Short on purpose: a pointer that
+/// has actually travelled onto the button is asking for the line, and making it
+/// wait is the "why is nothing happening?" the button used to cause. This is
+/// only the fallback for a pointer that arrived without visible movement; a
+/// pointer that moves while on the pill opens it at once, see `poll_peek`.
+const DWELL: Duration = Duration::from_millis(80);
+/// The same while the line is empty. A little longer, so a pointer that grazes
+/// the button on its way somewhere else does not pull out a rope with nothing on
+/// it.
+const DWELL_EMPTY: Duration = Duration::from_millis(220);
 /// A window that comes down stays "hooked": minimizing it hangs it up again.
 /// Ignore a minimize in the first moments after taking it down, so restoring it
 /// cannot immediately bounce it back.
@@ -124,6 +147,41 @@ const STUCK_GIVE_UP: Duration = Duration::from_millis(700);
 /// How long the little "show the line" pill stays when the pointer leaves it.
 const PEEK_AWAY: Duration = Duration::from_millis(500);
 const PEEK_LIFE: Duration = Duration::from_secs(6);
+/// After the cards have sunk behind the user's window, the pointer has to rest
+/// on the rope (not merely brush the top edge on its way to a title bar) for
+/// this long before the cards come back. Short enough to feel immediate, long
+/// enough that passing over the rope does not cover the window being used.
+const RAISE_DWELL: Duration = Duration::from_millis(140);
+
+/// Non-resident mode: the line is a short visit, not furniture. `auto_hide_secs`
+/// in the settings is the idle clock; these are the events that can end an empty
+/// visit sooner, and the grace after a take-down.
+///
+/// The slack after the last real action — a card let go, a window released on
+/// the rope, the pointer leaving the line. Long enough to put the pointer back
+/// on the rope and reach for the next window; short enough that a line nobody
+/// is using is not furniture.
+const VISIT_GRACE: Duration = Duration::from_millis(1_200);
+/// A click on another window, or another window taking the foreground, says the
+/// visit is over. Escape says it louder. The 0.28 s is the slide out, not a
+/// decision period.
+const VISIT_LEAVE: Duration = Duration::from_millis(280);
+/// The line can be empty on purpose: the user pulled it out to have somewhere
+/// to put a window, went to find that window, and is on their way back. That
+/// trip - opening Alt+Tab, choosing, dragging - takes seconds, so an empty line
+/// gets this much after the pointer leaves rather than the one-second visit.
+/// Long enough to choose; short enough that a rope nobody came back to is gone
+/// before it becomes furniture.
+const EMPTY_LINE_LINGER: Duration = Duration::from_secs(4);
+/// After a card goes back to the desktop the line stays down for a moment. The
+/// restored window is about to take the foreground, and that is not the user
+/// going elsewhere; dragging that window anywhere re-arms the busy clock.
+const VISIT_AFTER_TAKE: Duration = Duration::from_millis(1_500);
+/// The tag editor closes on the card, so the line stays a moment longer for the
+/// new label to be read before the visit clock takes over.
+const VISIT_AFTER_TAG: Duration = Duration::from_millis(1_800);
+/// A launch shows the line whatever mode it is in — see the startup block.
+const LAUNCH_LOOK: Duration = Duration::from_secs(4);
 
 pub enum Deferred {
     None,
@@ -162,9 +220,17 @@ impl Dib {
                 ..Default::default()
             };
             let mut bits: *mut c_void = std::ptr::null_mut();
-            let bitmap = CreateDIBSection(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let bitmap =
+                CreateDIBSection(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
             let old = SelectObject(hdc, bitmap.into());
-            Some(Dib { hdc, bitmap, old, bits: bits as *mut u8, w, h })
+            Some(Dib {
+                hdc,
+                bitmap,
+                old,
+                bits: bits as *mut u8,
+                w,
+                h,
+            })
         }
     }
 }
@@ -199,6 +265,16 @@ struct StuckFocus {
     hwnd: isize,
     since: Instant,
     last_try: Instant,
+}
+
+/// The window that was just taken off the line, and where it stood at the last
+/// look. Its rectangle moving while the left button is held is the user dragging
+/// it away, which is the same gesture as the hang that came before it.
+#[derive(Clone, Copy)]
+struct TakeWatch {
+    hwnd: isize,
+    rect: WRect,
+    until: Instant,
 }
 
 /// A press on a card. On its face it becomes a drag once the pointer travels
@@ -246,12 +322,15 @@ pub struct App {
     revealed: bool,
     pinned: bool,
     /// The user put the line away on purpose (the toggle hotkey or the tray
-    /// menu). A line that merely tucked itself away because the pointer left is
-    /// not dismissed, and a window dragged to the top still opens it and hangs.
-    /// A dismissed line is inert: it must not light up, come back or accept a
-    /// drop just because a window is dragged over the place it used to occupy.
+    /// menu), or a visit ran out. A dismissed line is inert: it must not light
+    /// up, come back or accept a drop just because a window is dragged over the
+    /// place it used to occupy.
     dismissed: bool,
     hold_until: Option<Instant>,
+    /// In non-resident mode, when the line should tuck itself away. The pointer
+    /// resting on the line and a card going back to the desktop both push it
+    /// forward; nothing shortens it but a click outside an empty line.
+    transient_until: Option<Instant>,
     slide: f32,
     shown: bool,
     anim_running: bool,
@@ -267,6 +346,27 @@ pub struct App {
     hover: Option<u64>,
     hits: Vec<(u64, WRect)>,
     click_through: bool,
+    /// Whether the card layer is asking Windows for the top of the screen. It
+    /// does that while the line is being used and gives it back the moment a
+    /// click lands somewhere else — see `set_topmost`.
+    topmost: bool,
+    /// The rope's own always-on-top, click-through layer. It is shown only while
+    /// the card layer is not topmost, so the rope stays reachable after the
+    /// cards have sunk behind the user's work.
+    rope_hwnd: HWND,
+    rope_canvas: Option<Pixmap>,
+    rope_dib: Option<Dib>,
+    rope_shown: bool,
+    /// Cursor position at the previous poll, so "the pointer moved onto the
+    /// pill" can open the line immediately instead of waiting out the dwell.
+    last_cursor: (i32, i32),
+    /// Automation hook: a stand-in for the pointer. A session with no input
+    /// desktop refuses to move the real one, and the whole z-order rule is a
+    /// question about where the pointer is, so the test sets this instead.
+    hover_point: Option<(i32, i32)>,
+    /// Automation hook: stand in for a drag the way `hover_point` stands in
+    /// for the pointer. Inert unless a test posts `WM_PRETEND_DRAG`.
+    pretend_drag: bool,
 
     drag: Option<DragWatch>,
     /// Where the pointer was when this press was first seen. A press that has
@@ -277,17 +377,51 @@ pub struct App {
     /// It is what lights the rope; the release asks the same question again.
     band_hot: bool,
     buttons_were_down: bool,
-    hot_since: Option<Instant>,
-    away_since: Option<Instant>,
-    empty_since: Option<Instant>,
+    /// The left button as of the last poll. Its falling edge is how the app
+    /// notices a click outside the line without taking input away from the
+    /// window that was clicked.
+    left_down: bool,
+    /// Whether the press now in progress moved a window or a card. A press that
+    /// turned into a drag is the user bringing something to the line; a press
+    /// that came back where it went in is a click, and a click that lands off
+    /// the line is the user going elsewhere.
+    press_dragged: bool,
+    /// The window last taken down and where it stood. While the left button is
+    /// held and that rectangle keeps changing, the user is dragging the window
+    /// they just freed away from the line: the gesture is still going on, and no
+    /// clock gets to decide when the line leaves.
+    take_watch: Option<TakeWatch>,
+    /// Escape as of the last poll. Its falling edge ends a visit at once, the
+    /// way a click on another window does.
+    esc_was_down: bool,
     /// False after an explicit "hide line" until the pointer leaves the top
     /// edge, so hiding the line while the cursor rests there sticks.
     hover_ready: bool,
-    /// The small "show the line" pill, used instead of hover-to-open when the
-    /// user turned that setting off.
+    /// The small "show the line" pill a non-resident line offers before the
+    /// user opens it. Hovering the edge never opens the line by itself.
     peek: bool,
     peek_hover: bool,
     peek_since: Option<Instant>,
+    /// When the pointer came onto the pill. Resting on it for the dwell opens the
+    /// line without the click; the pointer merely reaching the top edge does not.
+    peek_hot: Option<Instant>,
+    /// When the pointer first rested on the rope after the cards were demoted.
+    /// The cards come back after `RAISE_DWELL`, so brushing the rope does not
+    /// cover the window being worked in.
+    raise_since: Option<Instant>,
+    /// Whether the pointer was on the line at the previous poll, so leaving it
+    /// is an edge the visit rules can see once.
+    line_hot: bool,
+    /// Whether the line was empty at the previous poll, so the moment it runs
+    /// out of cards is an edge the visit rules can see once.
+    line_was_empty: bool,
+    /// A Win32 popup menu of ours is up. A menu is a normal window and cannot
+    /// be painted over a topmost layer, so the cards stay down until it closes;
+    /// and a menu is the user using the line, so the visit clock is paused.
+    menu_open: bool,
+    /// The card whose tag editor is open. While it is open the card layer keeps
+    /// the top and the visit clock is paused, so the live preview stays visible.
+    tag_card: Option<u64>,
     peek_away: Option<Instant>,
     /// The card being dragged along the line (reordering).
     card_press: Option<CardPress>,
@@ -306,6 +440,10 @@ pub struct App {
     /// would read that as "the user asked to see it" and take the card straight
     /// back down again.
     recent_park: Option<(isize, Instant)>,
+    /// A card that is hung but has not been painted yet, and when its window was
+    /// moved off screen. The gap is the part of a hang the user actually waits
+    /// for: everything before it happens while the window is still on screen.
+    hang_undrawn: Option<(isize, Instant)>,
 
     /// Large icon for Alt-Tab and small icon for the title bar, taskbar and
     /// tray. Both are loaded at the size Windows asks for at this DPI, so no
@@ -345,6 +483,17 @@ pub fn register_class(hinst: HINSTANCE, big: HICON, small: HICON) {
             ..Default::default()
         };
         RegisterClassExW(&class);
+        let rope = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(rope_wndproc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hIcon: big,
+            hIconSm: small,
+            lpszClassName: ROPE_CLASS,
+            ..Default::default()
+        };
+        RegisterClassExW(&rope);
     }
 }
 
@@ -357,8 +506,13 @@ impl App {
             let tray_icon = ico::load(ico::small_size()).unwrap_or_default();
             register_class(hinst, window_icon, tray_icon);
             settings_ui::register_class(hinst, window_icon, tray_icon);
+            crate::tag_ui::register_class(hinst, window_icon, tray_icon);
             let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE,
                 CLASS,
                 w!("ShaiWin"),
                 WS_POPUP,
@@ -373,6 +527,25 @@ impl App {
             )
             .ok()?;
             let raw = hwnd.0 as isize;
+            let rope_hwnd = CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE,
+                ROPE_CLASS,
+                w!("ShaiWinRope"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap_or_default();
 
             let monitor = monitor::at_point(monitor::cursor().0, monitor::cursor().1);
             let layout = settings.layout_for(monitor.bounds.width() as f32, monitor.scale);
@@ -402,6 +575,7 @@ impl App {
                 pinned: false,
                 dismissed: false,
                 hold_until: None,
+                transient_until: None,
                 slide: 0.0,
                 shown: false,
                 anim_running: false,
@@ -412,23 +586,39 @@ impl App {
                 hover: None,
                 hits: Vec::new(),
                 click_through: true,
+                topmost: true,
+                rope_hwnd,
+                rope_canvas: None,
+                rope_dib: None,
+                rope_shown: false,
+                last_cursor: monitor::cursor(),
+                hover_point: None,
+                pretend_drag: false,
                 drag: None,
                 press_at: None,
                 band_hot: false,
                 buttons_were_down: false,
-                hot_since: None,
-                away_since: None,
-                empty_since: None,
+                left_down: false,
                 hover_ready: true,
                 peek: false,
                 peek_hover: false,
                 peek_since: None,
+                peek_hot: None,
+                raise_since: None,
+                line_hot: false,
+                line_was_empty: true,
+                menu_open: false,
+                tag_card: None,
                 peek_away: None,
                 card_press: None,
                 last_foreground: window::foreground().map(window::raw_of).unwrap_or(0),
+                press_dragged: false,
+                take_watch: None,
+                esc_was_down: false,
                 pending_foreground: None,
                 stuck_foreground: None,
                 recent_park: None,
+                hang_undrawn: None,
                 window_icon,
                 tray_icon,
                 tray_tip: crate::i18n::tray_tip(0),
@@ -477,17 +667,25 @@ impl App {
         unsafe {
             if self.settings.hang_vk != 0 {
                 let mods = HOT_KEY_MODIFIERS(self.settings.hang_mods) | MOD_NOREPEAT;
-                if let Err(error) = RegisterHotKey(Some(self.hwnd), HOTKEY_HANG, mods, self.settings.hang_vk) {
+                if let Err(error) =
+                    RegisterHotKey(Some(self.hwnd), HOTKEY_HANG, mods, self.settings.hang_vk)
+                {
                     crate::log!("hotkey {} was refused: {error}", self.settings.hang_label());
                     failed.push(self.settings.hang_label());
                 }
             }
             if self.settings.toggle_vk != 0 {
                 let mods = HOT_KEY_MODIFIERS(self.settings.toggle_mods) | MOD_NOREPEAT;
-                if let Err(error) =
-                    RegisterHotKey(Some(self.hwnd), HOTKEY_TOGGLE, mods, self.settings.toggle_vk)
-                {
-                    crate::log!("hotkey {} was refused: {error}", self.settings.toggle_label());
+                if let Err(error) = RegisterHotKey(
+                    Some(self.hwnd),
+                    HOTKEY_TOGGLE,
+                    mods,
+                    self.settings.toggle_vk,
+                ) {
+                    crate::log!(
+                        "hotkey {} was refused: {error}",
+                        self.settings.toggle_label()
+                    );
                     failed.push(self.settings.toggle_label());
                 }
             }
@@ -508,24 +706,49 @@ impl App {
             self.settings.welcomed = true;
             self.settings.save();
             self.revealed = true;
-            self.hold_until = Some(Instant::now() + Duration::from_secs(6));
+            let until = Instant::now() + Duration::from_secs(6);
+            self.hold_until = Some(until);
+            if !self.settings.always_on {
+                self.transient_until = Some(until);
+            }
             // The line is only useful once somebody knows it is there. Say how
             // it works, once.
             if !self.tray_icon.is_invalid() {
-                tray::balloon(self.hwnd, self.tray_icon, t("howto_title"), t("howto_body"), false);
+                tray::balloon(
+                    self.hwnd,
+                    self.tray_icon,
+                    t("howto_title"),
+                    t("howto_body"),
+                    false,
+                );
             }
             self.invalidate();
         }
         // Elevation is a real safety trade-off, not a success: say so once.
         if self.self_elevated {
-            tray::balloon(self.hwnd, self.tray_icon, t("app_name"), t("elevated_tip"), true);
+            tray::balloon(
+                self.hwnd,
+                self.tray_icon,
+                t("app_name"),
+                t("elevated_tip"),
+                true,
+            );
         }
-        // The line is the only window this app has. Tucked away at the top edge
-        // it reads as "ShaiWin is not running", so by default it stays down
-        // until it is dismissed on purpose (the toggle shortcut un-pins it).
+        // The line is the only window this app has. Tucked at the top edge it
+        // reads as "ShaiWin never started", and that is exactly how every launch
+        // that left it up there has been read. So a launch always brings it down:
+        // resident mode keeps it, non-resident gets one look at it before the
+        // visit rules put it away.
+        self.revealed = true;
+        self.dismissed = false;
         if self.settings.always_on {
-            self.revealed = true;
             self.pinned = true;
+            self.transient_until = None;
+        } else {
+            self.start_visit();
+            let until = Instant::now() + LAUNCH_LOOK;
+            self.hold_until = Some(until);
+            self.transient_until = Some(self.transient_until.map_or(until, |t| t.max(until)));
         }
         self.invalidate();
     }
@@ -537,6 +760,10 @@ impl App {
             if !self.settings_wnd.is_invalid() {
                 let _ = DestroyWindow(self.settings_wnd);
                 self.settings_wnd = HWND::default();
+            }
+            if !self.rope_hwnd.is_invalid() {
+                let _ = DestroyWindow(self.rope_hwnd);
+                self.rope_hwnd = HWND::default();
             }
             let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_HANG);
             let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_TOGGLE);
@@ -565,7 +792,9 @@ impl App {
             if !window::still_same_window(entry.hwnd, entry.pid, entry.process_start) {
                 continue;
             }
-            let Some(now) = window::rect_of(window::hwnd_of(entry.hwnd)) else { continue };
+            let Some(now) = window::rect_of(window::hwnd_of(entry.hwnd)) else {
+                continue;
+            };
             if entry.hooked_away {
                 // The window was on the desktop, hooked, when we stopped. No
                 // window to put back: only the hook is worth recovering.
@@ -610,8 +839,14 @@ impl App {
                 accent: accent_for(&entry.exe),
                 placement: entry.placement,
                 parked: entry.parked,
-                window_rect: if entry.hooked_away { now } else { entry.placement.normal },
+                window_rect: if entry.hooked_away {
+                    now
+                } else {
+                    entry.placement.normal
+                },
                 centred: entry.centred,
+                tag: entry.tag.clone(),
+                tag_version: 0,
                 thumb: None,
                 thumb_version: 0,
                 icon,
@@ -630,15 +865,25 @@ impl App {
             };
             revealed_any |= !entry.hooked_away;
             self.line.recover(card, &self.layout);
-            self.worker.send(Job::Snapshot { id, hwnd: entry.hwnd });
+            self.worker.send(Job::Snapshot {
+                id,
+                hwnd: entry.hwnd,
+            });
             if !self.icons.contains_key(&entry.exe) {
-                self.worker.send(Job::Icon { id, exe_path: entry.exe.clone() });
+                self.worker.send(Job::Icon {
+                    id,
+                    exe_path: entry.exe.clone(),
+                });
             }
         }
         if revealed_any {
             self.revealed = true;
             self.dismissed = false;
+            self.pinned = self.settings.always_on;
             self.hold_until = Some(Instant::now() + Duration::from_secs(3));
+            if !self.settings.always_on {
+                self.transient_until = Some(Instant::now() + Duration::from_secs(6));
+            }
         }
     }
 
@@ -679,19 +924,65 @@ impl App {
                 LRESULT(0)
             }
             WM_TAKE_HWND => {
-                if let Some(id) = self.line.cards.iter().find(|c| c.hwnd == lp.0).map(|c| c.id) {
+                if let Some(id) = self
+                    .line
+                    .cards
+                    .iter()
+                    .find(|c| c.hwnd == lp.0)
+                    .map(|c| c.id)
+                {
                     self.take_down(id);
                 }
                 LRESULT(0)
             }
             WM_UNHOOK_HWND => {
-                if let Some(id) = self.line.cards.iter().find(|c| c.hwnd == lp.0).map(|c| c.id) {
+                if let Some(id) = self
+                    .line
+                    .cards
+                    .iter()
+                    .find(|c| c.hwnd == lp.0)
+                    .map(|c| c.id)
+                {
                     self.unhook(id);
                 }
                 LRESULT(0)
             }
             WM_TAKE_ALL => {
                 self.take_all();
+                LRESULT(0)
+            }
+            WM_OPEN_SETTINGS => {
+                self.open_settings();
+                LRESULT(0)
+            }
+            WM_OPEN_TAG => {
+                if let Some(id) = self
+                    .line
+                    .cards
+                    .iter()
+                    .find(|c| c.hwnd == lp.0)
+                    .map(|c| c.id)
+                {
+                    let initial = self
+                        .line
+                        .get(id)
+                        .map(|card| card.tag.clone())
+                        .unwrap_or_default();
+                    self.open_tag_dialog(id, &initial);
+                }
+                LRESULT(0)
+            }
+            WM_POINT_AT => {
+                let packed = wp.0 as u32;
+                self.hover_point = if packed == u32::MAX {
+                    None
+                } else {
+                    Some((packed as i32, lp.0 as i32))
+                };
+                LRESULT(0)
+            }
+            WM_PRETEND_DRAG => {
+                self.pretend_drag = wp.0 != 0;
                 LRESULT(0)
             }
             WM_DUMP_FRAME => {
@@ -727,10 +1018,13 @@ impl App {
                 let (x, y) = monitor::cursor();
                 let local = (x - self.origin.0, y - self.origin.1);
                 let over = self.card_at(local).is_some() || self.peek_at(local);
-                let edge = self.card_at(local).filter(|id| *id != PEEK_ID).and_then(|id| {
-                    self.card_rect(id)
-                        .and_then(|rect| crate::line::edge_at(&rect, local, self.layout.scale))
-                });
+                let edge = self
+                    .card_at(local)
+                    .filter(|id| *id != PEEK_ID)
+                    .and_then(|id| {
+                        self.card_rect(id)
+                            .and_then(|rect| crate::line::edge_at(&rect, local, self.layout.scale))
+                    });
                 unsafe {
                     let icon = match edge {
                         Some(crate::line::Edge::Bottom) => IDC_SIZENS,
@@ -751,6 +1045,13 @@ impl App {
                 crate::log!("press at {point:?}: card={:?}", self.card_at(point));
                 if let Some(id) = self.card_at(point) {
                     if id != PEEK_ID {
+                        // The card layer cannot take activation, so a click on a
+                        // card is not a deactivation for the tag popover. Close
+                        // it here, and save what was typed: the user's next
+                        // gesture is about the card, not about the field. Posted
+                        // rather than called: DestroyWindow would re-enter this
+                        // handler while it still owns the app.
+                        crate::tag_ui::close_saving();
                         // The side edges resize the width, the bottom edge the
                         // height, and the bottom corners both at once. The face
                         // drags or clicks.
@@ -765,9 +1066,11 @@ impl App {
                         // How tall one unit of vertical zoom is on screen right
                         // now: the card is drawn at its own zoom and the line's
                         // packed fit, and the body starts below the pin.
-                        let k = self.line.get(id).map_or(1.0, |card| card.scale) * self.line.fit(&self.layout);
+                        let k = self.line.get(id).map_or(1.0, |card| card.scale)
+                            * self.line.fit(&self.layout);
                         let height_unit = CARD_H * self.layout.scale * k;
-                        let body_top = rect.map_or(0.0, |rect| rect.bottom as f32 - height_unit * zoom_y0);
+                        let body_top =
+                            rect.map_or(0.0, |rect| rect.bottom as f32 - height_unit * zoom_y0);
                         self.card_press = Some(CardPress {
                             id,
                             start: point,
@@ -866,11 +1169,35 @@ impl App {
     fn finish_menu(&mut self, kind: MenuKind) -> Option<u32> {
         let menu = self.build_menu(kind);
         let hwnd = self.hwnd;
+        // A Win32 popup menu is itself a topmost window while it is tracked,
+        // and Windows keeps it above every other topmost window - the card
+        // layer included. So opening a menu does not ask the cards to give up
+        // the top: they stay exactly where they are, which is what "the line
+        // is still on top while I use its menu" means. `menu_open` only tells
+        // the poll not to re-decide the z-order, follow the monitor or slide
+        // the line while the menu is anchored to it.
+        self.menu_open = true;
         unsafe {
             let _ = SetForegroundWindow(hwnd);
         }
+        self.sync_rope();
         let at = tray::cursor();
-        let cmd = unsafe { TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, at.x, at.y, None, hwnd, None).0 as u32 };
+        let cmd = unsafe {
+            TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                at.x,
+                at.y,
+                None,
+                hwnd,
+                None,
+            )
+            .0 as u32
+        };
+        // Cleared before the command runs: "add a tag" opens the editor, and
+        // that one is the line being used again.
+        self.menu_open = false;
+        self.sync_rope();
         unsafe {
             let _ = DestroyMenu(menu);
             let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
@@ -892,29 +1219,54 @@ impl App {
                 MenuKind::Card => {
                     add(CMD_TAKE_ONE, t("restore"), MF_ENABLED);
                     sep();
+                    // A tag is typed in, not picked from a list: every window
+                    // needs a different name, and presets only get in the way.
+                    let current = self
+                        .card_menu_target
+                        .and_then(|id| self.line.get(id))
+                        .map(|card| card.tag.as_str())
+                        .unwrap_or("");
+                    if current.is_empty() {
+                        add(CMD_TAG_EDIT, t("tag_menu"), MF_ENABLED);
+                    } else {
+                        add(
+                            CMD_TAG_EDIT,
+                            &format!("{}{}", t("tag_current"), current),
+                            MF_ENABLED,
+                        );
+                        add(CMD_TAG_CLEAR, t("tag_clear"), MF_ENABLED);
+                    }
+                    sep();
                     add(CMD_UNHOOK, t("unhook"), MF_ENABLED);
                 }
                 MenuKind::Tray => {
-                    let current = window::foreground()
-                        .filter(|h| {
-                            let pid = window::pid_of(*h);
-                            pid != 0 && pid != self.self_pid
-                        })
-                        .and_then(|h| window::check(h, self.self_pid).ok());
-                    let hang = match &current {
-                        Some(info) => {
-                            format!("{}\t{}", truncate(&info.title, 40), self.settings.hang_label())
-                        }
-                        None => format!("{}\t{}", t("hang_short"), self.settings.hang_label()),
-                    };
-                    add(CMD_HANG, &hang, if current.is_some() { MF_ENABLED } else { MF_GRAYED });
-                    add(CMD_TAKE_ALL, t("take_down_all"), if self.line.hooked_count() > 0 { MF_ENABLED } else { MF_GRAYED });
+                    add(
+                        CMD_TAKE_ALL,
+                        t("take_down_all"),
+                        if self.line.hooked_count() > 0 {
+                            MF_ENABLED
+                        } else {
+                            MF_GRAYED
+                        },
+                    );
                     sep();
-                    let toggle = if self.revealed { t("hide_line") } else { t("show_line") };
-                    add(CMD_TOGGLE, &format!("{toggle}\t{}", self.settings.toggle_label()), MF_ENABLED);
+                    let toggle = if self.revealed {
+                        t("hide_line")
+                    } else {
+                        t("show_line")
+                    };
+                    add(
+                        CMD_TOGGLE,
+                        &format!("{toggle}\t{}", self.settings.toggle_label()),
+                        MF_ENABLED,
+                    );
                     add(CMD_SETTINGS, t("settings"), MF_ENABLED);
                     sep();
-                    let check = if tray::start_at_login() { MF_CHECKED } else { MF_UNCHECKED };
+                    let check = if tray::start_at_login() {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    };
                     add(CMD_LOGIN, t("open_at_login"), check | MF_ENABLED);
                     sep();
                     add(CMD_QUIT, t("quit"), MF_ENABLED);
@@ -926,22 +1278,15 @@ impl App {
 
     fn command(&mut self, id: u32) {
         match id {
-            CMD_HANG => {
-                if let Some(hwnd) = window::foreground() {
-                    self.request_hang(window::raw_of(hwnd), HangSource::Command);
-                }
-            }
             CMD_TAKE_ALL => self.take_all(),
             CMD_TOGGLE => self.toggle_reveal(),
             CMD_SETTINGS => self.open_settings(),
             CMD_LOGIN => {
                 tray::set_start_at_login(!tray::start_at_login());
             }
-            CMD_QUIT => {
-                unsafe {
-                    let _ = DestroyWindow(self.hwnd);
-                }
-            }
+            CMD_QUIT => unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            },
             CMD_TAKE_ONE => {
                 if let Some(id) = self.card_menu_target {
                     self.take_down(id);
@@ -950,6 +1295,21 @@ impl App {
             CMD_UNHOOK => {
                 if let Some(id) = self.card_menu_target {
                     self.unhook(id);
+                }
+            }
+            CMD_TAG_EDIT => {
+                if let Some(id) = self.card_menu_target {
+                    let initial = self
+                        .line
+                        .get(id)
+                        .map(|card| card.tag.clone())
+                        .unwrap_or_default();
+                    self.open_tag_dialog(id, &initial);
+                }
+            }
+            CMD_TAG_CLEAR => {
+                if let Some(id) = self.card_menu_target {
+                    self.set_card_tag(id, "");
                 }
             }
             _ => {}
@@ -977,7 +1337,13 @@ impl App {
         // only way to put it back on the line is to hang it again, and refusing
         // that with "already hung" - while nothing of it is on the line - is a
         // dead end the user cannot get out of.
-        if let Some(id) = self.line.cards.iter().find(|c| c.hwnd == hwnd && c.away).map(|c| c.id) {
+        if let Some(id) = self
+            .line
+            .cards
+            .iter()
+            .find(|c| c.hwnd == hwnd && c.away)
+            .map(|c| c.id)
+        {
             crate::log!("hang {hwnd}: hooked window put back on the line");
             self.rehang(id, Some(source));
             return;
@@ -986,7 +1352,11 @@ impl App {
             self.complain(t("already_hung").to_string());
             return;
         }
-        self.worker.send(Job::Prepare { info, source });
+        self.worker.send(Job::Prepare {
+            info,
+            source,
+            asked: Instant::now(),
+        });
     }
 
     fn on_prepared(
@@ -1030,9 +1400,15 @@ impl App {
             exe: exe.clone(),
             accent,
             placement: plan.placement,
-            parked: Parked { placement: plan.placement, parked: plan.target, was_maximized: plan.was_maximized },
+            parked: Parked {
+                placement: plan.placement,
+                parked: plan.target,
+                was_maximized: plan.was_maximized,
+            },
             window_rect: info.rect,
             centred: source.centred(),
+            tag: String::new(),
+            tag_version: 0,
             thumb,
             thumb_version: 1,
             icon,
@@ -1057,7 +1433,12 @@ impl App {
 
         match park::execute(window::hwnd_of(info.hwnd), &plan) {
             Ok(parked) => {
-                crate::log!("parked hwnd={} at {:?} (from {:?})", info.hwnd, parked.parked, plan.placement.normal);
+                crate::log!(
+                    "parked hwnd={} at {:?} (from {:?})",
+                    info.hwnd,
+                    parked.parked,
+                    plan.placement.normal
+                );
                 card.parked = parked;
                 // The window is off screen but still in front. Give the foreground
                 // away, so that clicking its taskbar button activates it (which
@@ -1068,9 +1449,17 @@ impl App {
                 self.line.hang(card, &self.layout, reduced);
                 self.revealed = true;
                 self.dismissed = false;
+                self.pinned = self.settings.always_on;
                 self.hold_until = Some(Instant::now() + Duration::from_secs(2));
+                self.start_visit();
+                // The card stays down unless the pointer is on the line: the
+                // rope's own layer is what shows where the window went, and the
+                // cards come up when he reaches for the rope. Raising them here
+                // regardless is how a hang used to cover the window he went back
+                // to.
                 self.sync_journal();
                 self.invalidate();
+                self.hang_undrawn = Some((info.hwnd, Instant::now()));
                 if !self.icons.contains_key(&exe) {
                     self.worker.send(Job::Icon { id, exe_path: exe });
                 }
@@ -1113,11 +1502,20 @@ impl App {
     }
 
     fn finish_take_down(&mut self, id: u64) {
-        let Some(card) = self.line.get(id) else { return };
+        let Some(card) = self.line.get(id) else {
+            return;
+        };
         let hwnd = card.hwnd;
         let parked = restore_record(card, self.monitor.work);
         let unhook = card.unhook;
         let before = window::rect_of(window::hwnd_of(hwnd));
+        // The line is topmost and the window is about to come back underneath
+        // it. The frame on screen still has this card painted in it, so during
+        // the restore the card sits on top of the window that just appeared -
+        // the small card that flashes before the window shows. Paint the line
+        // with the card already gone first; the restore then lands on a screen
+        // that no longer shows it.
+        self.redraw();
         let ok = park::restore(window::hwnd_of(hwnd), &parked);
         let after = window::rect_of(window::hwnd_of(hwnd));
         crate::log!(
@@ -1144,6 +1542,28 @@ impl App {
             self.line.detach(id, Instant::now());
             self.show_hook_hint();
         }
+        // A non-resident line is a short visit, but this is the moment the user
+        // is most likely to need it again: the window just opened, they move it
+        // aside, and come back for the next card. The line waits for that. Held
+        // as well as long-deadlined, because opening that window changed the
+        // foreground, and a foreground change is one of the reasons a visit is
+        // normally over - it must not cut the grace short in the same poll.
+        if self.revealed {
+            let now = Instant::now();
+            self.keep_alive(now, VISIT_AFTER_TAKE);
+            self.hold_until = Some(self.hold_until.map_or(now + VISIT_AFTER_TAKE, |until| {
+                until.max(now + VISIT_AFTER_TAKE)
+            }));
+            // The window is back on the desktop and the user is about to move it
+            // out of the way. That is this gesture, not the next one: while its
+            // rectangle keeps changing under a held button the visit stays open,
+            // instead of the line leaning on a grace period to stay out.
+            self.take_watch = Some(TakeWatch {
+                hwnd,
+                rect: after.unwrap_or(parked.placement.normal),
+                until: now + Duration::from_secs(6),
+            });
+        }
         self.sync_journal();
         self.invalidate();
     }
@@ -1166,12 +1586,24 @@ impl App {
     fn take_all(&mut self) {
         // Windows that are already on the desktop only need their hooks
         // dropped; restoring them would move them back to where they came from.
-        let away: Vec<u64> = self.line.cards.iter().filter(|c| c.away).map(|c| c.id).collect();
+        let away: Vec<u64> = self
+            .line
+            .cards
+            .iter()
+            .filter(|c| c.away)
+            .map(|c| c.id)
+            .collect();
         for id in away {
             self.painter.forget(id);
             self.line.remove(id);
         }
-        let ids: Vec<u64> = self.line.cards.iter().filter(|c| !c.leaving && !c.away).map(|c| c.id).collect();
+        let ids: Vec<u64> = self
+            .line
+            .cards
+            .iter()
+            .filter(|c| !c.leaving && !c.away)
+            .map(|c| c.id)
+            .collect();
         crate::log!("take_all: {} card(s), unhooking", ids.len());
         if ids.is_empty() {
             self.sync_journal();
@@ -1180,6 +1612,7 @@ impl App {
         }
         self.revealed = true;
         self.dismissed = false;
+        self.pinned = self.settings.always_on;
         for id in &ids {
             if let Some(card) = self.line.get_mut(*id) {
                 card.unhook = true;
@@ -1188,6 +1621,9 @@ impl App {
         for id in ids {
             self.take_down(id);
         }
+        // Everything went back because the user asked for it, so there is no
+        // next card to pick: the line goes on the empty-line clock.
+        self.start_visit();
     }
 
     /// Every window goes back to its remembered place minimized.
@@ -1206,10 +1642,7 @@ impl App {
             .map(|c| (c.id, c.hwnd, restore_record(c, work), c.away))
             .collect();
         for (id, hwnd, parked, away) in cards {
-            if !away
-                && window::is_alive(hwnd)
-                && !park::stow(window::hwnd_of(hwnd), &parked)
-            {
+            if !away && window::is_alive(hwnd) && !park::stow(window::hwnd_of(hwnd), &parked) {
                 crate::log!("quit: hwnd={hwnd} would not stay minimized; putting it back instead");
                 park::restore(window::hwnd_of(hwnd), &parked);
             }
@@ -1228,7 +1661,12 @@ impl App {
         }
         for reply in replies {
             match reply {
-                Reply::Prepared { info, image, plan, source } => self.on_prepared(info, image, plan, source),
+                Reply::Prepared {
+                    info,
+                    image,
+                    plan,
+                    source,
+                } => self.on_prepared(info, image, plan, source),
                 Reply::Snapshotted { id, image } => {
                     if let Some(card) = self.line.get_mut(id) {
                         if let Some(img) = image {
@@ -1239,7 +1677,9 @@ impl App {
                     self.invalidate();
                 }
                 Reply::Iconed { id, image } => {
-                    let Some(card) = self.line.get(id) else { continue };
+                    let Some(card) = self.line.get(id) else {
+                        continue;
+                    };
                     let exe = card.exe.clone();
                     if let Some(img) = image {
                         if let Some(pix) = to_pixmap(&img) {
@@ -1266,7 +1706,31 @@ impl App {
         let now = Instant::now();
         self.last_poll = now;
         self.polls = self.polls.wrapping_add(1);
-        let (cx, cy) = monitor::cursor();
+        let (cx, cy) = self.hover_point.unwrap_or_else(monitor::cursor);
+        let cursor_moved = (cx - self.last_cursor.0).abs() + (cy - self.last_cursor.1).abs() >= 3;
+        self.last_cursor = (cx, cy);
+
+        // The line belongs to the screen the pointer is on. On a multi-monitor
+        // desktop, moving to another display carries the cards and the rope
+        // there in the same poll, so the drop band is always where the user is
+        // about to let go. The bounds check keeps the monitor lookup off the
+        // common path; a point inside the current screen cannot have moved it.
+        // A card in hand or an open editor is a gesture that started here and
+        // must not be yanked to another screen underneath the pointer; a window
+        // being dragged is followed by the drag poll, which also knows where the
+        // drop would land; an open popup menu is anchored to the cards it was
+        // opened on.
+        if self.card_press.is_none() && self.tag_card.is_none() && !self.menu_open {
+            let b = self.monitor.bounds;
+            let inside = cx >= b.left && cx < b.right && cy >= b.top && cy < b.bottom;
+            if !inside {
+                let at = monitor::at_point(cx, cy);
+                if at.handle != self.monitor.handle {
+                    crate::log!("line follows the pointer to another monitor");
+                    self.place(at);
+                }
+            }
+        }
 
         if self.polls % 20 == 0 {
             self.refresh_titles();
@@ -1275,7 +1739,38 @@ impl App {
             self.poll_windows(now);
         }
 
-        self.poll_drag(cx, cy);
+        let left_state = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) };
+        let left_down = left_state < 0;
+        let left_pressed = left_down && !self.left_down;
+        let left_released = !left_down && self.left_down;
+        self.left_down = left_down;
+        // Bit 0 is not the state, it is a latch: "the button went down sometime
+        // since the last time we asked". The edges above miss a click that opens
+        // and closes between two polls, and a click on the window he is already
+        // using changes no foreground either - that is the click that used to
+        // leave the cards painted over his work.
+        let press_latched = (left_state & 1) != 0;
+        let esc_state = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) };
+        let esc_down = esc_state < 0;
+        // Escape while the tag field has focus belongs to the field: it puts
+        // the old tag back and must not also put the whole line away.
+        let esc_pressed =
+            ((esc_down && !self.esc_was_down) || (esc_state & 1) != 0) && self.tag_card.is_none();
+        self.esc_was_down = esc_down;
+        if left_pressed || press_latched {
+            self.press_dragged = false;
+        }
+        self.poll_drag(cx, cy, left_down);
+
+        // The card under the editor can go away - taken down, unhooked, gone
+        // from the line - while the popover is still open. Saving leaves the
+        // label in the journal for when the window comes back; closing on the
+        // user's typing would lose it.
+        if let Some(id) = self.tag_card {
+            if self.line.get(id).is_none_or(|card| card.leaving) {
+                crate::tag_ui::close_saving();
+            }
+        }
 
         // A parked window that the user brings forward (taskbar, Alt+Tab,
         // another app activating it) is a request to see it. Move it back on
@@ -1283,12 +1778,19 @@ impl App {
         // per poll, so simply hanging the window it was using is not a
         // transition.
         let foreground = window::foreground().map(window::raw_of).unwrap_or(0);
-        if foreground != self.last_foreground {
+        let foreground_changed = foreground != self.last_foreground;
+        // The tag popover and the settings window are ours. Their taking the
+        // foreground is not the user going back to work, and treating it as one
+        // is what used to sink the cards the moment the editor opened.
+        let foreground_ours =
+            foreground != 0 && window::pid_of(window::hwnd_of(foreground)) == self.self_pid;
+        let foreground_left = foreground_changed && !foreground_ours;
+        if foreground_changed {
             let previous = std::mem::replace(&mut self.last_foreground, foreground);
             self.pending_foreground = None;
-            let just_parked = self
-                .recent_park
-                .is_some_and(|(hwnd, at)| hwnd == foreground && now.duration_since(at) < PARK_FOREGROUND_GRACE);
+            let just_parked = self.recent_park.is_some_and(|(hwnd, at)| {
+                hwnd == foreground && now.duration_since(at) < PARK_FOREGROUND_GRACE
+            });
             if foreground != 0 && !just_parked {
                 if let Some(id) = self.parked_card(foreground) {
                     let h = window::hwnd_of(foreground);
@@ -1331,7 +1833,10 @@ impl App {
             if foreground != stuck.hwnd {
                 self.stuck_foreground = None;
             } else if now.duration_since(stuck.since) >= STUCK_GIVE_UP {
-                crate::log!("foreground: hwnd={} would not give up the focus; leaving it there", stuck.hwnd);
+                crate::log!(
+                    "foreground: hwnd={} would not give up the focus; leaving it there",
+                    stuck.hwnd
+                );
                 self.stuck_foreground = None;
             } else if now.duration_since(stuck.last_try) >= STUCK_RETRY {
                 // Only hand it to a real window this time. Activating the
@@ -1340,20 +1845,25 @@ impl App {
                 if window::hand_off_foreground(window::hwnd_of(stuck.hwnd), self.self_pid) {
                     self.last_foreground = window::foreground().map(window::raw_of).unwrap_or(0);
                     self.stuck_foreground = None;
-                    crate::log!("foreground: handed the focus away from the parked hwnd={} on retry", stuck.hwnd);
+                    crate::log!(
+                        "foreground: handed the focus away from the parked hwnd={} on retry",
+                        stuck.hwnd
+                    );
                 } else {
-                    self.stuck_foreground = Some(StuckFocus { last_try: now, ..stuck });
+                    self.stuck_foreground = Some(StuckFocus {
+                        last_try: now,
+                        ..stuck
+                    });
                 }
             }
         }
 
         let top = self.monitor.bounds.top;
-        let at_top = cy <= top + 2
-            && cx >= self.monitor.bounds.left
-            && cx < self.monitor.bounds.right;
-        // After an explicit "hide line" the pointer is often still resting on
-        // the edge. Wait until it leaves before hover may summon the line
-        // again, otherwise the line pops straight back out from under it.
+        let at_top =
+            cy <= top + 2 && cx >= self.monitor.bounds.left && cx < self.monitor.bounds.right;
+        // After the line is put away the pointer is often still resting on the
+        // edge. Wait until it leaves before the pill may appear again, otherwise
+        // it pops straight back out from under the cursor.
         if !at_top {
             self.hover_ready = true;
         }
@@ -1364,74 +1874,129 @@ impl App {
             self.invalidate();
         }
 
-        let inside = self.revealed
-            && cx >= self.panel.left
-            && cx < self.panel.right
-            && cy >= self.panel.top - 2
-            && cy < self.panel.bottom + 24;
+        // The strip rectangle is not the line. It is as tall as the cards and as
+        // wide as the monitor, so a cursor working near the top of a maximized
+        // window sits inside it without touching anything the rack owns. Only the
+        // rope, its hang band, and the cards count as being on the line.
+        //
+        // A card is a handle only where it is really on screen. The layer is sent
+        // to the bottom of the z-order when it is not in use and the strip is
+        // exactly where a maximized window lives, so the card's old place must
+        // not pull the rack back over the work. A card the user can see, though,
+        // is part of the line: that is what makes a visible card hoverable and
+        // clickable without first reaching for the rope. The rope - not the old
+        // position - is what always brings a covered line back.
+        let card_hit = self.card_at(local).filter(|id| *id != PEEK_ID);
+        let on_card = card_hit.is_some() && (self.topmost || !self.covered_at((cx, cy)));
+        let over_rope =
+            self.revealed && self.on_rope(local, (self.slide - 1.0) * self.layout.panel_height());
+        let on_line = self.revealed && (over_rope || on_card);
+        let in_hand = self.in_hand();
+        // Only gestures of the line's own keep the cards up. A window of the
+        // user's being dragged past the top is not one: the cards must not come
+        // up over it, which is what `in_hand` alone used to make them do.
+        let holding = self.card_press.is_some() || self.tag_card.is_some();
+        let dragging = self.drag.is_some() || self.pretend_drag;
+        // A click that lands off the line and moved nothing is the user going
+        // elsewhere. Judged when the button is up, from either edge of it: the
+        // press that starts dragging a window to the rope also lands off the line,
+        // and the cards must not sink in the middle of that gesture.
+        let click_off_line = !left_down
+            && (left_released || press_latched)
+            && !self.press_dragged
+            && !on_line
+            && !in_hand;
+        // The window just taken down being dragged about is the same gesture as
+        // taking it: as long as its rectangle keeps changing under a held button,
+        // the visit is still running.
+        let taking_away = self.poll_take_watch(now, left_down);
 
         if !self.revealed {
-            if self.settings.hover_open {
+            self.transient_until = None;
+            if self.settings.always_on {
+                // Resident mode: while the line is put away, the top edge does
+                // not summon a pill or the line itself. The show/hide shortcut
+                // is the only way back, which is what "resident" means.
                 if self.peek {
                     self.close_peek();
                 }
-                // Hovering the top edge works even when nothing is hanging:
-                // that is how somebody with an empty line discovers the hint
-                // and the gesture. It just takes a little longer than it does
-                // with cards.
-                let armed = at_top
-                    && self.hover_ready
-                    && !self.drag.as_ref().is_some_and(|d| d.moved)
-                    && self.card_press.is_none();
-                if armed {
-                    let since = *self.hot_since.get_or_insert(now);
-                    let wait = if self.line.live_count() == 0 { DWELL_EMPTY } else { DWELL };
-                    if now.duration_since(since) >= wait {
-                        self.hot_since = None;
-                        self.revealed = true;
-                        self.dismissed = false;
-                        crate::log!("line shown: hover");
-                        self.invalidate();
-                    }
-                } else {
-                    self.hot_since = None;
-                }
             } else {
-                self.poll_peek(now, cx, cy, at_top);
+                self.poll_peek(now, cx, cy, cursor_moved);
             }
         } else {
             if self.peek {
                 self.close_peek();
             }
-            self.hot_since = None;
-            if self.pinned
-                || self.hold_until.is_some_and(|until| now < until)
-                || self.drag.is_some()
-                || self.card_press.is_some()
-                || inside
-                || self.hover.is_some()
-            {
-                self.away_since = None;
+            if esc_pressed && !in_hand {
+                // Escape means the look is over. It works in both modes: in
+                // resident mode it is the quickest way to put the line away, and
+                // in the ordinary one there is nothing left to wait out.
+                self.tuck_line("Escape");
+            } else if self.settings.always_on {
+                // Resident: stays down until the user puts it away on purpose.
+                self.transient_until = None;
             } else {
-                let since = *self.away_since.get_or_insert(now);
-                if now.duration_since(since) >= AWAY {
-                    self.away_since = None;
-                    self.revealed = false;
-                    self.band_hot = false;
-                    self.hover = None;
-                    self.away_since = None;
-                    crate::log!("line hidden: pointer left");
-                    self.invalidate();
-                }
+                self.poll_visit(now, on_line, taking_away, click_off_line, foreground_left);
             }
         }
 
-        // Hover and click-through only matter while the line is down.
-        let next_hover = if self.revealed && inside {
-            self.card_at(local).filter(|id| *id != PEEK_ID)
+        // The cards hold the top of the screen only while the line itself is
+        // being used: a card in the hand, the editor, or the pointer on a card
+        // that is actually visible or on the rope. Any other place - his work,
+        // another window, the taskbar - and the layer goes back behind it. That
+        // is the whole rule now: no click or foreground event has to be watched
+        // for, because a pointer that is not on the line is already the answer.
+        // The rope's own topmost layer keeps the line in sight while the cards
+        // are down, and reaching for it is what brings them back.
+        //
+        // A window being dragged is the one case that always sinks the cards. It
+        // is the user's own gesture on his own window, it is usually headed for
+        // the top of the screen, and a wall of cards coming up over it is exactly
+        // in the way. The rope and its drop band stay visible on their own layer.
+        //
+        // The one exception is an open menu of ours: the popup is above the
+        // card layer on its own, and the layer must keep the z-order it had
+        // when the menu opened until the menu closes.
+        if self.revealed && !self.menu_open {
+            if holding {
+                self.raise_since = None;
+                self.set_topmost(true);
+            } else if dragging {
+                self.raise_since = None;
+                self.set_topmost(false);
+            } else if on_card {
+                // A visible card under the pointer means the line is being used.
+                self.raise_since = None;
+                self.set_topmost(true);
+            } else if over_rope {
+                // The rope is not a button: a pointer crossing it on the way to
+                // a title bar must not bring the cards back. Rest on it for a
+                // moment and the line answers.
+                if self.topmost {
+                    self.raise_since = None;
+                } else {
+                    let since = *self.raise_since.get_or_insert(now);
+                    if now.duration_since(since) >= RAISE_DWELL {
+                        self.raise_since = None;
+                        self.set_topmost(true);
+                    }
+                }
+            } else {
+                self.raise_since = None;
+                self.set_topmost(false);
+            }
         } else {
-            None
-        };
+            self.raise_since = None;
+        }
+
+        // Hover and click-through: a card is a target wherever the pointer can
+        // reach it. Clearing the click-through bit over one is what lets a click
+        // land on a demoted layer; where another window is above that point, the
+        // window still wins the click, so this cannot eat a click meant for the
+        // user's work. The layer being down used to make the whole strip
+        // click-through, which is why a visible card ignored clicks until the
+        // rope had brought the cards back up.
+        let next_hover = if self.revealed { card_hit } else { None };
         if next_hover != self.hover {
             self.hover = next_hover;
             self.invalidate();
@@ -1439,28 +2004,6 @@ impl App {
         let over_card = next_hover.is_some();
         self.set_click_through(!over_card && !peek_hover && self.card_press.is_none());
 
-        // An empty line is only interesting for a moment. It goes away on its
-        // own, unless the user pinned it (explicit "show line"), the pointer is
-        // still in it, or a card is still flying back to its window.
-        let empty = self.line.live_count() == 0
-            && !self.peek
-            && self.hold_until.is_none()
-            && !self.pinned
-            && !inside
-            && self.drag.is_none()
-            && self.card_press.is_none();
-        if empty && self.revealed {
-            let since = *self.empty_since.get_or_insert(now);
-            if now.duration_since(since) >= EMPTY_GRACE {
-                self.empty_since = None;
-                self.revealed = false;
-                self.band_hot = false;
-                crate::log!("line hidden: empty");
-                self.invalidate();
-            }
-        } else {
-            self.empty_since = None;
-        }
         if self.hold_until.is_some_and(|until| now >= until) {
             self.hold_until = None;
         }
@@ -1470,9 +2013,233 @@ impl App {
         }
     }
 
-    /// The "show the line" pill, for people who turned off direct hover.
-    fn poll_peek(&mut self, now: Instant, cx: i32, cy: i32, at_top: bool) {
+    /// Puts the line away without the user asking. The difference from a
+    /// deliberate hide is only that nothing in the log says the user did it;
+    /// both leave the line inert until the pill, the shortcut or a hang brings
+    /// it back.
+    fn tuck_line(&mut self, why: &str) {
+        self.revealed = false;
+        self.pinned = false;
+        self.dismissed = true;
+        self.hold_until = None;
+        self.transient_until = None;
+        self.band_hot = false;
+        self.line_hot = false;
+        self.hover = None;
+        self.close_peek();
+        // The pointer may still be on the edge. Do not let the pill appear under
+        // it before it has left once.
+        self.hover_ready = false;
+        crate::log!("line hidden: {why}");
+        self.invalidate();
+    }
+
+    /// Starts a non-resident visit: the line is on screen from now until its
+    /// clock runs out. Resident mode has no clock, so it clears one. A reveal is
+    /// the "pulled it out for a look" case, so it gets the fallback clock; the
+    /// gestures that follow are what set the short ones. An empty line is a
+    /// place to put a window rather than a look at one, so it waits the longer
+    /// empty-line time from the start.
+    fn start_visit(&mut self) {
+        self.transient_until = if self.settings.always_on {
+            None
+        } else {
+            let empty = self.line.live_count() == 0;
+            self.auto_hide().map(|after| {
+                Instant::now()
+                    + if empty {
+                        after.max(EMPTY_LINE_LINGER)
+                    } else {
+                        after
+                    }
+            })
+        };
+    }
+
+    /// The non-resident line's clock. While the pointer is on the line it is
+    /// kept alive; this is how long the line gets after the pointer leaves.
+    /// `auto_hide_secs = 0` means the user prefers to put it away by hand.
+    fn auto_hide(&self) -> Option<Duration> {
+        (self.settings.auto_hide_secs > 0)
+            .then(|| Duration::from_secs(self.settings.auto_hide_secs as u64))
+    }
+
+    /// Guarantees the line stays down for at least `after` from now. Never
+    /// shortens a visit that is already going to last longer.
+    fn keep_alive(&mut self, now: Instant, after: Duration) {
+        let until = now + after;
+        self.transient_until = Some(
+            self.transient_until
+                .map_or(until, |current| current.max(until)),
+        );
+    }
+
+    /// Shortens a transient visit to at most `after` from now. Never lengthens
+    /// it: a foreground change or a click outside should not extend a line that
+    /// is already on its way out.
+    fn tuck_soon(&mut self, now: Instant, after: Duration) {
+        let until = now + after;
+        self.transient_until = Some(
+            self.transient_until
+                .map_or(until, |current| current.min(until)),
+        );
+    }
+
+    /// The rules of a non-resident visit.
+    ///
+    /// The line is a short visit, not furniture. Everything that means "the
+    /// user is still using this" restarts the same short clock: the pointer on
+    /// the rope or a card, a card pressed, a window or card in hand, the tag
+    /// editor open, a menu of ours up. When the pointer leaves, `auto_hide_secs`
+    /// (1 s by default) is all it gets to be picked up again; `0` removes the
+    /// clock and leaves only Escape and the shortcut.
+    ///
+    /// Deliberate leave-taking does not wait for the clock. A click away or
+    /// another window taking the foreground ends the visit after the slide-out
+    /// (0.28 s). An empty line is the exception in both directions: there is
+    /// nothing to look at yet, and the user is most likely off choosing the
+    /// window that goes on it - so a click into that window is not the user
+    /// leaving, and the line waits `EMPTY_LINE_LINGER` after the pointer goes.
+    fn poll_visit(
+        &mut self,
+        now: Instant,
+        on_line: bool,
+        taking_away: bool,
+        click_off_line: bool,
+        foreground_left: bool,
+    ) {
+        let busy = self.in_hand() || taking_away || self.menu_open;
+        let held = self.hold_until.is_some_and(|until| now < until);
+        let Some(after) = self.auto_hide() else {
+            return;
+        };
+        if busy || on_line {
+            self.keep_alive(now, after);
+        }
+        let left_line = std::mem::replace(&mut self.line_hot, on_line);
+        let empty = self.line.live_count() == 0;
+        let became_empty = empty && !self.line_was_empty;
+        self.line_was_empty = empty;
+        if !busy && !held && empty && (became_empty || left_line) {
+            // One shot per edge, or re-arming every poll would push the
+            // deadline out forever and an empty line would never leave.
+            self.keep_alive(now, EMPTY_LINE_LINGER);
+        }
+        if !busy && !held && !empty && (foreground_left || click_off_line) {
+            self.tuck_soon(now, VISIT_LEAVE);
+        }
+        if !busy && !held && now >= self.transient_until.unwrap_or(now) {
+            self.tuck_line("the visit is over");
+        }
+    }
+
+    /// Whether the user is holding something the line is part of: a window
+    /// being dragged on it, a card being reordered, the drop band lit, or the
+    /// tag editor open on a card.
+    fn in_hand(&self) -> bool {
+        self.drag.is_some()
+            || self.pretend_drag
+            || self.card_press.is_some()
+            || self.band_hot
+            || self.tag_card.is_some()
+    }
+
+    /// Whether the window that was just taken down is being dragged away from
+    /// the line. Reports true while its rectangle keeps changing under a held
+    /// button; the motion is the gesture, so the visit stays open as long as it
+    /// lasts and gets the ordinary slack when it stops.
+    fn poll_take_watch(&mut self, now: Instant, left_down: bool) -> bool {
+        let Some(watch) = self.take_watch else {
+            return false;
+        };
+        if now >= watch.until || !left_down {
+            self.take_watch = None;
+            return false;
+        }
+        let hwnd = window::hwnd_of(watch.hwnd);
+        let Some(rect) = window::visible_rect(hwnd) else {
+            self.take_watch = None;
+            return false;
+        };
+        let moved = (rect.left - watch.rect.left).abs() > 4
+            || (rect.top - watch.rect.top).abs() > 4
+            || (rect.right - watch.rect.right).abs() > 4
+            || (rect.bottom - watch.rect.bottom).abs() > 4;
+        if moved {
+            self.take_watch = Some(TakeWatch { rect, ..watch });
+        }
+        moved
+    }
+
+    /// Whether the pointer is near the drawn rope. The old answer included the
+    /// whole drop band, which made a pointer passing over a maximized window's
+    /// title bar pull the card wall back over that window. The rope is drawn at
+    /// `rope_y`, so the pointer has to be near that curve.
+    fn on_rope(&self, local: (i32, i32), y_off: f32) -> bool {
+        let x = local.0 as f32;
+        if x < 0.0 || x > self.layout.width {
+            return false;
+        }
+        let rope = self.layout.rope_y(x) + y_off;
+        // `ROPE_REACH` is the grab band: wider than the stroke, still clear of
+        // the card tops, so reaching for the rope never turns the strip below
+        // it - where the user's windows live - into a handle.
+        (local.1 as f32 - rope).abs() <= self.layout.rope_reach()
+    }
+
+    /// Whether some other window is painted over the card layer at `point`
+    /// (screen pixels). The layer is demoted to the bottom of the z-order when
+    /// it is not in use, so a card may still be there and be covered by the
+    /// window the user is working in. That covered place is not a handle; only
+    /// a card that is really visible is. Transparent windows - our own rope layer
+    /// among them - do not count: they let the pointer through to what is under
+    /// them, just as they let a click through. Windows DWM has cloaked paint
+    /// nothing at all, even when they cover the whole screen - the input host's
+    /// CoreWindow is one - so they do not count either.
+    fn covered_at(&self, point: (i32, i32)) -> bool {
+        unsafe {
+            let mut above = GetWindow(self.hwnd, GW_HWNDPREV);
+            for _ in 0..512 {
+                let Ok(w) = above else { break };
+                if w.is_invalid() {
+                    break;
+                }
+                let ex = GetWindowLongPtrW(w, GWL_EXSTYLE) as u32;
+                if IsWindowVisible(w).as_bool()
+                    && ex & WS_EX_TRANSPARENT.0 == 0
+                    && !IsIconic(w).as_bool()
+                    && window::rect_of(w).is_some_and(|r| {
+                        point.0 >= r.left
+                            && point.0 < r.right
+                            && point.1 >= r.top
+                            && point.1 < r.bottom
+                    })
+                    && !window::is_cloaked(w)
+                {
+                    return true;
+                }
+                above = GetWindow(w, GW_HWNDPREV);
+            }
+        }
+        false
+    }
+
+    /// The "show the line" pill, the way into a non-resident line that is not
+    /// already down.
+    ///
+    /// The pill comes out as soon as the pointer reaches the top edge, because it
+    /// carries the card count: the user has to be able to read it before deciding.
+    /// Staying on the edge is that decision, so the line opens by itself after the
+    /// dwell - 0.08 s with cards on the line, 0.22 s with none, when the trip to
+    /// the top edge was probably for something else. Moving the pointer over the
+    /// pill opens it immediately.
+    fn poll_peek(&mut self, now: Instant, cx: i32, cy: i32, cursor_moved: bool) {
         let top = self.monitor.bounds.top;
+        let wait = if self.line.live_count() == 0 {
+            DWELL_EMPTY
+        } else {
+            DWELL
+        };
         if self.peek {
             let near = cx >= self.monitor.bounds.left
                 && cx < self.monitor.bounds.right
@@ -1487,27 +2254,46 @@ impl App {
                     return;
                 }
             }
-            if !self.peek_hover && self.peek_since.is_some_and(|t| now.duration_since(t) >= PEEK_LIFE) {
+            // The wait that opens the line counts from the moment the pointer is
+            // on the button. A pointer that moves while it is there is the
+            // clearest possible "I mean this button"; it opens at once, without
+            // the click or the old 0.18 s pause. A pointer that simply found
+            // itself on the pill when it appeared still gets the short dwell as
+            // a fallback, so grazing the top edge cannot yank the line down.
+            if self.peek_hover && self.drag.is_none() && self.card_press.is_none() {
+                let since = *self.peek_hot.get_or_insert(now);
+                if cursor_moved || now.duration_since(since) >= wait {
+                    self.open_from_peek();
+                    return;
+                }
+            } else {
+                self.peek_hot = None;
+            }
+            // The wait is on the button, not on the edge: a pointer that came to
+            // the pill and never settled on it has no clock running against it.
+            if self.peek_hot.is_none()
+                && self
+                    .peek_since
+                    .is_some_and(|t| now.duration_since(t) >= PEEK_LIFE)
+            {
                 self.close_peek();
             }
             return;
         }
-        let armed =
-            at_top && self.hover_ready && self.drag.is_none() && self.card_press.is_none();
+        let armed = self.hover_ready
+            && cx >= self.monitor.bounds.left
+            && cx < self.monitor.bounds.right
+            && cy <= top + 2
+            && self.drag.is_none()
+            && self.card_press.is_none();
         if armed {
-            let since = *self.hot_since.get_or_insert(now);
-            let wait = if self.line.live_count() == 0 { DWELL_EMPTY } else { DWELL };
-            if now.duration_since(since) >= wait {
-                self.hot_since = None;
-                self.peek = true;
-                self.peek_since = Some(now);
-                self.peek_away = None;
-                self.peek_hover = false;
-                crate::log!("line peek shown");
-                self.invalidate();
-            }
-        } else {
-            self.hot_since = None;
+            self.peek = true;
+            self.peek_since = Some(now);
+            self.peek_hot = None;
+            self.peek_away = None;
+            self.peek_hover = false;
+            crate::log!("line peek shown");
+            self.invalidate();
         }
     }
 
@@ -1518,6 +2304,7 @@ impl App {
         self.peek = false;
         self.peek_hover = false;
         self.peek_since = None;
+        self.peek_hot = None;
         self.peek_away = None;
         self.invalidate();
     }
@@ -1529,25 +2316,36 @@ impl App {
         self.peek = false;
         self.peek_hover = false;
         self.peek_since = None;
+        self.peek_hot = None;
         self.peek_away = None;
         self.revealed = true;
         self.dismissed = false;
-        // Not pinned: the pill was a way in, not a request to keep the line on
-        // the screen forever. It tucks away when the pointer leaves it, and the
-        // pill comes back when the pointer returns to the top edge.
+        self.pinned = false;
+        // The pill was a way in, not a request to keep the line on the screen
+        // forever: the visit it opens is the short one.
+        self.start_visit();
         self.hold_until = None;
-        self.empty_since = None;
-        self.hot_since = None;
-        self.away_since = None;
         crate::log!("line shown: peek button");
         self.invalidate();
     }
 
-    fn poll_drag(&mut self, cx: i32, cy: i32) {
-        let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
+    fn poll_drag(&mut self, cx: i32, cy: i32, down: bool) {
         if !self.settings.drag_hang {
             // The line stays out of dragging altogether: no light and no
             // hang. Windows go up by hotkey or from the tray.
+            if self.drag.take().is_some() {
+                self.set_band_hot(false, None);
+            }
+            self.buttons_were_down = false;
+            self.press_at = None;
+            return;
+        }
+        if !self.revealed {
+            // A line that is not on screen has nothing to hang a window on.
+            // It used to come back down whenever a window was dragged into the
+            // place it had occupied, which made merely moving a window to the
+            // top open the line and hang it. The pill and the show/hide
+            // shortcut are the ways back.
             if self.drag.take().is_some() {
                 self.set_band_hot(false, None);
             }
@@ -1568,14 +2366,17 @@ impl App {
                     let screen_top = self.monitor.bounds.top;
                     let rect = window::visible_rect(window::hwnd_of(watch.hwnd));
                     let zoomed = window::maximized(watch.hwnd);
-                    let on_line = rect.is_some_and(|rect| self.layout.window_on_line(rect.top, screen_top));
+                    let on_line =
+                        rect.is_some_and(|rect| self.layout.window_on_line(rect.top, screen_top));
                     let where_ = format!(
                         " (top={} edge={} band={})",
                         rect.map(|rect| rect.top).unwrap_or(screen_top),
                         screen_top,
                         self.layout.hang_depth()
                     );
-                    if zoomed || rect.is_some_and(|rect| self.layout.window_flush(rect.top, screen_top)) {
+                    if zoomed
+                        || rect.is_some_and(|rect| self.layout.window_flush(rect.top, screen_top))
+                    {
                         crate::log!(
                             "drag {:#x}: {} at the top, so Windows gets to maximize it{where_}",
                             watch.hwnd,
@@ -1590,10 +2391,16 @@ impl App {
                             watch.hwnd
                         );
                     } else if on_line {
-                        crate::log!("drag {:#x}: released on the line at y={cy}{where_}", watch.hwnd);
+                        crate::log!(
+                            "drag {:#x}: released on the line at y={cy}{where_}",
+                            watch.hwnd
+                        );
                         self.request_hang(watch.hwnd, HangSource::Drag);
                     } else {
-                        crate::log!("drag {:#x}: released off the line at y={cy}{where_}", watch.hwnd);
+                        crate::log!(
+                            "drag {:#x}: released off the line at y={cy}{where_}",
+                            watch.hwnd
+                        );
                     }
                 }
             }
@@ -1676,8 +2483,9 @@ impl App {
                 // pointer sits inside it.
                 found = window::foreground().filter(|fg| {
                     window::pid_of(*fg) != self.self_pid
-                        && window::rect_of(*fg)
-                            .is_some_and(|r| cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)
+                        && window::rect_of(*fg).is_some_and(|r| {
+                            cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom
+                        })
                         && window::check(*fg, self.self_pid).is_ok()
                 });
             }
@@ -1691,7 +2499,9 @@ impl App {
                                 window::class_name(mv)
                             )
                         });
-                        crate::log!("drag: the move loop is dragging a window that cannot be hung ({why})");
+                        crate::log!(
+                            "drag: the move loop is dragging a window that cannot be hung ({why})"
+                        );
                     } else if let Some(why) = refusal {
                         crate::log!("drag: nothing hangable under the pointer ({why})");
                     }
@@ -1704,14 +2514,22 @@ impl App {
             // hang band with it would call a window whose visible edge is clear
             // of the top flush with it. Everything below compares against this
             // same rectangle, including the movement test.
-            let Some(started) = window::visible_rect(hwnd) else { return };
+            let Some(started) = window::visible_rect(hwnd) else {
+                return;
+            };
             crate::log!(
                 "drag {raw:#x}: following {} class={}{}",
                 window::describe(raw),
                 window::class_name(hwnd),
                 if moving.is_some() { " (move loop)" } else { "" }
             );
-            self.drag = Some(DragWatch { hwnd: raw, started, moved: false, told_tucked: false });
+            self.drag = Some(DragWatch {
+                hwnd: raw,
+                started,
+                moved: false,
+                told_tucked: false,
+            });
+            self.press_dragged = true;
             return;
         }
 
@@ -1730,7 +2548,10 @@ impl App {
             if let Some(mv) = moving {
                 let raw = window::raw_of(mv);
                 if raw != watch.hwnd {
-                    crate::log!("drag {:#x}: the move loop names {raw:#x}; following that", watch.hwnd);
+                    crate::log!(
+                        "drag {:#x}: the move loop names {raw:#x}; following that",
+                        watch.hwnd
+                    );
                     watch.hwnd = raw;
                     watch.started = match window::rect_of(mv) {
                         Some(r) => r,
@@ -1752,17 +2573,22 @@ impl App {
         // actually be moving the window — by the move loop when it answers, by
         // the rectangle otherwise — or dragging across a page's text would hang
         // a window nobody touched.
-        let travelled =
-            self.press_at.is_some_and(|(px, py)| (cx - px).abs() > 8 || (cy - py).abs() > 8);
+        let travelled = self
+            .press_at
+            .is_some_and(|(px, py)| (cx - px).abs() > 8 || (cy - py).abs() > 8);
         let mut moved = false;
         let mut rect = None;
         if let Some(watch) = self.drag.as_mut() {
             rect = window::visible_rect(window::hwnd_of(watch.hwnd));
             let rect_moved = rect.is_some_and(|rect| {
-                (rect.left - watch.started.left).abs() > 8 || (rect.top - watch.started.top).abs() > 8
+                (rect.left - watch.started.left).abs() > 8
+                    || (rect.top - watch.started.top).abs() > 8
             });
             if travelled && (moving.is_some() || rect_moved) && !watch.moved {
-                crate::log!("drag {:#x}: the pointer has moved; the line is armed", watch.hwnd);
+                crate::log!(
+                    "drag {:#x}: the pointer has moved; the line is armed",
+                    watch.hwnd
+                );
                 watch.moved = true;
             }
             moved = watch.moved;
@@ -1790,13 +2616,10 @@ impl App {
         // window can be gripped well below its top, and gating on the pointer as
         // well made the light flicker off while the window sat on the rope.
         let on_line = rect.is_some_and(|rect| self.layout.window_on_line(rect.top, screen_top));
-        // A line the user put away is inert: it must not light up, come back
-        // or accept a drop just because a window is dragged over the place it
-        // used to occupy. Hanging a window while the line is hidden would also
-        // hide the thing the window went to, which looks like the window was
-        // closed. Hover, the pill and the hotkey are the ways back. A line that
-        // merely tucked itself away is still available: dragging a window up
-        // brings it back, which is the documented gesture.
+        // A line that is not on screen never reaches here: `poll_drag` returns
+        // before it starts watching a window. So a drag can only hang when the
+        // line is actually visible, which is what stops a window moved past the
+        // top edge from opening the line and hanging itself by accident.
         if on_line && self.dismissed {
             if let Some(watch) = self.drag.as_mut() {
                 if !watch.told_tucked {
@@ -1811,8 +2634,14 @@ impl App {
         let near = on_line && !self.dismissed;
         let numbers = rect.map(|rect| (rect.top, screen_top, self.layout.hang_depth()));
         self.set_band_hot(near, numbers);
-        if near {
-            self.revealed = true;
+        if near && !self.settings.always_on {
+            // Keep a short visit alive while a window is being aimed at the
+            // rope; the deadline starts again once the gesture is over.
+            let until = Instant::now() + VISIT_GRACE;
+            self.transient_until = Some(
+                self.transient_until
+                    .map_or(until, |current| current.max(until)),
+            );
         }
     }
 
@@ -1831,8 +2660,12 @@ impl App {
         });
         crate::log!(
             "drag band: {}",
-            if hot { "the window is on the line, letting go will hang it" } else { "off the line" }
-                .to_string()
+            if hot {
+                "the window is on the line, letting go will hang it"
+            } else {
+                "off the line"
+            }
+            .to_string()
                 + &detail
         );
         // The frame timer stops while the line is still, so nothing would repaint
@@ -1901,7 +2734,9 @@ impl App {
                     self.line.detach(id, now);
                     changed = true;
                 } else {
-                    crate::log!("card {id}: window {hwnd} moved but is still off screen; restoring it");
+                    crate::log!(
+                        "card {id}: window {hwnd} moved but is still off screen; restoring it"
+                    );
                     self.take_down(id);
                 }
             }
@@ -1928,7 +2763,11 @@ impl App {
 
     /// The card of a window that is on the line right now, if it is still ours.
     fn parked_card(&self, hwnd: isize) -> Option<u64> {
-        self.line.cards.iter().find(|c| c.hwnd == hwnd && !c.away && !c.leaving).map(|c| c.id)
+        self.line
+            .cards
+            .iter()
+            .find(|c| c.hwnd == hwnd && !c.away && !c.leaving)
+            .map(|c| c.id)
     }
 
     /// The focus fell on a parked window without being asked for. Give it to a
@@ -1958,11 +2797,18 @@ impl App {
         }
         match self.stuck_foreground {
             Some(stuck) if stuck.hwnd == raw => {
-                self.stuck_foreground = Some(StuckFocus { last_try: now, ..stuck });
+                self.stuck_foreground = Some(StuckFocus {
+                    last_try: now,
+                    ..stuck
+                });
             }
             _ => {
                 crate::log!("foreground: hwnd={raw} is off screen but kept the focus; nothing else would take it");
-                self.stuck_foreground = Some(StuckFocus { hwnd: raw, since: now, last_try: now });
+                self.stuck_foreground = Some(StuckFocus {
+                    hwnd: raw,
+                    since: now,
+                    last_try: now,
+                });
             }
         }
         false
@@ -1980,7 +2826,9 @@ impl App {
     /// hotkey before. `None` is the automatic re-hang when the user minimizes
     /// the window, which is not a new choice and keeps the old one.
     fn rehang(&mut self, id: u64, source: Option<HangSource>) {
-        let Some(card) = self.line.get(id) else { return };
+        let Some(card) = self.line.get(id) else {
+            return;
+        };
         if !card.away {
             return;
         }
@@ -2003,11 +2851,16 @@ impl App {
             let Some(placement) = park::Placement::capture(h) else {
                 return;
             };
-            (placement, park::hung_up_in_place(placement), placement.normal)
+            (
+                placement,
+                park::hung_up_in_place(placement),
+                placement.normal,
+            )
         } else {
             let previous = window::foreground();
             let before = window::rect_of(h).unwrap_or(card.window_rect);
-            let result = park::plan(h).and_then(|plan| park::execute(h, &plan).map(|parked| (plan, parked)));
+            let result =
+                park::plan(h).and_then(|plan| park::execute(h, &plan).map(|parked| (plan, parked)));
             match result {
                 Ok((plan, parked)) => {
                     // Do not leave an invisible window holding the keyboard.
@@ -2021,7 +2874,8 @@ impl App {
                                 && window::is_alive(window::raw_of(prev)) =>
                         {
                             window::force_foreground(prev);
-                            self.last_foreground = window::foreground().map(window::raw_of).unwrap_or(0);
+                            self.last_foreground =
+                                window::foreground().map(window::raw_of).unwrap_or(0);
                         }
                         _ => {
                             self.hand_focus_off(h, Instant::now());
@@ -2046,7 +2900,9 @@ impl App {
         }
         if self.line.rehang(id, &self.layout) {
             if park::parked_minimized(&parked) {
-                crate::log!("rehang {id}: hwnd={hwnd} was already minimized; hung it up where it stands");
+                crate::log!(
+                    "rehang {id}: hwnd={hwnd} was already minimized; hung it up where it stands"
+                );
             } else {
                 crate::log!("rehang {id}: hwnd={hwnd} parked at {:?}", parked.parked);
             }
@@ -2091,45 +2947,115 @@ impl App {
 
     fn toggle_reveal(&mut self) {
         if self.revealed {
-            self.revealed = false;
-            self.pinned = false;
-            // Put away on purpose. Unlike an automatic tuck, this line must not
-            // answer a drag any more: a window over the old spot neither lights
-            // it nor hangs.
-            self.dismissed = true;
-            self.hold_until = None;
-            self.away_since = None;
-            self.empty_since = None;
-            self.hot_since = None;
-            self.hover_ready = false;
-            self.peek = false;
-            self.peek_hover = false;
-            self.band_hot = false;
-            self.hover = None;
-        } else {
-            // Asked for on purpose: keep it down until it is dismissed on
-            // purpose, even when there is nothing hanging on it yet.
-            self.revealed = true;
-            self.pinned = true;
-            self.dismissed = false;
-            self.hold_until = None;
-            self.empty_since = None;
-            self.peek = false;
-            self.peek_hover = false;
-            let (x, y) = monitor::cursor();
-            let at = monitor::at_point(x, y);
-            if at.handle != self.monitor.handle {
-                self.place(at);
-            }
+            // Put away on purpose. The line is inert until the shortcut, the
+            // pill or a hang brings it back: a window over the old spot neither
+            // lights it nor hangs.
+            self.tuck_line("the user put it away");
+            return;
         }
-        crate::log!("line toggled: revealed={} pinned={}", self.revealed, self.pinned);
+        // Asked for on purpose. Resident mode stays down until the next
+        // shortcut; a non-resident line gets its short visit.
+        self.revealed = true;
+        self.pinned = self.settings.always_on;
+        self.dismissed = false;
+        self.hold_until = None;
+        self.peek = false;
+        self.peek_hover = false;
+        self.start_visit();
+        let (x, y) = monitor::cursor();
+        let at = monitor::at_point(x, y);
+        if at.handle != self.monitor.handle {
+            self.place(at);
+        }
+        crate::log!(
+            "line toggled: revealed={} pinned={}",
+            self.revealed,
+            self.pinned
+        );
         self.invalidate();
     }
 
     // MARK: Settings
 
+    /// Shows `tag` on the card without writing the journal. The editor calls
+    /// this on every keystroke, so the label on the card behind the popover is
+    /// the preview: what the user types is what he will see.
+    pub(crate) fn preview_card_tag(&mut self, id: u64, tag: &str) {
+        let tag = settings::clean_tag(tag);
+        let Some(card) = self.line.get_mut(id) else {
+            return;
+        };
+        if card.tag == tag {
+            return;
+        }
+        card.tag = tag;
+        card.tag_version = card.tag_version.wrapping_add(1);
+        self.painter.forget(id);
+        self.invalidate();
+    }
+
+    /// Puts a short label on a card and makes it the one that survives a
+    /// restart. The tag is user content, so it is cleaned only of the characters
+    /// that would break the journal.
+    pub(crate) fn set_card_tag(&mut self, id: u64, tag: &str) {
+        let tag = settings::clean_tag(tag);
+        let Some(card) = self.line.get_mut(id) else {
+            return;
+        };
+        let changed = card.tag != tag;
+        if changed {
+            card.tag = tag.clone();
+            card.tag_version = card.tag_version.wrapping_add(1);
+            self.painter.forget(id);
+            crate::log!("card {id}: tag is now {tag:?}");
+        }
+        // A live preview has already put the value in the card, so "unchanged"
+        // here does not mean the journal already has it: always commit.
+        self.write_journal();
+        self.invalidate();
+    }
+
+    /// Opens the tag editor under the card. The cards keep the top: the whole
+    /// point of the editor is the label appearing on the card while the user
+    /// types, and a modal box in the middle of the screen showed neither.
+    fn open_tag_dialog(&mut self, id: u64, initial: &str) {
+        if self.tag_card == Some(id) {
+            crate::tag_ui::raise();
+            return;
+        }
+        crate::tag_ui::commit_open();
+        self.tag_card = Some(id);
+        self.set_topmost(true);
+        self.keep_alive(Instant::now(), VISIT_AFTER_TAG);
+        let anchor = self.card_rect(id).map(|rect| WRect {
+            left: rect.left + self.origin.0,
+            top: rect.top + self.origin.1,
+            right: rect.right + self.origin.0,
+            bottom: rect.bottom + self.origin.1,
+        });
+        let app = self as *mut App;
+        crate::tag_ui::open(self.hwnd, app, id, initial, self.monitor, anchor);
+    }
+
+    /// The editor closed. The line keeps the top for a moment so the new label
+    /// is actually read, then the ordinary visit clock takes over.
+    pub(crate) fn tag_dialog_closed(&mut self) {
+        if self.tag_card.take().is_none() {
+            return;
+        }
+        let now = Instant::now();
+        self.hold_until = Some(now + VISIT_AFTER_TAG);
+        if self.revealed {
+            self.keep_alive(now, VISIT_AFTER_TAG);
+        } else {
+            self.start_visit();
+        }
+        self.invalidate();
+    }
+
     fn open_settings(&mut self) {
-        if !self.settings_wnd.is_invalid() && unsafe { IsWindow(Some(self.settings_wnd)).as_bool() } {
+        if !self.settings_wnd.is_invalid() && unsafe { IsWindow(Some(self.settings_wnd)).as_bool() }
+        {
             unsafe {
                 let _ = ShowWindow(self.settings_wnd, SW_RESTORE);
                 let _ = SetForegroundWindow(self.settings_wnd);
@@ -2137,8 +3063,14 @@ impl App {
             return;
         }
         let app = self as *mut App;
-        self.settings_wnd = settings_ui::open(self.window_icon, self.tray_icon, &self.settings, self.monitor, app)
-            .unwrap_or_default();
+        self.settings_wnd = settings_ui::open(
+            self.window_icon,
+            self.tray_icon,
+            &self.settings,
+            self.monitor,
+            app,
+        )
+        .unwrap_or_default();
     }
 
     pub(crate) fn settings_window_closed(&mut self) {
@@ -2151,11 +3083,28 @@ impl App {
     /// the program ships with.
     pub(crate) fn preview_sag(&mut self, sag_percent: f32) {
         self.settings.sag_percent = sag_percent;
-        let monitor = self.monitor;
-        self.place(monitor);
+        self.relayout();
         self.revealed = true;
         self.dismissed = false;
-        self.hold_until = Some(Instant::now() + Duration::from_millis(3500));
+        self.pinned = self.settings.always_on;
+        let until = Instant::now() + Duration::from_millis(3500);
+        self.hold_until = Some(until);
+        if !self.settings.always_on {
+            self.transient_until = Some(until);
+        }
+        self.invalidate();
+    }
+
+    /// Recompute the geometry for the monitor we are on after a setting that
+    /// moves the rope, without resetting the panel first. `place` starts from
+    /// the bare strip, so calling it on every drag of the settings preview
+    /// shrank the panel to below the cards and `ensure_panel` grew it back on
+    /// the next frame - which is the flashing the preview used to cause.
+    fn relayout(&mut self) {
+        self.layout = self
+            .settings
+            .layout_for(self.monitor.bounds.width() as f32, self.monitor.scale);
+        self.ensure_panel();
         self.invalidate();
     }
 
@@ -2167,7 +3116,6 @@ impl App {
         hang: (u32, u32),
         toggle: (u32, u32),
         sag_percent: f32,
-        hover_open: bool,
         always_on: bool,
         drag_hang: bool,
     ) -> Result<(), String> {
@@ -2176,14 +3124,34 @@ impl App {
         self.settings.hang_vk = hang.1;
         self.settings.toggle_mods = toggle.0;
         self.settings.toggle_vk = toggle.1;
-        self.settings.sag_percent =
-            if sag_percent < 0.0 { SAG_AUTO } else { sag_percent.clamp(0.0, SAG_PERCENT_MAX) };
-        self.settings.hover_open = hover_open;
+        self.settings.sag_percent = if sag_percent < 0.0 {
+            SAG_AUTO
+        } else {
+            sag_percent.clamp(0.0, SAG_PERCENT_MAX)
+        };
         self.settings.always_on = always_on;
         self.settings.drag_hang = drag_hang;
         self.settings.save();
+        // Applying the mode immediately is the difference between a setting and
+        // a promise: turning "keep the line on screen" on should bring it down,
+        // and turning it off should hand the line over to the short-visit rules.
+        if always_on {
+            self.revealed = true;
+            self.pinned = true;
+            self.dismissed = false;
+            self.transient_until = None;
+            self.peek = false;
+            self.peek_hover = false;
+        } else {
+            self.pinned = false;
+            if self.revealed {
+                self.start_visit();
+            } else {
+                self.transient_until = None;
+            }
+        }
         crate::log!(
-            "settings saved: hang={} toggle={} sag={} hover_open={} always_on={} drag_hang={}",
+            "settings saved: hang={} toggle={} sag={} always_on={} drag_hang={}",
             self.settings.hang_label(),
             self.settings.toggle_label(),
             if self.settings.sag_is_auto() {
@@ -2191,14 +3159,11 @@ impl App {
             } else {
                 format!("{:.1}%", self.settings.sag_percent)
             },
-            hover_open,
             always_on,
             drag_hang
         );
         // A different sag changes the strip height and where the cards sit.
-        let monitor = self.monitor;
-        self.place(monitor);
-        self.invalidate();
+        self.relayout();
         Ok(())
     }
 
@@ -2249,7 +3214,11 @@ impl App {
                     let _ = RegisterHotKey(Some(self.hwnd), HOTKEY_TOGGLE, mods, old.3);
                 }
             }
-            return Err(format!("{}: {}", t("settings_hotkey_failed"), failed.join(", ")));
+            return Err(format!(
+                "{}: {}",
+                t("settings_hotkey_failed"),
+                failed.join(", ")
+            ));
         }
         crate::log!(
             "hotkeys now {} / {}",
@@ -2292,6 +3261,7 @@ impl App {
         }
 
         self.ensure_panel();
+        self.sync_rope();
         // The frame timer should only run while something is actually moving.
         // A line that is simply down is static: it is redrawn on demand (hover,
         // new thumbnails, polls) by `invalidate`, not sixty times a second.
@@ -2306,6 +3276,12 @@ impl App {
             let started = Instant::now();
             self.redraw();
             self.pace_frame(started.elapsed().as_secs_f32());
+            if let Some((hwnd, parked_at)) = self.hang_undrawn.take() {
+                crate::log!(
+                    "card {hwnd} drawn {} ms after the park",
+                    now.duration_since(parked_at).as_millis()
+                );
+            }
             self.set_shown(true);
         } else {
             self.set_shown(false);
@@ -2358,11 +3334,143 @@ impl App {
         self.shown = on;
         unsafe {
             if on {
+                // Coming back on screen is the start of a use, so the layer
+                // takes the top again: the pill has to be reachable above
+                // whatever window happens to touch the top edge.
+                self.topmost = true;
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-                let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
             } else {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
+                if !self.rope_hwnd.is_invalid() {
+                    let _ = ShowWindow(self.rope_hwnd, SW_HIDE);
+                }
+                self.rope_shown = false;
             }
+        }
+        self.sync_rope();
+    }
+
+    /// The cards are a layer you reach into, not a layer that sits on your work.
+    /// While the pointer is on the line, or a card or a window is in the hand,
+    /// the layer is topmost so it can be seen and hit. A click that lands off the
+    /// line, or another window taking the foreground, hands the top of the screen
+    /// back.
+    ///
+    /// Handing it back is two moves, not one. Clearing the topmost style alone
+    /// leaves the layer at the *head* of the normal band, which is above the
+    /// window that was just clicked into - the cards stay exactly where they were
+    /// and the user cannot see what he is working in. Going to the bottom puts
+    /// them behind it, which is the only reading of "do not cover my work".
+    fn set_topmost(&mut self, on: bool) {
+        if self.topmost == on {
+            return;
+        }
+        self.topmost = on;
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(if on { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            if !on {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_BOTTOM),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+        // The editor is a small topmost window of ours; taking the top for the
+        // cards must put it back above the panel, or the live preview it exists
+        // for is hidden under the card it belongs to.
+        if on {
+            crate::tag_ui::raise();
+        }
+        // Cards give the top back, the rope does not. Its own layer keeps the
+        // line visible above the window just clicked into; the next pointer
+        // move onto it raises the cards again.
+        self.sync_rope();
+        crate::log!(
+            "card layer {}",
+            if on {
+                "takes the top"
+            } else {
+                "sinks behind the work"
+            }
+        );
+        self.invalidate();
+    }
+
+    /// Shows the rope's always-on-top layer exactly while the card layer is not
+    /// topmost. When the cards have the top, they draw the rope themselves;
+    /// showing both would composite the same line twice.
+    fn needs_rope(&self) -> bool {
+        !self.rope_hwnd.is_invalid() && self.revealed && !self.topmost && self.slide > 0.001
+    }
+
+    fn sync_rope(&mut self) {
+        let show = self.needs_rope();
+        if show != self.rope_shown {
+            self.rope_shown = show;
+            unsafe {
+                if show {
+                    let _ = ShowWindow(self.rope_hwnd, SW_SHOWNOACTIVATE);
+                    let _ = SetWindowPos(
+                        self.rope_hwnd,
+                        Some(HWND_TOPMOST),
+                        self.panel.left,
+                        self.panel.top,
+                        self.panel.width(),
+                        self.panel.height(),
+                        SWP_NOACTIVATE,
+                    );
+                } else {
+                    let _ = ShowWindow(self.rope_hwnd, SW_HIDE);
+                }
+            }
+        } else if show {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.rope_hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    /// Where a resize or move of the layer should sit in the z-order: wherever
+    /// `set_topmost` last put it. Passing `HWND_TOPMOST` here would silently
+    /// undo a demotion the user asked for by clicking elsewhere - and passing
+    /// `HWND_NOTOPMOST` would undo it too, because that one means "to the head
+    /// of the normal band", which is above the window he is working in. The line
+    /// changes height whenever a card settles, so this is not a rare path.
+    fn z_for_move(&self) -> (Option<HWND>, SET_WINDOW_POS_FLAGS) {
+        if self.topmost {
+            (Some(HWND_TOPMOST), SWP_NOACTIVATE)
+        } else {
+            (None, SWP_NOACTIVATE | SWP_NOZORDER)
         }
     }
 
@@ -2391,12 +3499,37 @@ impl App {
 
     fn place(&mut self, monitor: Monitor) {
         self.monitor = monitor;
-        self.layout = self.settings.layout_for(self.monitor.bounds.width() as f32, self.monitor.scale);
+        self.layout = self
+            .settings
+            .layout_for(self.monitor.bounds.width() as f32, self.monitor.scale);
         self.panel = self.strip();
         self.origin = (self.panel.left, self.panel.top);
+        let (z, flags) = self.z_for_move();
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
+                z,
+                self.panel.left,
+                self.panel.top,
+                self.panel.width(),
+                self.panel.height(),
+                flags,
+            );
+        }
+        self.move_rope();
+        self.invalidate();
+    }
+
+    /// Keeps the rope layer over the same strip as the cards. It is click-through
+    /// and only visible while the cards are sunk, so this is the entire cost of
+    /// the second window when the line is being used normally.
+    fn move_rope(&mut self) {
+        if self.rope_hwnd.is_invalid() {
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                self.rope_hwnd,
                 Some(HWND_TOPMOST),
                 self.panel.left,
                 self.panel.top,
@@ -2405,7 +3538,6 @@ impl App {
                 SWP_NOACTIVATE,
             );
         }
-        self.invalidate();
     }
 
     fn strip(&self) -> WRect {
@@ -2429,7 +3561,9 @@ impl App {
                 let k = card.scale * fit;
                 let bottom = self.layout.rope_y(card.x.x)
                     + ((PIN_TOP - 22.0) + CARD_H * card.zoom_y) * s * k;
-                rect.bottom = rect.bottom.max(self.monitor.bounds.top + bottom.ceil() as i32 + 10);
+                rect.bottom = rect
+                    .bottom
+                    .max(self.monitor.bounds.top + bottom.ceil() as i32 + 10);
             }
         }
         // Never leave the monitor: a layered window straddling screens is both
@@ -2450,20 +3584,35 @@ impl App {
         }
         self.panel = want;
         self.origin = (want.left, want.top);
+        let (z, flags) = self.z_for_move();
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
+                z,
                 want.left,
                 want.top,
                 want.width(),
                 want.height(),
-                SWP_NOACTIVATE,
+                flags,
             );
+        }
+        self.move_rope();
+        self.sync_rope();
+        // Moving the panel re-asserts its z-order, which can put it over the
+        // editor. The editor follows the card; it never goes under it.
+        if self.topmost && self.tag_card.is_some() {
+            crate::tag_ui::raise();
         }
     }
 
     fn redraw(&mut self) {
+        // A demotion can land while the line is still sliding in, or the line
+        // can start sliding out while the cards are demoted. Keep the rope's
+        // companion layer in step with the state that decides whether it should
+        // exist, instead of only at the moment `set_topmost` was called.
+        if self.needs_rope() != self.rope_shown {
+            self.sync_rope();
+        }
         if !self.compose() {
             return;
         }
@@ -2472,7 +3621,11 @@ impl App {
             if let Some(dir) = &self.dump_dir {
                 let _ = std::fs::create_dir_all(dir);
                 self.dump_seq += 1;
-                let path = dir.join(format!("frame-{}-{:02}.png", std::process::id(), self.dump_seq));
+                let path = dir.join(format!(
+                    "frame-{}-{:02}.png",
+                    std::process::id(),
+                    self.dump_seq
+                ));
                 if let Some(canvas) = self.canvas.as_ref() {
                     let _ = canvas.save_png(&path);
                 }
@@ -2480,6 +3633,9 @@ impl App {
             }
         }
         self.present();
+        if self.rope_shown {
+            self.present_rope();
+        }
     }
 
     /// Debug aid for the regression tests: the clickable rectangles of the cards
@@ -2503,14 +3659,24 @@ impl App {
     fn compose(&mut self) -> bool {
         let w = self.panel.width().max(1) as u32;
         let h = self.panel.height().max(1) as u32;
-        if self.canvas.as_ref().is_none_or(|c| c.width() != w || c.height() != h) {
-            let Some(canvas) = Pixmap::new(w, h) else { return false };
+        if self
+            .canvas
+            .as_ref()
+            .is_none_or(|c| c.width() != w || c.height() != h)
+        {
+            let Some(canvas) = Pixmap::new(w, h) else {
+                return false;
+            };
             self.canvas = Some(canvas);
         }
-        let Some(mut canvas) = self.canvas.take() else { return false };
+        let Some(mut canvas) = self.canvas.take() else {
+            return false;
+        };
         let frame = if self.peek && self.slide <= 0.001 {
             let hot = self.peek_hover;
-            self.painter.compose_peek_into(&mut canvas, &self.layout, hot)
+            let cards = self.line.live_count();
+            self.painter
+                .compose_peek_into(&mut canvas, &self.layout, hot, cards)
         } else {
             let hot = self.band_hot && self.drag.is_some();
             let hint: Option<String> = if self.line.live_count() == 0 {
@@ -2523,6 +3689,7 @@ impl App {
                 y_off: (self.slide - 1.0) * self.layout.panel_height(),
                 hint: hint.as_deref(),
                 hot,
+                rope: self.topmost,
             };
             self.painter
                 .compose_into(&mut canvas, &self.line, &self.layout, &ui)
@@ -2533,63 +3700,54 @@ impl App {
     }
 
     fn present(&mut self) {
-        let Some(canvas) = self.canvas.as_ref() else { return };
-        let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-        // Grow the DIB only when the frame no longer fits in it. A flight makes
-        // the panel grow and shrink with every frame; allocating the GDI bitmap
-        // each time is a cost the frame rate pays for no visible reason.
-        let reuse = self.dib.as_ref().is_some_and(|d| {
-            let area = (d.w * d.h) as i64;
-            let want = (w * h) as i64;
-            d.w >= w && d.h >= h && area <= want * 5 / 2
-        });
-        if !reuse {
-            self.dib = Dib::new(w, h);
-        }
-        let Some(dib) = self.dib.as_ref() else { return };
-        let stride = (dib.w * 4) as usize;
-        let row = (w * 4) as usize;
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(dib.bits, stride * dib.h as usize);
-            // tiny-skia speaks RGBA, the layered window wants BGRA. One 32-bit
-            // swap per pixel, a row at a time, because the DIB may be wider
-            // than this frame.
-            for (y, src) in canvas.data().chunks_exact(row).enumerate() {
-                let out = &mut dst[y * stride..y * stride + row];
-                for (to, from) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                    let v = u32::from_ne_bytes([from[0], from[1], from[2], from[3]]);
-                    let swapped = (v & 0xFF00_FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
-                    to.copy_from_slice(&swapped.to_ne_bytes());
-                }
-            }
-        }
-        let origin = POINT { x: self.origin.0, y: self.origin.1 };
-        let size = SIZE { cx: w, cy: h };
-        let source = POINT::default();
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
+        let Some(canvas) = self.canvas.take() else {
+            return;
         };
-        unsafe {
-            if let Err(error) = UpdateLayeredWindow(
-                self.hwnd,
-                None,
-                Some(&origin),
-                Some(&size),
-                Some(dib.hdc),
-                Some(&source),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            ) {
-                if !self.present_failed {
-                    self.present_failed = true;
-                    crate::log!("UpdateLayeredWindow failed (nothing will show): {error}");
-                }
-            }
+        present_layer(
+            self.hwnd,
+            &canvas,
+            &mut self.dib,
+            self.origin,
+            &mut self.present_failed,
+        );
+        self.canvas = Some(canvas);
+    }
+
+    /// The rope-only companion layer, painted only while the cards are sunk.
+    /// It is a full-panel layered window like the main one, so the rope keeps
+    /// exactly the same curve and slide offset instead of being a second,
+    /// subtly different drawing.
+    fn present_rope(&mut self) {
+        if self.rope_hwnd.is_invalid() {
+            return;
         }
+        let w = self.panel.width().max(1) as u32;
+        let h = self.panel.height().max(1) as u32;
+        if self
+            .rope_canvas
+            .as_ref()
+            .is_none_or(|c| c.width() != w || c.height() != h)
+        {
+            let Some(canvas) = Pixmap::new(w, h) else {
+                return;
+            };
+            self.rope_canvas = Some(canvas);
+        }
+        let Some(mut canvas) = self.rope_canvas.take() else {
+            return;
+        };
+        let hot = self.band_hot && self.drag.is_some();
+        let y_off = (self.slide - 1.0) * self.layout.panel_height();
+        self.painter
+            .compose_rope_into(&mut canvas, &self.layout, y_off, hot);
+        present_layer(
+            self.rope_hwnd,
+            &canvas,
+            &mut self.rope_dib,
+            self.origin,
+            &mut self.present_failed,
+        );
+        self.rope_canvas = Some(canvas);
     }
 
     // MARK: Small helpers
@@ -2610,7 +3768,11 @@ impl App {
     /// The card's clickable rectangle in canvas coordinates, as of the last
     /// frame. Its sides and bottom corners are the resize handles.
     fn card_rect(&self, id: u64) -> Option<WRect> {
-        self.hits.iter().rev().find(|(hit, _)| *hit == id).map(|(_, rect)| *rect)
+        self.hits
+            .iter()
+            .rev()
+            .find(|(hit, _)| *hit == id)
+            .map(|(_, rect)| *rect)
     }
 
     fn peek_at(&self, point: (i32, i32)) -> bool {
@@ -2633,13 +3795,18 @@ impl App {
         if let Some(edge) = press.edge {
             let mut changed = false;
             if edge.resizes_height() {
-                let zoom_y = crate::line::zoom_y_from_bottom(point.1 as f32, press.body_top, press.height_unit);
+                let zoom_y = crate::line::zoom_y_from_bottom(
+                    point.1 as f32,
+                    press.body_top,
+                    press.height_unit,
+                );
                 // The top stays on the pin, so the card only moves its bottom;
                 // the line does not need re-packing.
                 changed |= self.line.set_zoom_y(press.id, zoom_y);
             }
             if edge.resizes_width() {
-                let zoom = crate::line::zoom_from_edge(point.0 as f32, press.centre, self.layout.scale);
+                let zoom =
+                    crate::line::zoom_from_edge(point.0 as f32, press.centre, self.layout.scale);
                 if self.line.set_zoom(press.id, zoom) {
                     // A wider card re-packs the line, which would carry it away
                     // from the edge the pointer is holding. Keep its hanging
@@ -2653,6 +3820,7 @@ impl App {
                     p.grabbed = true;
                     p.zoomed = true;
                 }
+                self.press_dragged = true;
                 self.revealed = true;
                 self.hold_until = Some(Instant::now() + Duration::from_secs(1));
                 self.invalidate();
@@ -2667,6 +3835,7 @@ impl App {
         if let Some(p) = self.card_press.as_mut() {
             p.grabbed = true;
         }
+        self.press_dragged = true;
         let id = press.id;
         let x = (point.0 as f32).clamp(0.0, self.layout.width);
         self.line.dragging = Some(id);
@@ -2693,7 +3862,9 @@ impl App {
     }
 
     fn finish_card_press(&mut self, point: (i32, i32)) {
-        let Some(press) = self.card_press.take() else { return };
+        let Some(press) = self.card_press.take() else {
+            return;
+        };
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -2794,6 +3965,74 @@ impl App {
 /// the line is on; a window hung up by hotkey or from the tray goes back
 /// exactly where it was. Both keep their size, and a maximized window is left
 /// alone: it comes back full screen either way.
+fn present_layer(
+    hwnd: HWND,
+    canvas: &Pixmap,
+    dibs: &mut Option<Dib>,
+    origin: (i32, i32),
+    failed: &mut bool,
+) {
+    let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+    // Grow the DIB only when the frame no longer fits in it. A flight makes
+    // the panel grow and shrink with every frame; allocating the GDI bitmap
+    // each time is a cost the frame rate pays for no visible reason.
+    let reuse = dibs.as_ref().is_some_and(|d| {
+        let area = (d.w * d.h) as i64;
+        let want = (w * h) as i64;
+        d.w >= w && d.h >= h && area <= want * 5 / 2
+    });
+    if !reuse {
+        *dibs = Dib::new(w, h);
+    }
+    let Some(dib) = dibs.as_ref() else { return };
+    let stride = (dib.w * 4) as usize;
+    let row = (w * 4) as usize;
+    unsafe {
+        let dst = std::slice::from_raw_parts_mut(dib.bits, stride * dib.h as usize);
+        // tiny-skia speaks RGBA, the layered window wants BGRA. One 32-bit
+        // swap per pixel, a row at a time, because the DIB may be wider
+        // than this frame.
+        for (y, src) in canvas.data().chunks_exact(row).enumerate() {
+            let out = &mut dst[y * stride..y * stride + row];
+            for (to, from) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                let v = u32::from_ne_bytes([from[0], from[1], from[2], from[3]]);
+                let swapped = (v & 0xFF00_FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+                to.copy_from_slice(&swapped.to_ne_bytes());
+            }
+        }
+    }
+    let origin = POINT {
+        x: origin.0,
+        y: origin.1,
+    };
+    let size = SIZE { cx: w, cy: h };
+    let source = POINT::default();
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    unsafe {
+        if let Err(error) = UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&origin),
+            Some(&size),
+            Some(dib.hdc),
+            Some(&source),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        ) {
+            if !*failed {
+                *failed = true;
+                crate::log!("UpdateLayeredWindow failed (nothing will show): {error}");
+            }
+        }
+    }
+}
+
 fn restore_record(card: &Card, work: WRect) -> Parked {
     if card.centred {
         park::centred_on(&card.parked, work)
@@ -2817,6 +4056,7 @@ fn journal_entry(card: &Card) -> journal::Entry {
         zoom_y: card.zoom_y,
         offset: card.offset,
         centred: card.centred,
+        tag: card.tag.clone(),
     }
 }
 
@@ -2852,15 +4092,6 @@ fn to_pixmap(image: &shaiwin_platform_win::Image) -> Option<Pixmap> {
     Pixmap::from_vec(image.to_premultiplied_rgba(), size)
 }
 
-fn truncate(text: &str, max: usize) -> String {
-    let mut out: String = text.chars().take(max).collect();
-    if text.chars().count() > max {
-        out.push('…');
-    }
-    out
-}
-
-
 fn client_point(lp: LPARAM) -> (i32, i32) {
     let x = (lp.0 & 0xFFFF) as i16 as i32;
     let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -2892,6 +4123,19 @@ fn taskbar_created() -> u32 {
     use std::sync::OnceLock;
     static MSG: OnceLock<u32> = OnceLock::new();
     *MSG.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) })
+}
+
+unsafe extern "system" fn rope_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            // The rope is a visual reminder, not a target. Every click belongs
+            // to the window the user is working in, even when the pointer is on
+            // the rope; the poll watches the pointer and raises the card layer.
+            WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {

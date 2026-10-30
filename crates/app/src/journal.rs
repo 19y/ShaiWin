@@ -45,6 +45,9 @@ pub struct Entry {
     /// The window was dragged onto the line, so it opens in the middle of the
     /// screen instead of where it was. Recorded so a restart keeps that promise.
     pub centred: bool,
+    /// The user's short label for the card. Empty when untagged. Mainly so a
+    /// loaded line can be read at a glance; it never affects parking.
+    pub tag: String,
 }
 
 fn file() -> PathBuf {
@@ -52,7 +55,9 @@ fn file() -> PathBuf {
 }
 
 pub fn load() -> Vec<Entry> {
-    let Ok(text) = fs::read_to_string(file()) else { return Vec::new() };
+    let Ok(text) = fs::read_to_string(file()) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for line in text.lines() {
         if let Some(entry) = parse(line) {
@@ -63,7 +68,7 @@ pub fn load() -> Vec<Entry> {
 }
 
 fn parse(line: &str) -> Option<Entry> {
-    let mut f = line.splitn(17, '\t');
+    let mut f = line.splitn(18, '\t');
     let hwnd = f.next()?.parse().ok()?;
     let pid = f.next()?.parse().ok()?;
     let process_start = f.next()?.parse().ok()?;
@@ -86,6 +91,8 @@ fn parse(line: &str) -> Option<Entry> {
     // Records written before the drag/hotkey distinction have no 17th field;
     // they open where they were, which is what every hang did back then.
     let centred = f.next() == Some("1");
+    // The tag arrived last, so every record written before it still reads.
+    let tag = f.next().map(unescape).unwrap_or_default();
     Some(Entry {
         hwnd,
         pid,
@@ -101,13 +108,26 @@ fn parse(line: &str) -> Option<Entry> {
             max_y,
             normal,
         },
-        parked: Parked { placement: Placement { flags, show_cmd, min_x, min_y, max_x, max_y, normal }, parked: parked_rect, was_maximized: show_cmd == 3 },
+        parked: Parked {
+            placement: Placement {
+                flags,
+                show_cmd,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                normal,
+            },
+            parked: parked_rect,
+            was_maximized: show_cmd == 3,
+        },
         anchor: (anchor_x, anchor_y),
         hooked_away,
         zoom,
         zoom_y,
         offset,
         centred,
+        tag,
     })
 }
 
@@ -137,7 +157,7 @@ fn unescape(s: &str) -> String {
 fn line(entry: &Entry) -> String {
     let p = &entry.placement;
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{}\t{},{}\t{},{}\t{},{},{},{}\t{},{}\t{}\t{:.3}\t{:.1}\t{:.3}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{}\t{},{}\t{},{}\t{},{},{},{}\t{},{}\t{}\t{:.3}\t{:.1}\t{:.3}\t{}\t{}\n",
         entry.hwnd,
         entry.pid,
         entry.process_start,
@@ -164,6 +184,7 @@ fn line(entry: &Entry) -> String {
         entry.offset,
         entry.zoom_y,
         u8::from(entry.centred),
+        escape(&entry.tag),
     )
 }
 
@@ -211,11 +232,34 @@ mod tests {
                 min_y: -1,
                 max_x: -2,
                 max_y: -2,
-                normal: Rect { left: 10, top: 20, right: 300, bottom: 400 },
+                normal: Rect {
+                    left: 10,
+                    top: 20,
+                    right: 300,
+                    bottom: 400,
+                },
             },
             parked: Parked {
-                placement: Placement { flags: 0, show_cmd: 3, min_x: -1, min_y: -1, max_x: -2, max_y: -2, normal: Rect { left: 10, top: 20, right: 300, bottom: 400 } },
-                parked: Rect { left: 2000, top: 40, right: 2500, bottom: 800 },
+                placement: Placement {
+                    flags: 0,
+                    show_cmd: 3,
+                    min_x: -1,
+                    min_y: -1,
+                    max_x: -2,
+                    max_y: -2,
+                    normal: Rect {
+                        left: 10,
+                        top: 20,
+                        right: 300,
+                        bottom: 400,
+                    },
+                },
+                parked: Rect {
+                    left: 2000,
+                    top: 40,
+                    right: 2500,
+                    bottom: 800,
+                },
                 was_maximized: true,
             },
             anchor: (1920, 0),
@@ -224,6 +268,7 @@ mod tests {
             zoom_y: 1.6,
             offset: -42.0,
             centred: true,
+            tag: "work".to_string(),
         };
         let text = line(&entry);
         let back = parse(text.trim_end()).expect("parses");
@@ -234,6 +279,7 @@ mod tests {
         assert_eq!(back.anchor, entry.anchor);
         assert_eq!(back.hooked_away, entry.hooked_away);
         assert!(back.centred);
+        assert_eq!(back.tag, entry.tag);
         assert!((back.zoom - entry.zoom).abs() < 0.001);
         assert!((back.zoom_y - entry.zoom_y).abs() < 0.001);
         assert!((back.offset - entry.offset).abs() < 0.1);
@@ -255,7 +301,12 @@ mod tests {
                 min_y: 0,
                 max_x: 0,
                 max_y: 0,
-                normal: Rect { left: 0, top: 0, right: 10, bottom: 10 },
+                normal: Rect {
+                    left: 0,
+                    top: 0,
+                    right: 10,
+                    bottom: 10,
+                },
             },
             parked: Parked {
                 placement: Placement {
@@ -265,9 +316,19 @@ mod tests {
                     min_y: 0,
                     max_x: 0,
                     max_y: 0,
-                    normal: Rect { left: 0, top: 0, right: 10, bottom: 10 },
+                    normal: Rect {
+                        left: 0,
+                        top: 0,
+                        right: 10,
+                        bottom: 10,
+                    },
                 },
-                parked: Rect { left: 0, top: 0, right: 10, bottom: 10 },
+                parked: Rect {
+                    left: 0,
+                    top: 0,
+                    right: 10,
+                    bottom: 10,
+                },
                 was_maximized: false,
             },
             anchor: (0, 0),
@@ -276,11 +337,12 @@ mod tests {
             zoom_y: 1.0,
             offset: 0.0,
             centred: false,
+            tag: String::new(),
         };
         // An old record is today's line with the fields added since removed.
-        let full = line(&entry).trim_end().to_string();
+        let full = line(&entry).trim_end_matches('\n').to_string();
         let mut head = full.as_str();
-        for _ in 0..5 {
+        for _ in 0..6 {
             head = head.rsplit_once('\t').expect("more than one field").0;
         }
         let back = parse(head).expect("parses");
@@ -311,7 +373,12 @@ mod tests {
                 min_y: 0,
                 max_x: 0,
                 max_y: 0,
-                normal: Rect { left: 0, top: 0, right: 10, bottom: 10 },
+                normal: Rect {
+                    left: 0,
+                    top: 0,
+                    right: 10,
+                    bottom: 10,
+                },
             },
             parked: Parked {
                 placement: Placement {
@@ -321,9 +388,19 @@ mod tests {
                     min_y: 0,
                     max_x: 0,
                     max_y: 0,
-                    normal: Rect { left: 0, top: 0, right: 10, bottom: 10 },
+                    normal: Rect {
+                        left: 0,
+                        top: 0,
+                        right: 10,
+                        bottom: 10,
+                    },
                 },
-                parked: Rect { left: 0, top: 0, right: 10, bottom: 10 },
+                parked: Rect {
+                    left: 0,
+                    top: 0,
+                    right: 10,
+                    bottom: 10,
+                },
                 was_maximized: false,
             },
             anchor: (0, 0),
@@ -332,9 +409,12 @@ mod tests {
             zoom_y: 1.6,
             offset: -37.0,
             centred: true,
+            tag: String::new(),
         };
-        let full = line(&entry).trim_end().to_string();
+        let full = line(&entry).trim_end_matches('\n').to_string();
+        // Drop the tag, the centring flag and the height that came after it.
         let old = full.rsplit_once('\t').expect("more than one field").0;
+        let old = old.rsplit_once('\t').expect("more than one field").0;
         let old = old.rsplit_once('\t').expect("more than one field").0;
         let back = parse(old).expect("parses");
         assert_eq!(back.zoom, 1.45);

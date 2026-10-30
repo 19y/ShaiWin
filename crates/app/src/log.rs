@@ -18,16 +18,26 @@ pub fn init() {
         let _ = std::fs::create_dir_all(dir);
     }
     rotate(&path);
-    let file = OpenOptions::new().create(true).append(true).open(&path).ok();
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok();
     if let Ok(mut guard) = LOG.lock() {
         *guard = file;
     }
-    write(format_args!("--- shaiwin {} (pid {}) ---", env!("CARGO_PKG_VERSION"), std::process::id()));
+    write(format_args!(
+        "--- shaiwin {} (pid {}) ---",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    ));
 }
 
 fn rotate(path: &Path) {
     const LIMIT: u64 = 256 * 1024;
-    let too_big = std::fs::metadata(path).map(|m| m.len() > LIMIT).unwrap_or(false);
+    let too_big = std::fs::metadata(path)
+        .map(|m| m.len() > LIMIT)
+        .unwrap_or(false);
     if too_big {
         let _ = std::fs::rename(path, path.with_extension("old.log"));
     }

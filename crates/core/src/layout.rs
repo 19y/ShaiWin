@@ -53,6 +53,16 @@ pub const SAG_PERCENT_MAX: f32 = 16.0;
 const CARD_TOP_GAP: f32 = 22.0;
 const CARD_BOTTOM_GAP: f32 = 18.0;
 
+/// How far above and below the drawn rope a pointer still counts as being on
+/// it, in logical pixels. The stroke is a couple of pixels wide, and aiming at
+/// the drawing itself makes the pointer feel like a needle. This is the grab
+/// band: a 28 logical px target, which is comfortable without being a wall.
+/// It stays `CARD_TOP_GAP - ROPE_REACH` (8 px at 100%) clear of the card tops,
+/// so no widening can ever make the band answer for a card's place on the
+/// strip - that place belongs to the user's windows and must not summon the
+/// cards back.
+pub const ROPE_REACH: f32 = 14.0;
+
 impl LineLayout {
     /// The shipped geometry: the classic sag.
     pub fn new(width: f32, scale: f32) -> Self {
@@ -74,8 +84,15 @@ impl LineLayout {
     }
 
     fn built(width: f32, scale: f32, sag: f32) -> Self {
-        let panel_h = (ROPE_TOP + CARD_TOP_GAP + CARD_H + CARD_BOTTOM_GAP + sag / scale).max(PANEL_H);
-        LineLayout { width, scale, top_inset: ROPE_TOP, sag, panel_h }
+        let panel_h =
+            (ROPE_TOP + CARD_TOP_GAP + CARD_H + CARD_BOTTOM_GAP + sag / scale).max(PANEL_H);
+        LineLayout {
+            width,
+            scale,
+            top_inset: ROPE_TOP,
+            sag,
+            panel_h,
+        }
     }
 
     /// How far below the top edge a dragged window may be released and still
@@ -127,6 +144,11 @@ impl LineLayout {
     /// the screen so it looks the same on a laptop and an ultrawide.
     pub fn sag(&self) -> f32 {
         self.sag
+    }
+
+    /// The rope's grab band above and below the stroke, in device pixels.
+    pub fn rope_reach(&self) -> f32 {
+        ROPE_REACH * self.scale
     }
 
     /// Screen x of the rope at `x`.
@@ -293,7 +315,11 @@ mod tests {
         // squeezed; ten normal ones must still fit on screen when they are not.
         let l = LineLayout::new(1920.0, 1.0);
         let small = vec![CARD_W * 0.6; 10];
-        assert_eq!(l.pack_fit(&small), 1.0, "ten small cards should not need squeezing");
+        assert_eq!(
+            l.pack_fit(&small),
+            1.0,
+            "ten small cards should not need squeezing"
+        );
         let xs = l.pack_x(&small);
         assert!(xs[0] > 0.0 && *xs.last().unwrap() < l.width);
 
@@ -301,7 +327,11 @@ mod tests {
         let fit = l.pack_fit(&big);
         assert!(fit < 1.0, "ten wide cards were allowed to spill");
         let xs = l.pack_x(&big);
-        assert!(xs[0] - CARD_W * 1.6 * fit / 2.0 > -1.0, "first card off the left edge at {}", xs[0]);
+        assert!(
+            xs[0] - CARD_W * 1.6 * fit / 2.0 > -1.0,
+            "first card off the left edge at {}",
+            xs[0]
+        );
         assert!(*xs.last().unwrap() + CARD_W * 1.6 * fit / 2.0 < l.width + 1.0);
     }
 
@@ -356,13 +386,37 @@ mod tests {
     }
 
     #[test]
+    fn the_rope_grab_band_is_a_target_not_a_wall() {
+        // Wide enough that aiming at a 2 px stroke does not feel like a needle,
+        // narrow enough that it cannot start answering for the strip below it.
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let l = LineLayout::new(2560.0, scale);
+            let reach = l.rope_reach();
+            assert!(
+                reach >= 10.0 * scale,
+                "a {reach} px grab band at {scale}x is back to feeling like a needle"
+            );
+            assert!(
+                reach < CARD_TOP_GAP * scale,
+                "{reach} px at {scale}x must stay above the card tops ({})",
+                CARD_TOP_GAP * scale
+            );
+            assert!((reach - ROPE_REACH * scale).abs() < 0.01);
+        }
+    }
+
+    #[test]
     fn a_deep_sag_makes_the_strip_taller() {
         let shallow = LineLayout::with_sag(2560.0, 1.0, 0.0);
         let deep = LineLayout::with_sag(2560.0, 1.0, 8.0);
         assert!(deep.panel_height() > shallow.panel_height());
         // The lowest card (at the middle of the rope) must fit inside.
         let lowest = deep.rope_y(1280.0) + CARD_TOP_GAP + CARD_H;
-        assert!(lowest < deep.panel_height(), "lowest = {lowest}, panel = {}", deep.panel_height());
+        assert!(
+            lowest < deep.panel_height(),
+            "lowest = {lowest}, panel = {}",
+            deep.panel_height()
+        );
     }
 
     #[test]
@@ -383,9 +437,17 @@ mod tests {
         let laptop = LineLayout::new(1000.0, 1.0);
         assert!((laptop.sag() - 16.0).abs() < 0.01, "sag = {}", laptop.sag());
         let hidpi = LineLayout::new(2560.0, 1.5);
-        assert!((hidpi.sag() - 26.0 * 1.5).abs() < 0.01, "sag = {}", hidpi.sag());
+        assert!(
+            (hidpi.sag() - 26.0 * 1.5).abs() < 0.01,
+            "sag = {}",
+            hidpi.sag()
+        );
         let lowest = l.rope_y(1280.0) + CARD_TOP_GAP + CARD_H;
-        assert!(lowest < l.panel_height(), "lowest = {lowest}, panel = {}", l.panel_height());
+        assert!(
+            lowest < l.panel_height(),
+            "lowest = {lowest}, panel = {}",
+            l.panel_height()
+        );
     }
 
     #[test]
@@ -411,7 +473,11 @@ mod tests {
         assert!(l.hang_zone() < l.panel_height());
         // A curve the user dials down moves the rope and the band together.
         let deep = LineLayout::with_sag(2560.0, 1.0, 16.0);
-        assert!(deep.hang_zone() > l.hang_zone(), "zone = {}", deep.hang_zone());
+        assert!(
+            deep.hang_zone() > l.hang_zone(),
+            "zone = {}",
+            deep.hang_zone()
+        );
         assert!(deep.hang_zone() < deep.panel_height());
     }
 
@@ -455,7 +521,11 @@ mod tests {
         assert!(hidpi.window_on_line((ROPE_TOP * hidpi.scale) as i32, 0));
         // A curve the user dials up reaches further down.
         let deep = LineLayout::with_sag(2560.0, 1.0, 16.0);
-        assert!(deep.window_on_line(l.hang_depth() + 1, 0), "depth = {}", deep.hang_depth());
+        assert!(
+            deep.window_on_line(l.hang_depth() + 1, 0),
+            "depth = {}",
+            deep.hang_depth()
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\testkit.ps1"
 
 $root = Join-Path $env:TEMP "shaiwin-resize"
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nhover_open=0`nalways_on=1`nexcluded=`n"
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
 Initialize-Fixtures $root
 $journal = Join-Path $state "ShaiWin\parked.txt"
 

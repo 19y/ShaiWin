@@ -24,7 +24,7 @@ $demoDir = Join-Path $root "demo"
 if (-not $Out) { $Out = Join-Path $shotDir "frame.png" }
 Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
 
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nhover_open=0`nalways_on=1`nexcluded=`n"
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
 New-Item -ItemType Directory -Force -Path $shotDir, $demoDir | Out-Null
 $env:SHAIWIN_DUMP_DIR = $shotDir
 

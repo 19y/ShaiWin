@@ -17,7 +17,11 @@ pub fn is_chinese() -> bool {
 /// Looks up a key. Unknown keys come back as themselves, which makes a missing
 /// translation obvious without crashing.
 pub fn t(key: &str) -> &'static str {
-    if is_chinese() { zh(key) } else { en(key) }
+    if is_chinese() {
+        zh(key)
+    } else {
+        en(key)
+    }
 }
 
 macro_rules! table {
@@ -40,7 +44,6 @@ fn leak(key: &str) -> &'static str {
 table! {
     "app_name" => "ShaiWin" | "晒窗",
     "hang_window" => "Hang the window I am using" | "挂起当前窗口",
-    "hang_short" => "Hang window" | "挂起窗口",
     "take_down_all" => "Take everything down" | "全部取下",
     "take_down" => "Take down" | "取下",
     "restore" => "Take it down and show it" | "取下并显示",
@@ -76,21 +79,29 @@ table! {
     "tray_hint" => "Click the tray icon for more." | "右键托盘图标查看更多。",
     "elevated_tip" => "ShaiWin is running as administrator. Do that only when you need to hang administrator windows; running normally is safer." | "晒窗正以管理员权限运行。只有在需要挂起管理员窗口时才这样做，平时以普通权限运行更安全。",
     "settings_title" => "ShaiWin settings" | "晒窗设置",
+    "settings_group_keys" => "Shortcuts" | "快捷键",
+    "settings_group_line" => "The line" | "晾衣架",
     "settings_hang" => "Hang the current window" | "挂起当前窗口",
     "settings_toggle" => "Show / hide the line" | "展开 / 收起晾衣架",
-    "settings_sag" => "Curve of the line" | "晾衣架弧度",
-    "sag_shipped" => "as shipped" | "原版弧度",
-    "settings_sag_note" => "Drag and the line on screen changes shape straight away. Save keeps it, Cancel puts the old curve back." | "拖动滑块，屏幕上的晾衣架会立刻变弯或变平。保存才会记住，取消会恢复原来的弧度。",
-    "settings_hover" => "Hovering the top edge opens the line directly" | "鼠标停在屏幕顶端时直接展开晾衣架",
-    "settings_always" => "Bring the line down as soon as ShaiWin starts" | "打开晒窗就展开晾衣架",
-    "settings_hover_note" => "When off, a small “Show the line” pill appears instead; click it to open." | "关闭后改为弹出小按钮，点一下才展开。",
-    "settings_drag" => "Drag a window up to the line to hang it" | "把窗口拖到屏幕顶端挂起",
-    "settings_drag_note" => "Off means dragging never lights the line — hang with the shortcut or the tray menu." | "关掉后拖窗口不再亮线，只能用快捷键或托盘菜单挂起。",
+    "settings_key_unset" => "Not set" | "未设置",
+    "settings_key_capture" => "Press a shortcut" | "按下组合键",
+    "settings_sag_note" => "Pull the rope, nudge it with the arrow keys, double-click for the shipped curve." | "按住绳子往下拉，或用方向键微调；双击回自动弧度。",
+    "settings_auto" => "auto" | "自动",
+    "settings_always" => "Keep the line on screen" | "晾衣架一直显示",
+    "settings_always_note" => "Off: it opens from the top edge and tucks itself away when you are done." | "关掉后只在需要时展开，用完自己收起。",
+    "settings_drag" => "Drag to the top to hang" | "拖到屏幕顶端就挂上",
+    "settings_drag_note" => "Off: only the shortcut hangs a window." | "关掉后，只能靠快捷键挂起窗口。",
     "settings_save" => "Save" | "保存",
     "settings_cancel" => "Cancel" | "取消",
-    "settings_no_mods" => "Give the shortcut at least one modifier (Ctrl, Alt or Shift), or clear it to switch it off." | "快捷键至少要有一个修饰键（Ctrl、Alt 或 Shift），清空可以关闭它。",
+    "settings_no_mods" => "Give the shortcut at least one modifier (Ctrl, Alt, Shift or Win)." | "快捷键至少要带一个 Ctrl、Alt、Shift 或 Win。",
     "settings_hotkey_failed" => "That shortcut could not be registered. Another program may be using it." | "这个快捷键注册失败，可能被其他程序占用了。",
-    "settings_hint" => "Clear a shortcut to switch it off." | "清空快捷键可以关闭它。",
+    "tag_menu" => "Set tag…" | "设置标签…",
+    "tag_current" => "Tag: " | "标签：",
+    "tag_clear" => "Remove tag" | "清除标签",
+    "tag_title" => "Window tag" | "窗口标签",
+    "tag_placeholder" => "A name you will recognise" | "起个一眼能认出的名字",
+    "tag_ok" => "Save" | "保存",
+    "tag_cancel" => "Cancel" | "取消",
 }
 
 /// The empty line's prompt uses the user's own hang shortcut.

@@ -53,11 +53,19 @@ impl Rect {
     }
 
     pub fn from_xywh(x: i32, y: i32, w: i32, h: i32) -> Self {
-        Rect { left: x, top: y, right: x + w, bottom: y + h }
+        Rect {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        }
     }
 
     pub fn overlaps(&self, other: &Rect) -> bool {
-        self.left < other.right && other.left < self.right && self.top < other.bottom && other.top < self.bottom
+        self.left < other.right
+            && other.left < self.right
+            && self.top < other.bottom
+            && other.top < self.bottom
     }
 }
 

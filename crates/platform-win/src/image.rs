@@ -11,7 +11,11 @@ pub struct Image {
 
 impl Image {
     pub fn new(width: u32, height: u32) -> Self {
-        Image { width, height, rgba: vec![0; (width as usize * height as usize * 4).max(4)] }
+        Image {
+            width,
+            height,
+            rgba: vec![0; (width as usize * height as usize * 4).max(4)],
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -23,7 +27,12 @@ impl Image {
             return [0, 0, 0, 0];
         }
         let i = ((y as usize * self.width as usize) + x as usize) * 4;
-        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]]
+        [
+            self.rgba[i],
+            self.rgba[i + 1],
+            self.rgba[i + 2],
+            self.rgba[i + 3],
+        ]
     }
 
     /// True when every sampled pixel is the same colour. PrintWindow returns an
@@ -42,7 +51,10 @@ impl Image {
             let mut x = 0;
             while x < w {
                 let p = self.pixel(x, y);
-                if p[0].abs_diff(first[0]) > 6 || p[1].abs_diff(first[1]) > 6 || p[2].abs_diff(first[2]) > 6 {
+                if p[0].abs_diff(first[0]) > 6
+                    || p[1].abs_diff(first[1]) > 6
+                    || p[2].abs_diff(first[2]) > 6
+                {
                     return false;
                 }
                 x += step_x;
@@ -76,7 +88,10 @@ impl Image {
             let mut x = x0;
             while x < x0 + w {
                 let p = self.pixel(x, y);
-                if p[0].abs_diff(first[0]) > 6 || p[1].abs_diff(first[1]) > 6 || p[2].abs_diff(first[2]) > 6 {
+                if p[0].abs_diff(first[0]) > 6
+                    || p[1].abs_diff(first[1]) > 6
+                    || p[2].abs_diff(first[2]) > 6
+                {
                     return false;
                 }
                 x += step_x;
@@ -93,7 +108,9 @@ impl Image {
         }
         let bg = self.pixel(0, 0);
         let same = |p: [u8; 4]| {
-            p[0].abs_diff(bg[0]) <= tolerance && p[1].abs_diff(bg[1]) <= tolerance && p[2].abs_diff(bg[2]) <= tolerance
+            p[0].abs_diff(bg[0]) <= tolerance
+                && p[1].abs_diff(bg[1]) <= tolerance
+                && p[2].abs_diff(bg[2]) <= tolerance
         };
         let (w, h) = (self.width, self.height);
         let mut left = 0;
@@ -125,7 +142,8 @@ impl Image {
         for row in 0..h {
             let src = (((y + row) as usize * self.width as usize) + x as usize) * 4;
             let dst = row as usize * w as usize * 4;
-            out.rgba[dst..dst + w as usize * 4].copy_from_slice(&self.rgba[src..src + w as usize * 4]);
+            out.rgba[dst..dst + w as usize * 4]
+                .copy_from_slice(&self.rgba[src..src + w as usize * 4]);
         }
         out
     }

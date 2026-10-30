@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use shaiwin_core::layout::EDGE_PAD;
 use shaiwin_core::{LineLayout, Rgb, Spring};
-use shaiwin_platform_win::Rect as WRect;
 use shaiwin_platform_win::park::{Parked, Placement};
+use shaiwin_platform_win::Rect as WRect;
 use tiny_skia::Pixmap;
 
 /// Where a card's rectangle sits relative to the hanging point, in logical px.
@@ -71,7 +71,10 @@ pub enum Edge {
 impl Edge {
     /// Whether dragging this edge changes the card's width.
     pub fn resizes_width(self) -> bool {
-        matches!(self, Edge::Left | Edge::Right | Edge::BottomLeft | Edge::BottomRight)
+        matches!(
+            self,
+            Edge::Left | Edge::Right | Edge::BottomLeft | Edge::BottomRight
+        )
     }
 
     /// Whether dragging this edge changes the card's height.
@@ -83,7 +86,10 @@ impl Edge {
 /// The side of `rect` `point` is within reach of, if any. Outside the card, or
 /// on its face, this is `None` and the press is a click or a drag.
 pub fn edge_at(rect: &WRect, point: (i32, i32), s: f32) -> Option<Edge> {
-    let inside = point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom;
+    let inside = point.0 >= rect.left
+        && point.0 < rect.right
+        && point.1 >= rect.top
+        && point.1 < rect.bottom;
     if !inside {
         return None;
     }
@@ -129,7 +135,6 @@ pub fn zoom_from_edge(x: f32, centre: f32, s: f32) -> f32 {
 pub fn zoom_y_from_bottom(y: f32, top: f32, unit: f32) -> f32 {
     ((y - top) / unit.max(1.0)).clamp(ZOOM_Y_MIN, ZOOM_Y_MAX)
 }
-
 
 /// How close a dropped card may come to its neighbour, in logical pixels.
 const PACK_GAP: f32 = 8.0;
@@ -209,6 +214,12 @@ pub struct Card {
     /// The line still packs and reorders; this is what lets a card stay exactly
     /// where the user dropped it instead of snapping back to its slot.
     pub offset: f32,
+
+    /// The user's short label for this card, drawn as a chip. Empty means no
+    /// tag. It is remembered in the journal and never affects the window.
+    pub tag: String,
+    /// Bumped whenever `tag` changes, so the sprite cache knows to rebuild.
+    pub tag_version: u64,
 
     pub x: Spring,
     /// Sway, in degrees.
@@ -295,7 +306,10 @@ impl Line {
 
     /// The card's place among the cards actually hanging, if it is one of them.
     pub fn live_position(&self, id: u64) -> Option<usize> {
-        self.cards.iter().filter(|c| !c.leaving && !c.away).position(|c| c.id == id)
+        self.cards
+            .iter()
+            .filter(|c| !c.leaving && !c.away)
+            .position(|c| c.id == id)
     }
 
     /// Cards whose windows are still hooked, including the ones currently
@@ -322,7 +336,11 @@ impl Line {
     }
 
     fn live_offsets(&self) -> Vec<f32> {
-        self.cards.iter().filter(|c| !c.away && !c.leaving).map(|c| c.offset).collect()
+        self.cards
+            .iter()
+            .filter(|c| !c.away && !c.leaving)
+            .map(|c| c.offset)
+            .collect()
     }
 
     fn live_widths(&self, layout: &LineLayout) -> Vec<f32> {
@@ -348,7 +366,9 @@ impl Line {
     /// Resizes one card. Returns false when nothing changed, so the caller does
     /// not redraw or rewrite the journal for a drag that went nowhere.
     pub fn set_zoom(&mut self, id: u64, zoom: f32) -> bool {
-        let Some(card) = self.get_mut(id) else { return false };
+        let Some(card) = self.get_mut(id) else {
+            return false;
+        };
         let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         if (card.zoom - zoom).abs() < 0.001 {
             return false;
@@ -359,7 +379,9 @@ impl Line {
 
     /// Resizes one card's height, see [`set_zoom`](Self::set_zoom).
     pub fn set_zoom_y(&mut self, id: u64, zoom_y: f32) -> bool {
-        let Some(card) = self.get_mut(id) else { return false };
+        let Some(card) = self.get_mut(id) else {
+            return false;
+        };
         let zoom_y = zoom_y.clamp(ZOOM_Y_MIN, ZOOM_Y_MAX);
         if (card.zoom_y - zoom_y).abs() < 0.001 {
             return false;
@@ -373,14 +395,21 @@ impl Line {
     pub fn drop_index(&self, layout: &LineLayout, id: u64, x: f32) -> usize {
         let mut widths = Vec::new();
         let mut offsets = Vec::new();
-        for card in self.cards.iter().filter(|c| !c.away && !c.leaving && c.id != id) {
+        for card in self
+            .cards
+            .iter()
+            .filter(|c| !c.away && !c.leaving && c.id != id)
+        {
             widths.push(CARD_W * layout.scale * card.zoom);
             offsets.push(card.offset);
         }
         if widths.is_empty() {
             return 0;
         }
-        placed(layout, &widths, &offsets).iter().filter(|cx| **cx < x).count()
+        placed(layout, &widths, &offsets)
+            .iter()
+            .filter(|cx| **cx < x)
+            .count()
     }
 
     /// Leaves a dragged card where it was released. The order has already been
@@ -388,10 +417,22 @@ impl Line {
     /// clamp keeps it on screen and leaves a gap to its neighbours, which is
     /// what stops two cards from covering each other.
     pub fn place_at(&mut self, id: u64, layout: &LineLayout, x: f32) -> bool {
-        let cards: Vec<&Card> = self.cards.iter().filter(|c| !c.away && !c.leaving).collect();
-        let Some(index) = cards.iter().position(|c| c.id == id) else { return false };
-        let widths: Vec<f32> = cards.iter().map(|c| CARD_W * layout.scale * c.zoom).collect();
-        let offsets: Vec<f32> = cards.iter().map(|c| if c.id == id { 0.0 } else { c.offset }).collect();
+        let cards: Vec<&Card> = self
+            .cards
+            .iter()
+            .filter(|c| !c.away && !c.leaving)
+            .collect();
+        let Some(index) = cards.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        let widths: Vec<f32> = cards
+            .iter()
+            .map(|c| CARD_W * layout.scale * c.zoom)
+            .collect();
+        let offsets: Vec<f32> = cards
+            .iter()
+            .map(|c| if c.id == id { 0.0 } else { c.offset })
+            .collect();
         let fit = layout.pack_fit(&widths);
         let base = layout.pack_x(&widths);
         let others = placed(layout, &widths, &offsets);
@@ -399,15 +440,25 @@ impl Line {
         let half = widths[index] * fit / 2.0;
         let gap = PACK_GAP * s;
         let pad = EDGE_PAD * s;
-        let lo = if index > 0 { others[index - 1] + half + widths[index - 1] * fit / 2.0 + gap } else { pad + half };
+        let lo = if index > 0 {
+            others[index - 1] + half + widths[index - 1] * fit / 2.0 + gap
+        } else {
+            pad + half
+        };
         let hi = if index + 1 < cards.len() {
             others[index + 1] - half - widths[index + 1] * fit / 2.0 - gap
         } else {
             layout.width - pad - half
         };
         let want = x.clamp(pad + half, layout.width - pad - half);
-        let target = if lo <= hi { want.clamp(lo, hi) } else { base[index] };
-        let Some(card) = self.get_mut(id) else { return false };
+        let target = if lo <= hi {
+            want.clamp(lo, hi)
+        } else {
+            base[index]
+        };
+        let Some(card) = self.get_mut(id) else {
+            return false;
+        };
         card.offset = (target - base[index]) / s.max(0.01);
         card.x.snap(target);
         true
@@ -424,8 +475,15 @@ impl Line {
         card.away_at = None;
         card.unhook = false;
         self.cards.push(card);
-        let index = self.cards.iter().position(|c| c.id == id).expect("just pushed");
-        let position = self.cards[..index].iter().filter(|c| !c.away && !c.leaving).count();
+        let index = self
+            .cards
+            .iter()
+            .position(|c| c.id == id)
+            .expect("just pushed");
+        let position = self.cards[..index]
+            .iter()
+            .filter(|c| !c.away && !c.leaving)
+            .count();
         let slot = self.targets(layout)[position];
         let sway = self.random(-1.6, 1.6);
         let card = self.get_mut(id).expect("just pushed");
@@ -452,8 +510,15 @@ impl Line {
         card.away_at = None;
         card.unhook = false;
         self.cards.push(card);
-        let index = self.cards.iter().position(|c| c.id == id).expect("just pushed");
-        let position = self.cards[..index].iter().filter(|c| !c.away && !c.leaving).count();
+        let index = self
+            .cards
+            .iter()
+            .position(|c| c.id == id)
+            .expect("just pushed");
+        let position = self.cards[..index]
+            .iter()
+            .filter(|c| !c.away && !c.leaving)
+            .count();
         // A card whose window was on the desktop is not part of the order until
         // it is hung up again, so it has no slot to take: `targets` does not
         // contain it. Reading a slot for it anyway is an out-of-bounds index.
@@ -473,7 +538,9 @@ impl Line {
         }
         let sway0 = self.random(-1.6, 1.6);
         {
-            let Some(card) = self.get_mut(id) else { return false };
+            let Some(card) = self.get_mut(id) else {
+                return false;
+            };
             card.away = false;
             card.away_at = None;
             card.unhook = false;
@@ -483,8 +550,13 @@ impl Line {
             // is better than a blank pane.
             card.thumb_version += 1;
         }
-        let Some(index) = self.cards.iter().position(|c| c.id == id) else { return false };
-        let position = self.cards[..index].iter().filter(|c| !c.away && !c.leaving).count();
+        let Some(index) = self.cards.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        let position = self.cards[..index]
+            .iter()
+            .filter(|c| !c.away && !c.leaving)
+            .count();
         let slot = self.targets(layout)[position];
         if let Some(card) = self.get_mut(id) {
             card.x = Spring::responsive(slot, SLOT_RESPONSE, SLOT_DAMPING);
@@ -528,7 +600,9 @@ impl Line {
     /// the caller: the click has to put the window in front now, not after an
     /// animation, or it reads as "nothing happened" until the taskbar is used.
     pub fn take_down(&mut self, id: u64) -> bool {
-        let Some(card) = self.get_mut(id) else { return false };
+        let Some(card) = self.get_mut(id) else {
+            return false;
+        };
         if card.leaving || card.away {
             return false;
         }
@@ -545,7 +619,13 @@ impl Line {
 
     /// Advances every animation. Returns the ids of cards that are leaving and
     /// ready for their window to be restored.
-    pub fn step(&mut self, dt: f32, now: Instant, layout: &LineLayout, hover: Option<u64>) -> Vec<u64> {
+    pub fn step(
+        &mut self,
+        dt: f32,
+        now: Instant,
+        layout: &LineLayout,
+        hover: Option<u64>,
+    ) -> Vec<u64> {
         if self.gust_back.is_some_and(|t| now >= t) {
             self.gust_back = None;
             for card in &mut self.cards {
@@ -580,7 +660,11 @@ impl Line {
             }
             card.x.step(dt);
             card.sway.step(dt);
-            card.scale_goal = if hover == Some(card.id) { HOVER_SCALE } else { 1.0 };
+            card.scale_goal = if hover == Some(card.id) {
+                HOVER_SCALE
+            } else {
+                1.0
+            };
             card.scale = shaiwin_core::spring::approach(card.scale, card.scale_goal, dt, 16.0);
             if (card.scale - card.scale_goal).abs() < 0.0005 {
                 card.scale = card.scale_goal;
@@ -597,9 +681,7 @@ impl Line {
     pub fn animating(&self) -> bool {
         self.cards.iter().any(|c| {
             !c.away
-                && (!c.x.at_rest()
-                    || !c.sway.at_rest()
-                    || (c.scale - c.scale_goal).abs() > 0.001)
+                && (!c.x.at_rest() || !c.sway.at_rest() || (c.scale - c.scale_goal).abs() > 0.001)
         })
     }
 
@@ -609,7 +691,9 @@ impl Line {
         if self.live_count() == 0 || now < self.next_gust {
             return false;
         }
-        let angles: Vec<f32> = (0..self.cards.len()).map(|_| self.random(1.2, 2.6)).collect();
+        let angles: Vec<f32> = (0..self.cards.len())
+            .map(|_| self.random(1.2, 2.6))
+            .collect();
         for (card, angle) in self.cards.iter_mut().zip(angles) {
             if !card.leaving && !card.away {
                 card.sway.retarget(angle);
@@ -626,7 +710,12 @@ mod tests {
     use super::*;
 
     fn rect(l: i32, t: i32, r: i32, b: i32) -> WRect {
-        WRect { left: l, top: t, right: r, bottom: b }
+        WRect {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        }
     }
 
     /// A card's rectangle on screen at rest, given its slot. Matches how the
@@ -663,9 +752,15 @@ mod tests {
             exe: "test.exe".to_string(),
             accent: Rgb::new(200, 120, 60),
             placement,
-            parked: Parked { placement, parked: rect(3000, 0, 3500, 400), was_maximized: false },
+            parked: Parked {
+                placement,
+                parked: rect(3000, 0, 3500, 400),
+                was_maximized: false,
+            },
             window_rect: rect(100, 100, 600, 500),
             centred: false,
+            tag: String::new(),
+            tag_version: 0,
             thumb: None,
             thumb_version: 0,
             icon: None,
@@ -691,7 +786,11 @@ mod tests {
     }
 
     fn live_ids(line: &Line) -> Vec<u64> {
-        line.cards.iter().filter(|c| !c.away && !c.leaving).map(|c| c.id).collect()
+        line.cards
+            .iter()
+            .filter(|c| !c.away && !c.leaving)
+            .map(|c| c.id)
+            .collect()
     }
 
     fn layout() -> LineLayout {
@@ -762,7 +861,10 @@ mod tests {
         let mut line = Line::new();
         hung(&mut line, &[1, 2, 3], &l);
         run(&mut line, &l, 1.0);
-        assert!(!line.animating(), "a line that is only hanging has something moving");
+        assert!(
+            !line.animating(),
+            "a line that is only hanging has something moving"
+        );
 
         // A gust, the way `gauge` throws one: every card takes a new angle.
         for card in line.cards.iter_mut() {
@@ -809,7 +911,10 @@ mod tests {
             line.step(1.0 / 60.0, now, &l, Some(1));
         }
         let hovered = line.get(1).unwrap();
-        assert!(hovered.scale > 1.02, "the card under the pointer did not enlarge");
+        assert!(
+            hovered.scale > 1.02,
+            "the card under the pointer did not enlarge"
+        );
         assert_eq!(hovered.scale, hovered.scale_goal);
         assert!(!line.animating(), "a hovered card kept the line animating");
 
@@ -830,14 +935,25 @@ mod tests {
 
         assert!(line.rehang(2, &l));
         let card = line.get(2).unwrap();
-        let slot = expected_slots(&line, &l).into_iter().find(|(id, _)| *id == 2).unwrap().1;
-        assert!((card.x.x - slot).abs() < 0.5, "card 2 sits at {}, belongs at {slot}", card.x.x);
+        let slot = expected_slots(&line, &l)
+            .into_iter()
+            .find(|(id, _)| *id == 2)
+            .unwrap()
+            .1;
+        assert!(
+            (card.x.x - slot).abs() < 0.5,
+            "card 2 sits at {}, belongs at {slot}",
+            card.x.x
+        );
 
         run(&mut line, &l, 3.0);
         assert!(!line.animating(), "the line never came to rest");
         for (id, slot) in expected_slots(&line, &l) {
             let x = line.get(id).unwrap().x.x;
-            assert!((x - slot).abs() < 0.5, "card {id} sits at {x}, belongs at {slot}");
+            assert!(
+                (x - slot).abs() < 0.5,
+                "card {id} sits at {x}, belongs at {slot}"
+            );
         }
     }
 
@@ -860,8 +976,14 @@ mod tests {
         run(&mut line, &l, 2.0);
 
         let x = line.get(1).unwrap().x.x;
-        assert!((x - wanted).abs() < 1.0, "card 1 snapped back to {x}, wanted {wanted}");
-        assert!(line.get(2).unwrap().x.x < second, "card 2 did not close the gap card 1 left");
+        assert!(
+            (x - wanted).abs() < 1.0,
+            "card 1 snapped back to {x}, wanted {wanted}"
+        );
+        assert!(
+            line.get(2).unwrap().x.x < second,
+            "card 2 did not close the gap card 1 left"
+        );
     }
 
     #[test]
@@ -876,8 +998,14 @@ mod tests {
         assert!(line.place_at(1, &l, second));
         run(&mut line, &l, 2.0);
         let first = line.get(1).unwrap().x.x;
-        assert!(first < second, "card 1 ended up at {first}, card 2 at {second}");
-        assert!(second - first > CARD_W * l.scale * 0.9, "the two cards overlap");
+        assert!(
+            first < second,
+            "card 1 ended up at {first}, card 2 at {second}"
+        );
+        assert!(
+            second - first > CARD_W * l.scale * 0.9,
+            "the two cards overlap"
+        );
     }
 
     #[test]
@@ -895,7 +1023,10 @@ mod tests {
         let mut last = -1.0;
         for (id, slot) in expected_slots(&line, &l) {
             let x = line.get(id).unwrap().x.x;
-            assert!((x - slot).abs() < 0.5, "card {id} sits at {x}, belongs at {slot}");
+            assert!(
+                (x - slot).abs() < 0.5,
+                "card {id} sits at {x}, belongs at {slot}"
+            );
             assert!(x > last, "cards must not share a slot");
             last = x;
         }
@@ -929,7 +1060,10 @@ mod tests {
         // there is no window-sized sheet sweeping the desktop.
         let slot = line.targets(&l)[0];
         let card1 = line.get(1).unwrap();
-        assert!((card1.x.x - slot).abs() < 0.5, "the card starts away from its slot");
+        assert!(
+            (card1.x.x - slot).abs() < 0.5,
+            "the card starts away from its slot"
+        );
         assert!(card1.scale < 1.0, "the card did not get its settle-in");
 
         run(&mut line, &l, 1.0);
@@ -951,18 +1085,37 @@ mod tests {
         assert_eq!(before.top, after.top, "the big card moved its top edge");
         assert_eq!(before.left, after.left, "resizing height changed the width");
         let grown = (after.bottom - after.top) as f32;
-        assert!((grown / (CARD_H * s) - 1.6).abs() < 0.02, "height zoom = {}", grown / (CARD_H * s));
+        assert!(
+            (grown / (CARD_H * s) - 1.6).abs() < 0.02,
+            "height zoom = {}",
+            grown / (CARD_H * s)
+        );
 
         // The middle of the bottom edge resizes height, the sides resize width,
         // and the bottom corners resize both at once.
-        assert_eq!(edge_at(&after, (after.left + 60, after.bottom - 3), s), Some(Edge::Bottom));
-        assert_eq!(edge_at(&after, (after.left + 4, after.bottom - 4), s), Some(Edge::BottomLeft));
-        assert_eq!(edge_at(&after, (after.right - 5, after.bottom - 2), s), Some(Edge::BottomRight));
-        assert_eq!(edge_at(&after, (after.left + 3, after.top + 60), s), Some(Edge::Left));
+        assert_eq!(
+            edge_at(&after, (after.left + 60, after.bottom - 3), s),
+            Some(Edge::Bottom)
+        );
+        assert_eq!(
+            edge_at(&after, (after.left + 4, after.bottom - 4), s),
+            Some(Edge::BottomLeft)
+        );
+        assert_eq!(
+            edge_at(&after, (after.right - 5, after.bottom - 2), s),
+            Some(Edge::BottomRight)
+        );
+        assert_eq!(
+            edge_at(&after, (after.left + 3, after.top + 60), s),
+            Some(Edge::Left)
+        );
         assert_eq!(edge_at(&after, (after.left + 60, after.top + 60), s), None);
         // A corner is a small target; the diagonal zone is wider than the edge
         // strip so a grab that is a few pixels off still resizes both ways.
-        assert_eq!(edge_at(&after, (after.left + 12, after.bottom - 12), s), Some(Edge::BottomLeft));
+        assert_eq!(
+            edge_at(&after, (after.left + 12, after.bottom - 12), s),
+            Some(Edge::BottomLeft)
+        );
     }
 
     #[test]

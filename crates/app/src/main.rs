@@ -15,18 +15,21 @@ mod log;
 mod render;
 mod settings;
 mod settings_ui;
+mod tag_ui;
 mod text;
 mod tray;
 mod worker;
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_APP,
-};
 use windows::core::w;
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_APP,
+};
 
 /// Posted to the window when a background thread has something for the UI.
 pub const WM_EVENT: u32 = WM_APP + 1;

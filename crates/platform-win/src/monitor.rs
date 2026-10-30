@@ -8,8 +8,8 @@ use std::ffi::c_void;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
-    MONITORINFO, MonitorFromPoint, MonitorFromRect,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, HDC, HMONITOR,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
@@ -41,17 +41,43 @@ impl Monitor {
 pub fn monitors() -> Vec<Monitor> {
     let mut found: Vec<Monitor> = Vec::new();
     unsafe {
-        let _ = EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut found as *mut Vec<Monitor> as isize));
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut found as *mut Vec<Monitor> as isize),
+        );
     }
     if found.is_empty() {
         // A headless session (some CI machines) still deserves a sane fallback.
-        found.push(Monitor { handle: 0, bounds: Rect { left: 0, top: 0, right: 1920, bottom: 1080 }, work: Rect { left: 0, top: 0, right: 1920, bottom: 1040 }, scale: 1.0, primary: true });
+        found.push(Monitor {
+            handle: 0,
+            bounds: Rect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            work: Rect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
+            scale: 1.0,
+            primary: true,
+        });
     }
     found.sort_by_key(|m| (!m.primary, m.bounds.left));
     found
 }
 
-unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, lparam: LPARAM) -> BOOL {
+unsafe extern "system" fn collect(
+    hmon: HMONITOR,
+    _hdc: HDC,
+    _rect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
     let list = unsafe { &mut *(lparam.0 as *mut Vec<Monitor>) };
     if let Some(monitor) = unsafe { read(hmon) } {
         list.push(monitor);
@@ -62,7 +88,10 @@ unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, l
 /// One monitor from its handle, without enumerating every display.
 unsafe fn read(hmon: HMONITOR) -> Option<Monitor> {
     unsafe {
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         if !GetMonitorInfoW(hmon, &mut info).as_bool() {
             return None;
         }
@@ -80,7 +109,12 @@ unsafe fn read(hmon: HMONITOR) -> Option<Monitor> {
                 right: info.rcMonitor.right,
                 bottom: info.rcMonitor.bottom,
             },
-            work: Rect { left: info.rcWork.left, top: info.rcWork.top, right: info.rcWork.right, bottom: info.rcWork.bottom },
+            work: Rect {
+                left: info.rcWork.left,
+                top: info.rcWork.top,
+                right: info.rcWork.right,
+                bottom: info.rcWork.bottom,
+            },
             scale,
             primary: info.dwFlags & 1 != 0,
         })

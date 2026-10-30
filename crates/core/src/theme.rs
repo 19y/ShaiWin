@@ -27,7 +27,11 @@ impl Rgb {
     /// Blends towards black.
     pub fn darken(self, t: f32) -> Rgb {
         let t = 1.0 - t.clamp(0.0, 1.0);
-        Rgb((self.0 as f32 * t) as u8, (self.1 as f32 * t) as u8, (self.2 as f32 * t) as u8)
+        Rgb(
+            (self.0 as f32 * t) as u8,
+            (self.1 as f32 * t) as u8,
+            (self.2 as f32 * t) as u8,
+        )
     }
 
     pub fn as_tuple(self) -> (u8, u8, u8) {
@@ -95,6 +99,53 @@ pub const PALETTE: [Rgb; 12] = [
     Rgb(0xB4, 0x53, 0x09), // brown-orange
 ];
 
+/// Tag labels carry words the user typed, so their colour has to come from the
+/// words themselves: the same tag is the same colour on every card, and it
+/// stays that colour after a restart. These are deeper than [`PALETTE`] because
+/// white label text has to stay legible on them.
+pub const TAG_PALETTE: [Rgb; 10] = [
+    Rgb(0x3F, 0x5F, 0xDB), // cobalt
+    Rgb(0xB6, 0x3A, 0x33), // brick
+    Rgb(0x1D, 0x7F, 0x5F), // pine
+    Rgb(0x6F, 0x46, 0xB8), // iris
+    Rgb(0xA8, 0x37, 0x63), // plum
+    Rgb(0x0C, 0x73, 0x7F), // lagoon
+    Rgb(0x8A, 0x55, 0x06), // ochre
+    Rgb(0x3B, 0x49, 0xB5), // indigo
+    Rgb(0x55, 0x70, 0x1A), // moss
+    Rgb(0x8E, 0x37, 0xA3), // orchid
+];
+
+/// The colour of a tag. Empty text still gets a stable colour so the editor's
+/// preview never has to special-case a half-typed tag.
+pub fn tag_color(tag: &str) -> Rgb {
+    let mut hash: u32 = 2_166_136_261;
+    for b in tag.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    TAG_PALETTE[(hash as usize) % TAG_PALETTE.len()]
+}
+
+/// Black or white, whichever is legible on `base`. The crossover is the WCAG
+/// point where both choices contrast equally.
+pub fn tag_ink(base: Rgb) -> Rgb {
+    let linear = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(base.0) + 0.7152 * linear(base.1) + 0.0722 * linear(base.2);
+    if luminance > 0.179 {
+        Rgb(32, 32, 40)
+    } else {
+        Rgb(255, 255, 255)
+    }
+}
+
 /// Picks the accent for an application key (executable name, lower-cased).
 /// Deterministic across runs and cheap enough to call per frame.
 pub fn accent_for(key: &str) -> Rgb {
@@ -121,11 +172,42 @@ mod tests {
 
     #[test]
     fn different_apps_usually_differ() {
-        let names = ["chrome.exe", "code.exe", "wechat.exe", "explorer.exe", "notepad.exe", "slack.exe"];
+        let names = [
+            "chrome.exe",
+            "code.exe",
+            "wechat.exe",
+            "explorer.exe",
+            "notepad.exe",
+            "slack.exe",
+        ];
         let mut seen = std::collections::HashSet::new();
         for n in names {
             seen.insert(accent_for(n));
         }
         assert!(seen.len() >= 4, "palette collided too often: {seen:?}");
+    }
+
+    #[test]
+    fn a_tag_keeps_its_colour() {
+        assert_eq!(tag_color("客户报价"), tag_color("客户报价"));
+        assert_eq!(tag_color("Deploy"), tag_color("Deploy"));
+    }
+
+    #[test]
+    fn tags_that_mean_different_things_look_different() {
+        let tags = ["工作", "客户", "参考", "临时", "待办", "重要"];
+        let mut seen = std::collections::HashSet::new();
+        for tag in tags {
+            seen.insert(tag_color(tag));
+        }
+        assert!(seen.len() >= 4, "tag palette collided too often: {seen:?}");
+    }
+
+    #[test]
+    fn label_ink_is_readable_on_every_tag_colour() {
+        for base in TAG_PALETTE {
+            assert_eq!(tag_ink(base), Rgb(255, 255, 255));
+        }
+        assert_eq!(tag_ink(Rgb(250, 240, 200)), Rgb(32, 32, 40));
     }
 }

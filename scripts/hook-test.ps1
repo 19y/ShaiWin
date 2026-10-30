@@ -16,7 +16,7 @@
 #   6. ask for a window that is hooked but sitting on the desktop
 #      -> it goes back up; it used to be refused with "already on the line"
 #         while the line showed nothing of it
-#   7. drag a window to the top and let go
+#   7. reveal the line, drag a window to the top and let go
 #      -> the "let go" prompt is gone once the drag is over and the pointer has
 #        left the top edge (the stuck pill); skipped when the cursor cannot move
 #   7b. put the line away on purpose, then drag a window over its old spot
@@ -33,9 +33,10 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\testkit.ps1"
 
 $root = Join-Path $env:TEMP "shaiwin-hook"
-# Direct hover has its own test; here the line is driven through the hooks.
-# always_on=0 because steps 7 and 7b assert the line tucks itself away again.
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nhover_open=0`nalways_on=0`nexcluded=`n"
+# The pill and short visits have their own test; here the line is driven through
+# the hooks. always_on=0 because steps 7 and 7b assert the line tucks itself
+# away again.
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=0`nexcluded=`n"
 Initialize-Fixtures $root
 $journal = Join-Path $state "ShaiWin\parked.txt"
 
@@ -157,10 +158,29 @@ try {
     $r = Get-Rect $c
     $grabX = [int](($r.Left + $r.Right) / 2)
     $grabY = [int]($r.Top + 18)
+    # A line that is away does not take a drag (step 7b tests exactly that), so
+    # bring it down first. "The overlay window is visible" is not the same as
+    # "the line is down" - the pill is the same window, and a pointer that
+    # brushes the top edge between two steps is enough to raise it - so put the
+    # layer away completely and ask for the line from there. A toggle from the
+    # pill reveals the line rather than hiding it, which is why this may take
+    # two passes to reach the hidden state.
+    $v = Get-VirtualBounds
+    if (-not (Move-Cursor ([int]($v.Right / 2)) ([int]($v.Bottom - 120)))) { Fail "lost cursor control" }
+    Start-Sleep -Milliseconds 800
+    $overlay = Get-Overlay
+    $hidden = $false
+    foreach ($pass in 1..3) {
+      if (-not [W]::IsWindowVisible($overlay)) { $hidden = $true; break }
+      Toggle $overlay
+      if (Wait-Visibility $overlay $false 1500) { $hidden = $true; break }
+    }
+    if (-not $hidden) { Fail "the layer would not go away for the drag step" }
+    Toggle $overlay
+    if (-not (Wait-Visibility $overlay $true 2000)) { Fail "the line did not come down for the drag step" }
     if (-not (Move-Cursor $grabX $grabY)) { Fail "lost cursor control" }
     [W]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)   # LEFTDOWN
     Start-Sleep -Milliseconds 200
-    $v = Get-VirtualBounds
     # Into the hang band, but not flush with the screen edge: the top
     # MAXIMIZE_YIELD (2 logical px) belongs to Windows' own maximize gesture, so
     # a release there is deliberately left to the system. The band now stops at
@@ -185,7 +205,10 @@ try {
     # With the pointer away from the top edge and nothing pinned, the strip and
     # whatever it was saying must both leave the screen.
     if (-not (Move-Cursor ([int]($v.Right / 2)) ([int]($v.Bottom - 120)))) { Fail "lost cursor control" }
-    if (-not (Wait-Until ({ -not [W]::IsWindowVisible((Get-Overlay)) }) 4000)) {
+    # A take-down with cards left behind lingers for four seconds so the opened
+    # window can be moved aside, then the pointer-away timer runs. Six seconds
+    # covers both without mistaking a slow wind-up for a stuck line.
+    if (-not (Wait-Until ({ -not [W]::IsWindowVisible((Get-Overlay)) }) 6000)) {
       Fail "the line stayed on screen after the drag ended and the pointer left: $(Get-Rect (Get-Overlay))"
     }
     Write-Host "  the strip went away with the drag"
@@ -195,6 +218,7 @@ try {
     $overlay = Get-Overlay
     # Get it down first if it has already tucked itself away, so the hide below
     # goes through the explicit toggle (an automatic tuck is not a dismissal).
+    # Away means hidden: a pill left over from the drag above is not a line.
     if (-not [W]::IsWindowVisible($overlay)) {
       Toggle $overlay
       if (-not (Wait-Visibility $overlay $true 2000)) { Fail "the line did not come down for the hide step" }

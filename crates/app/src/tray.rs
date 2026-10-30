@@ -2,12 +2,12 @@
 
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW, Shell_NotifyIconW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO,
+    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{HICON, WM_APP};
-use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+use winreg::RegKey;
 
 pub const WM_TRAY: u32 = WM_APP + 2;
 pub const TRAY_ID: u32 = 1;
@@ -95,9 +95,13 @@ pub fn start_at_login() -> bool {
 
 pub fn set_start_at_login(on: bool) -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE) else { return false };
+    let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE) else {
+        return false;
+    };
     if on {
-        let Ok(exe) = std::env::current_exe() else { return false };
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
         let command = format!("\"{}\"", exe.display());
         key.set_value(RUN_VALUE, &command).is_ok()
     } else {
@@ -123,4 +127,3 @@ pub fn cursor() -> POINT {
     }
     p
 }
-

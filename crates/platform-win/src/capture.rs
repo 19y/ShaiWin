@@ -47,9 +47,9 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, GetDC, MONITOR_DEFAULTTONEAREST, MonitorFromWindow, ReleaseDC, SRCCOPY,
+    BitBlt, GetDC, MonitorFromWindow, ReleaseDC, MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
-use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
 
@@ -89,12 +89,20 @@ pub fn snapshot(hwnd: isize) -> Shot {
     let h = window::hwnd_of(hwnd);
     unsafe {
         if !IsWindow(Some(h)).as_bool() || IsIconic(h).as_bool() {
-            return Shot { image: None, via: "gone", settled_ms: 0 };
+            return Shot {
+                image: None,
+                via: "gone",
+                settled_ms: 0,
+            };
         }
     }
     let settled_ms = settle(h);
     let Some(full) = window::rect_of(h) else {
-        return Shot { image: None, via: "no rect", settled_ms };
+        return Shot {
+            image: None,
+            via: "no rect",
+            settled_ms,
+        };
     };
     let visible = window::visible_rect(h).unwrap_or(full);
     let (fw, fh) = (full.width().max(1), full.height().max(1));
@@ -112,8 +120,13 @@ pub fn snapshot(hwnd: isize) -> Shot {
     // it is really the window is decided below, against the screen.
     let mut chosen: Option<(Image, &'static str)> = None;
     let mut flat: Option<Image> = None;
-    for (via, flags) in [("print:full", PW_RENDERFULLCONTENT), ("print:legacy", PRINT_WINDOW_FLAGS(0))] {
-        if let Some(image) = print_window(h, pw, ph, flags).and_then(|printed| crop_visible(&printed, full, visible)) {
+    for (via, flags) in [
+        ("print:full", PW_RENDERFULLCONTENT),
+        ("print:legacy", PRINT_WINDOW_FLAGS(0)),
+    ] {
+        if let Some(image) =
+            print_window(h, pw, ph, flags).and_then(|printed| crop_visible(&printed, full, visible))
+        {
             if !image.looks_blank_center() {
                 chosen = Some((image, via));
                 break;
@@ -130,7 +143,11 @@ pub fn snapshot(hwnd: isize) -> Shot {
         // The screen can testify about the window only while it is visible in
         // full: off screen it is the desktop, covered it is whatever covers it.
         let clear = on_screen && unoccluded(h, visible);
-        let grab_rect = if clear { clip(visible, monitor::virtual_bounds()) } else { None };
+        let grab_rect = if clear {
+            clip(visible, monitor::virtual_bounds())
+        } else {
+            None
+        };
         // A grab of part of the window would carry the desktop along the edge
         // that hangs off the screen, so only a whole one is used.
         let grab = grab_rect.filter(|r| *r == visible).and_then(screen_grab);
@@ -141,10 +158,18 @@ pub fn snapshot(hwnd: isize) -> Shot {
     }
 
     match chosen {
-        Some((image, via)) => Shot { image: Some(image.downscale(MAX_SIDE, MAX_SIDE)), via, settled_ms },
+        Some((image, via)) => Shot {
+            image: Some(image.downscale(MAX_SIDE, MAX_SIDE)),
+            via,
+            settled_ms,
+        },
         // A discarded flat print is worth naming: it is the case that used to
         // turn into a white card. No print at all is just no picture.
-        None => Shot { image: None, via: if had_flat { "print:blank" } else { "none" }, settled_ms },
+        None => Shot {
+            image: None,
+            via: if had_flat { "print:blank" } else { "none" },
+            settled_ms,
+        },
     }
 }
 
@@ -159,9 +184,15 @@ pub fn snapshot(hwnd: isize) -> Shot {
 /// `trusted` says the print was taken while nothing covered the window, or that
 /// the window is off screen. An untrusted flat print is not a picture of
 /// anything the user can see, so it is dropped rather than shown as a white card.
-fn choose_flat(flat: Option<Image>, grab: Option<Image>, trusted: bool) -> Option<(Image, &'static str)> {
+fn choose_flat(
+    flat: Option<Image>,
+    grab: Option<Image>,
+    trusted: bool,
+) -> Option<(Image, &'static str)> {
     match (flat, grab) {
-        (Some(print), Some(screen)) if matches_screen(&print, &screen) => Some((print, "print:flat")),
+        (Some(print), Some(screen)) if matches_screen(&print, &screen) => {
+            Some((print, "print:flat"))
+        }
         (_, Some(screen)) => Some((screen, "screen")),
         (Some(print), None) if trusted => Some((print, "print:flat")),
         _ => None,
@@ -188,7 +219,9 @@ fn matches_screen(print: &Image, screen: &Image) -> bool {
     let at = |image: &Image, fx: u32| image.pixel(image.width * fx / 100, image.height / 2);
     [30, 50, 70].into_iter().all(|fx| {
         let (a, b) = (at(print, fx), at(screen, fx));
-        a[0].abs_diff(b[0]) <= SAME_COLOUR && a[1].abs_diff(b[1]) <= SAME_COLOUR && a[2].abs_diff(b[2]) <= SAME_COLOUR
+        a[0].abs_diff(b[0]) <= SAME_COLOUR
+            && a[1].abs_diff(b[1]) <= SAME_COLOUR
+            && a[2].abs_diff(b[2]) <= SAME_COLOUR
     })
 }
 
@@ -201,7 +234,11 @@ fn clip(rect: Rect, bounds: Rect) -> Option<Rect> {
         right: rect.right.min(bounds.right),
         bottom: rect.bottom.min(bounds.bottom),
     };
-    if clipped.width() < 4 || clipped.height() < 4 { None } else { Some(clipped) }
+    if clipped.width() < 4 || clipped.height() < 4 {
+        None
+    } else {
+        Some(clipped)
+    }
 }
 
 /// Whether the target is the top-level window at a grid of points inside its
@@ -307,8 +344,12 @@ fn crop_visible(printed: &Image, full: Rect, visible: Rect) -> Option<Image> {
     let map_y = |y: i32| by as f32 + (y - full.top) as f32 * ky;
     let x0 = map_x(visible.left).round().clamp(0.0, printed.width as f32) as u32;
     let y0 = map_y(visible.top).round().clamp(0.0, printed.height as f32) as u32;
-    let x1 = map_x(visible.right).round().clamp(0.0, printed.width as f32) as u32;
-    let y1 = map_y(visible.bottom).round().clamp(0.0, printed.height as f32) as u32;
+    let x1 = map_x(visible.right)
+        .round()
+        .clamp(0.0, printed.width as f32) as u32;
+    let y1 = map_y(visible.bottom)
+        .round()
+        .clamp(0.0, printed.height as f32) as u32;
     let cw = x1.saturating_sub(x0).min(printed.width.saturating_sub(x0));
     let ch = y1.saturating_sub(y0).min(printed.height.saturating_sub(y0));
     if cw < 16 || ch < 16 {
@@ -362,7 +403,11 @@ fn print_window(hwnd: HWND, width: u32, height: u32, flags: PRINT_WINDOW_FLAGS) 
     if !ok.as_bool() {
         return None;
     }
-    Some(Image { width, height, rgba: dib.to_rgba(false) })
+    Some(Image {
+        width,
+        height,
+        rgba: dib.to_rgba(false),
+    })
 }
 
 /// A straight copy of the screen. Used when the window does not implement
@@ -383,12 +428,27 @@ pub fn screen_grab(rect: Rect) -> Option<Image> {
             let _ = ReleaseDC(None, screen);
             return None;
         };
-        let copied = BitBlt(dib.hdc, 0, 0, w, h, Some(screen), rect.left, rect.top, SRCCOPY).is_ok();
+        let copied = BitBlt(
+            dib.hdc,
+            0,
+            0,
+            w,
+            h,
+            Some(screen),
+            rect.left,
+            rect.top,
+            SRCCOPY,
+        )
+        .is_ok();
         let _ = ReleaseDC(None, screen);
         if !copied {
             return None;
         }
-        Some(Image { width: w as u32, height: h as u32, rgba: dib.to_rgba(false) })
+        Some(Image {
+            width: w as u32,
+            height: h as u32,
+            rgba: dib.to_rgba(false),
+        })
     }
 }
 
@@ -403,7 +463,12 @@ mod tests {
     use super::*;
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
-        Rect { left, top, right, bottom }
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
     }
 
     fn image(width: u32, height: u32, sentinel: bool) -> Image {
@@ -413,7 +478,11 @@ mod tests {
                 px.copy_from_slice(&[255, 0, 255, 255]);
             }
         }
-        Image { width, height, rgba }
+        Image {
+            width,
+            height,
+            rgba,
+        }
     }
 
     fn painted(width: u32, height: u32, rgb: [u8; 3]) -> Image {
@@ -427,7 +496,9 @@ mod tests {
     #[test]
     fn an_untouched_bitmap_has_no_picture() {
         assert_eq!(painted_bounds(&image(40, 30, true)), None);
-        assert!(crop_visible(&image(40, 30, true), rect(0, 0, 40, 30), rect(0, 0, 40, 30)).is_none());
+        assert!(
+            crop_visible(&image(40, 30, true), rect(0, 0, 40, 30), rect(0, 0, 40, 30)).is_none()
+        );
     }
 
     #[test]
@@ -467,10 +538,16 @@ mod tests {
         let desktop = rect(0, 0, 2560, 1440);
         // A maximized window sticks out past the screen edges by the resize
         // border; the grab must not carry the desktop that is not there.
-        assert_eq!(clip(rect(-8, -8, 2568, 1408), desktop), Some(rect(0, 0, 2560, 1408)));
+        assert_eq!(
+            clip(rect(-8, -8, 2568, 1408), desktop),
+            Some(rect(0, 0, 2560, 1408))
+        );
         // A window fully on the desktop is its own clip, so the caller can tell
         // that the grab covers the whole visible rectangle.
-        assert_eq!(clip(rect(100, 100, 300, 200), desktop), Some(rect(100, 100, 300, 200)));
+        assert_eq!(
+            clip(rect(100, 100, 300, 200), desktop),
+            Some(rect(100, 100, 300, 200))
+        );
         // Past the edge there is nothing worth grabbing.
         assert_eq!(clip(rect(3000, 100, 3200, 200), desktop), None);
     }
@@ -504,7 +581,8 @@ mod tests {
                 screen.rgba[i..i + 4].copy_from_slice(&[30, 80, 200, 255]);
             }
         }
-        let (image, via) = choose_flat(Some(print), Some(screen), true).expect("the screen is a picture");
+        let (image, via) =
+            choose_flat(Some(print), Some(screen), true).expect("the screen is a picture");
         assert_eq!(via, "screen");
         assert_eq!(image.pixel(100, 50), [30, 80, 200, 255]);
     }
@@ -515,7 +593,8 @@ mod tests {
         // grab may include our own rope over the top of the window.
         let print = painted(200, 100, [250, 250, 250]);
         let screen = painted(400, 200, [255, 255, 255]);
-        let (image, via) = choose_flat(Some(print), Some(screen), true).expect("a white window has a picture");
+        let (image, via) =
+            choose_flat(Some(print), Some(screen), true).expect("a white window has a picture");
         assert_eq!(via, "print:flat");
         assert_eq!((image.width, image.height), (200, 100));
     }
@@ -524,7 +603,10 @@ mod tests {
     fn a_flat_print_survives_without_a_screen_only_when_it_is_trustworthy() {
         let print = painted(200, 100, [255, 255, 255]);
         // Off screen or unoccluded: the print is the window's own painting.
-        assert_eq!(choose_flat(Some(print.clone()), None, true).map(|(_, via)| via), Some("print:flat"));
+        assert_eq!(
+            choose_flat(Some(print.clone()), None, true).map(|(_, via)| via),
+            Some("print:flat")
+        );
         // Covered: it is a print of something the user cannot see. Better no
         // picture than a white block.
         assert!(choose_flat(Some(print), None, false).is_none());
@@ -533,7 +615,10 @@ mod tests {
     #[test]
     fn a_window_that_prints_nothing_falls_back_to_the_screen() {
         let screen = painted(200, 100, [10, 20, 30]);
-        assert_eq!(choose_flat(None, Some(screen), true).map(|(_, via)| via), Some("screen"));
+        assert_eq!(
+            choose_flat(None, Some(screen), true).map(|(_, via)| via),
+            Some("screen")
+        );
         assert!(choose_flat(None, None, true).is_none());
     }
 }

@@ -23,7 +23,7 @@ $ErrorActionPreference = "Stop"
 $canPointer = Test-CursorControl
 
 $root = Join-Path $env:TEMP "shaiwin-position"
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nhover_open=0`nalways_on=1`nexcluded=`n"
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
 Initialize-Fixtures $root
 $journal = Join-Path $state "ShaiWin\parked.txt"
 $shotDir = Join-Path $root "shots"
@@ -57,7 +57,11 @@ function Invoke-Case([string]$name, [IntPtr]$h, [bool]$wantZoomed) {
   Write-Host ("  leaving {0},{1} {2}x{3}" -f $before.Left, $before.Top, ($before.Right - $before.Left), ($before.Bottom - $before.Top))
 
   Invoke-Wm (Get-Overlay) $script:KitHang ([IntPtr]::Zero) ([IntPtr]$h)
-  if (-not (Wait-Until ({ Test-Parked $h }) 6000)) { Fail "${name}: the window never went up to the line" }
+  # A maximized window is taken off screen by minimizing it (moving it would
+  # drop it out of the maximized state); a normal window is parked past the
+  # right edge. Both mean the window is on the line.
+  $wentUp = if ($wantZoomed) { { [W]::IsIconic($h) } } else { { Test-Parked $h } }
+  if (-not (Wait-Until $wentUp 6000)) { Fail "${name}: the window never went up to the line" }
   # A window hung up by hotkey (or by message, which is the same path) comes
   # back where it was, so its record must not ask for the middle of the screen.
   if (-not (Wait-Until ({ Get-Record $journal $h }) 4000)) { Fail "${name}: no journal record after hanging" }

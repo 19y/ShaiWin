@@ -31,7 +31,11 @@ pub unsafe extern "C" fn shaiwin_layout_free(layout: *mut LineLayout) {
 /// # Safety
 /// `layout` must be a valid pointer from [`shaiwin_layout_new`].
 #[no_mangle]
-pub unsafe extern "C" fn shaiwin_layout_slot_x(layout: *const LineLayout, index: usize, count: usize) -> f32 {
+pub unsafe extern "C" fn shaiwin_layout_slot_x(
+    layout: *const LineLayout,
+    index: usize,
+    count: usize,
+) -> f32 {
     unsafe { (*layout).slot_x(index, count) }
 }
 

@@ -23,7 +23,7 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\testkit.ps1"
 
 $root = Join-Path $env:TEMP "shaiwin-edge"
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nhover_open=0`nexcluded=`n"
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nexcluded=`n"
 Initialize-Fixtures $root
 $journal = Join-Path $state "ShaiWin\parked.txt"
 
@@ -69,11 +69,13 @@ try {
   Start-Sleep -Milliseconds 900
   if (-not [W]::IsZoomed($b)) { Fail "could not maximize the fixture" }
   Hang $b
-  if (-not (Wait-Until ({ Test-Parked $b }) 5000)) { Fail "the maximized window was not parked" }
+  # Maximized windows are taken off screen by minimizing them, not by parking
+  # them past the edge: moving one drops it out of the maximized state.
+  if (-not (Wait-Until ({ [W]::IsIconic($b) }) 5000)) { Fail "the maximized window was not taken off screen" }
   Take-All
-  if (-not (Wait-Until ({ Test-OnDesktop $b }) 6000)) { Fail "B did not come back on screen" }
+  if (-not (Wait-Until ({ Test-OnDesktop $b -or [W]::IsZoomed($b) }) 6000)) { Fail "B did not come back on screen" }
   if (-not [W]::IsZoomed($b)) { Fail "the window did not come back maximized" }
-  Write-Host "  parked and restored as maximized"
+  Write-Host "  taken off screen and restored as maximized"
 
   Write-Host "== 4. the application closes while its card is hanging =="
   $c = New-Fixture "C" 2

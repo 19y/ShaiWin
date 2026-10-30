@@ -8,20 +8,22 @@ use std::os::windows::ffi::OsStrExt;
 
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HWND, LPARAM, RECT};
-use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
-use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
-use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromWindow};
-use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
-use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GUI_INMOVESIZE, GUITHREADINFO, GW_HWNDNEXT, GWL_EXSTYLE, GA_PARENT, GetAncestor,
-    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow, GetTopWindow, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WindowFromPoint,
+    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow,
+    GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetForegroundWindow,
+    ShowWindow, WindowFromPoint, GA_PARENT, GA_ROOT, GUITHREADINFO, GUI_INMOVESIZE, GWL_EXSTYLE,
+    GW_HWNDNEXT, SW_RESTORE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 use crate::Rect;
@@ -85,13 +87,21 @@ impl WindowInfo {
 pub fn title(hwnd: HWND) -> String {
     let mut buf = [0u16; 512];
     let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    if n <= 0 { String::new() } else { from_wide(&buf[..n as usize]) }
+    if n <= 0 {
+        String::new()
+    } else {
+        from_wide(&buf[..n as usize])
+    }
 }
 
 pub fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
-    if n <= 0 { String::new() } else { from_wide(&buf[..n as usize]) }
+    if n <= 0 {
+        String::new()
+    } else {
+        from_wide(&buf[..n as usize])
+    }
 }
 
 pub fn pid_of(hwnd: HWND) -> u32 {
@@ -111,7 +121,13 @@ pub fn process_path(pid: u32) -> Option<String> {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
         let _ = CloseHandle(handle);
         if !ok || len == 0 {
             return None;
@@ -126,7 +142,9 @@ pub fn process_start(pid: u32) -> u64 {
         return 0;
     }
     unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return 0 };
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return 0;
+        };
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
@@ -164,7 +182,11 @@ pub fn process_elevated(pid: u32) -> Option<bool> {
         )
         .is_ok();
         let _ = CloseHandle(token);
-        if ok { Some(elevation.TokenIsElevated != 0) } else { None }
+        if ok {
+            Some(elevation.TokenIsElevated != 0)
+        } else {
+            None
+        }
     }
 }
 
@@ -204,7 +226,12 @@ pub fn visible_rect(hwnd: HWND) -> Option<Rect> {
         )
         .is_ok();
         if got {
-            let r = Rect { left: frame.left, top: frame.top, right: frame.right, bottom: frame.bottom };
+            let r = Rect {
+                left: frame.left,
+                top: frame.top,
+                right: frame.right,
+                bottom: frame.bottom,
+            };
             if !r.is_empty() {
                 return Some(r);
             }
@@ -217,7 +244,12 @@ pub fn rect_of(hwnd: HWND) -> Option<Rect> {
     unsafe {
         let mut rect = RECT::default();
         GetWindowRect(hwnd, &mut rect).ok()?;
-        Some(Rect { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom })
+        Some(Rect {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        })
     }
 }
 
@@ -276,7 +308,10 @@ pub fn check(hwnd: HWND, self_pid: u32) -> Result<WindowInfo, Rejection> {
         return Err(Rejection::ToolWindow);
     }
     let class = class_name(hwnd);
-    if IGNORED_CLASSES.iter().any(|c| c.eq_ignore_ascii_case(&class)) {
+    if IGNORED_CLASSES
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&class))
+    {
         return Err(Rejection::ToolWindow);
     }
     let title = title(hwnd);
@@ -286,7 +321,9 @@ pub fn check(hwnd: HWND, self_pid: u32) -> Result<WindowInfo, Rejection> {
     if unsafe { IsIconic(hwnd).as_bool() } {
         return Err(Rejection::Minimized);
     }
-    let Some(rect) = visible_rect(hwnd) else { return Err(Rejection::Gone) };
+    let Some(rect) = visible_rect(hwnd) else {
+        return Err(Rejection::Gone);
+    };
     if rect.width() < 120 || rect.height() < 80 {
         return Err(Rejection::TooSmall);
     }
@@ -315,7 +352,10 @@ pub fn check(hwnd: HWND, self_pid: u32) -> Result<WindowInfo, Rejection> {
 pub fn list_hangable(self_pid: u32) -> Vec<WindowInfo> {
     let mut found: Vec<WindowInfo> = Vec::new();
     unsafe {
-        let _ = EnumWindows(Some(collect), LPARAM(&mut found as *mut Vec<WindowInfo> as isize));
+        let _ = EnumWindows(
+            Some(collect),
+            LPARAM(&mut found as *mut Vec<WindowInfo> as isize),
+        );
     }
     found.retain(|w| w.pid != self_pid);
     found
@@ -331,7 +371,11 @@ unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
 pub fn foreground() -> Option<HWND> {
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() { None } else { Some(hwnd) }
+    if hwnd.0.is_null() {
+        None
+    } else {
+        Some(hwnd)
+    }
 }
 
 /// The top-level window under a screen point, which is what the user thinks
@@ -342,7 +386,11 @@ pub fn root_at(x: i32, y: i32) -> Option<HWND> {
         return None;
     }
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    if root.0.is_null() { Some(hwnd) } else { Some(root) }
+    if root.0.is_null() {
+        Some(hwnd)
+    } else {
+        Some(root)
+    }
 }
 
 /// The thread that owns a window.
@@ -374,7 +422,11 @@ pub fn moving_on(thread: u32) -> Option<HWND> {
         return None;
     }
     let root = unsafe { GetAncestor(info.hwndMoveSize, GA_ROOT) };
-    Some(if root.0.is_null() { info.hwndMoveSize } else { root })
+    Some(if root.0.is_null() {
+        info.hwndMoveSize
+    } else {
+        root
+    })
 }
 
 /// Restores a parked window to the foreground. Windows only lets the foreground
@@ -396,9 +448,14 @@ pub fn force_foreground(hwnd: HWND) {
         // back, not worth doing when the plain call was going to work.
         let fg = GetForegroundWindow();
         let our_thread = GetCurrentThreadId();
-        let fg_thread = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
+        let fg_thread = if fg.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
         let target_thread = GetWindowThreadProcessId(hwnd, None);
-        let attach_fg = fg_thread != 0 && fg_thread != our_thread
+        let attach_fg = fg_thread != 0
+            && fg_thread != our_thread
             && AttachThreadInput(our_thread, fg_thread, true).as_bool();
         let attach_target = target_thread != 0
             && target_thread != our_thread
@@ -536,7 +593,10 @@ fn is_foreground_material(hwnd: HWND, avoid: HWND, self_pid: u32) -> bool {
         return false;
     }
     let class = class_name(hwnd);
-    if IGNORED_CLASSES.iter().any(|c| c.eq_ignore_ascii_case(&class)) {
+    if IGNORED_CLASSES
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&class))
+    {
         return false;
     }
     !title(hwnd).trim().is_empty()
@@ -563,7 +623,9 @@ pub fn maximized(hwnd: isize) -> bool {
 /// parked window's rectangle changes but it is still off screen, it must be
 /// brought back before the card goes away.
 pub fn on_screen(hwnd: HWND) -> bool {
-    !unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) }.0.is_null()
+    !unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) }
+        .0
+        .is_null()
 }
 
 /// True when the handle is still a window of `pid`.
@@ -608,7 +670,11 @@ pub fn exe_of(hwnd: isize) -> String {
     let h = hwnd_of(hwnd);
     let pid = pid_of(h);
     process_path(pid)
-        .and_then(|p| std::path::Path::new(&p).file_name().map(|f| f.to_string_lossy().to_lowercase()))
+        .and_then(|p| {
+            std::path::Path::new(&p)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_lowercase())
+        })
         .unwrap_or_default()
 }
 

@@ -22,13 +22,14 @@ use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow,
+    GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowPlacement, IsIconic, IsWindow, IsZoomed, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
-    SetWindowPlacement, SetWindowPos, ShowWindow, HWND_TOP, WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,
+    GetSystemMetrics, GetWindowPlacement, IsIconic, IsWindow, IsZoomed, SetWindowPlacement,
+    SetWindowPos, ShowWindow, HWND_TOP, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED,
+    SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,
 };
 
 use crate::window;
@@ -77,7 +78,10 @@ impl Placement {
             if !IsWindow(Some(hwnd)).as_bool() {
                 return None;
             }
-            let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            let mut wp = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
             if GetWindowPlacement(hwnd, &mut wp).is_err() {
                 return None;
             }
@@ -108,8 +112,14 @@ impl Placement {
                 length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                 flags: WINDOWPLACEMENT_FLAGS(self.flags),
                 showCmd: self.show_cmd,
-                ptMinPosition: POINT { x: self.min_x, y: self.min_y },
-                ptMaxPosition: POINT { x: self.max_x, y: self.max_y },
+                ptMinPosition: POINT {
+                    x: self.min_x,
+                    y: self.min_y,
+                },
+                ptMaxPosition: POINT {
+                    x: self.max_x,
+                    y: self.max_y,
+                },
                 rcNormalPosition: RECT {
                     left: self.normal.left,
                     top: self.normal.top,
@@ -159,10 +169,14 @@ impl ParkError {
                 "Windows refused to move that window because it runs as administrator.".to_string()
             }
             ParkError::Refused(code) => {
-                format!("Windows refused to move that window: {}", crate::last_error_text(code))
+                format!(
+                    "Windows refused to move that window: {}",
+                    crate::last_error_text(code)
+                )
             }
             ParkError::NotMoved => {
-                "The window would not move. Some full-screen and protected windows refuse.".to_string()
+                "The window would not move. Some full-screen and protected windows refuse."
+                    .to_string()
             }
         }
     }
@@ -174,7 +188,12 @@ fn virtual_bounds() -> Rect {
         let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
         let w = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
         let h = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
-        Rect { left: x, top: y, right: x + w, bottom: y + h }
+        Rect {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        }
     }
 }
 
@@ -183,7 +202,9 @@ fn virtual_bounds() -> Rect {
 pub fn parking_spot(size: (i32, i32), origin: Rect) -> (i32, i32) {
     let v = virtual_bounds();
     let x = v.right + PARK_GAP;
-    let y = origin.top.clamp(v.top, (v.bottom - size.1.max(1)).max(v.top));
+    let y = origin
+        .top
+        .clamp(v.top, (v.bottom - size.1.max(1)).max(v.top));
     (x, y)
 }
 
@@ -199,14 +220,23 @@ pub fn plan(hwnd: HWND) -> Result<ParkPlan, ParkError> {
         let was_maximized = IsZoomed(hwnd).as_bool();
         // While maximized, GetWindowRect is the whole monitor. The restored
         // size is what the window will have once it is off screen.
-        let current = if was_maximized { placement.normal } else { window::rect_of(hwnd).ok_or(ParkError::Gone)? };
+        let current = if was_maximized {
+            placement.normal
+        } else {
+            window::rect_of(hwnd).ok_or(ParkError::Gone)?
+        };
         if current.is_empty() {
             return Err(ParkError::NotMoved);
         }
         let (x, y) = parking_spot((current.width(), current.height()), current);
         Ok(ParkPlan {
             placement,
-            target: Rect { left: x, top: y, right: x + current.width(), bottom: y + current.height() },
+            target: Rect {
+                left: x,
+                top: y,
+                right: x + current.width(),
+                bottom: y + current.height(),
+            },
             was_maximized,
         })
     }
@@ -234,8 +264,17 @@ pub fn execute(hwnd: HWND, plan: &ParkPlan) -> Result<Parked, ParkError> {
                 let _ = transitions(hwnd, true);
             }
             if IsIconic(hwnd).as_bool() {
-                let parked = Rect { left: ICONIC, top: ICONIC, right: ICONIC, bottom: ICONIC };
-                return Ok(Parked { placement: plan.placement, parked, was_maximized: true });
+                let parked = Rect {
+                    left: ICONIC,
+                    top: ICONIC,
+                    right: ICONIC,
+                    bottom: ICONIC,
+                };
+                return Ok(Parked {
+                    placement: plan.placement,
+                    parked,
+                    was_maximized: true,
+                });
             }
             // Minimizing was refused (an elevated window refuses every call from
             // here); the move below is what reports the refusal properly.
@@ -252,16 +291,26 @@ pub fn execute(hwnd: HWND, plan: &ParkPlan) -> Result<Parked, ParkError> {
         );
         if let Err(e) = moved {
             let code = (e.code().0 as u32) & 0xFFFF;
-            return Err(if code == 5 { ParkError::Elevated } else { ParkError::Refused(code) });
+            return Err(if code == 5 {
+                ParkError::Elevated
+            } else {
+                ParkError::Refused(code)
+            });
         }
-        let Some(after) = window::rect_of(hwnd) else { return Err(ParkError::Gone) };
+        let Some(after) = window::rect_of(hwnd) else {
+            return Err(ParkError::Gone);
+        };
         // Some windows clamp themselves back onto a monitor; treat that as a
         // refusal instead of pretending they are out of the way.
         if (after.left - target.left).abs() > 4 || (after.top - target.top).abs() > 4 {
             plan.placement.apply(hwnd);
             return Err(ParkError::NotMoved);
         }
-        Ok(Parked { placement: plan.placement, parked: after, was_maximized: plan.was_maximized })
+        Ok(Parked {
+            placement: plan.placement,
+            parked: after,
+            was_maximized: plan.was_maximized,
+        })
     }
 }
 
@@ -280,7 +329,12 @@ const ICONIC: i32 = -32000;
 pub fn hung_up_in_place(placement: Placement) -> Parked {
     Parked {
         placement,
-        parked: Rect { left: ICONIC, top: ICONIC, right: ICONIC, bottom: ICONIC },
+        parked: Rect {
+            left: ICONIC,
+            top: ICONIC,
+            right: ICONIC,
+            bottom: ICONIC,
+        },
         was_maximized: false,
     }
 }
@@ -305,7 +359,8 @@ pub fn still_hung(hwnd: HWND, parked: &Parked) -> bool {
         }
         match window::rect_of(hwnd) {
             Some(now) => {
-                (now.left - parked.parked.left).abs() <= 8 && (now.top - parked.parked.top).abs() <= 8
+                (now.left - parked.parked.left).abs() <= 8
+                    && (now.top - parked.parked.top).abs() <= 8
             }
             None => false,
         }
@@ -385,7 +440,15 @@ pub fn restore(hwnd: HWND, parked: &Parked) -> bool {
         // focus can be refused (Windows only hands it to the foreground process)
         // but the z-order cannot, so the worst case is a window the user can see
         // and click, instead of nothing at all.
-        let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
         window::force_foreground(hwnd);
         if animate {
             let _ = transitions(hwnd, true);
@@ -441,7 +504,12 @@ pub fn centre_in(rect: Rect, work: Rect) -> Rect {
     let height = rect.height().min(work.height().max(1));
     let x = work.left + (work.width() - width) / 2;
     let y = work.top + (work.height() - height) / 2;
-    Rect { left: x, top: y, right: x + width, bottom: y + height }
+    Rect {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + height,
+    }
 }
 
 /// The record moved to the middle of `work`, keeping its size and its show
@@ -505,9 +573,17 @@ fn minimized_placement(placement: &Placement) -> Placement {
 /// and a stack of them all landing in the middle of the screen.
 fn on_screen_spot(target: Rect, hwnd: HWND) -> Rect {
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
     if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return Rect { left: 40, top: 40, right: 40 + target.width(), bottom: 40 + target.height() };
+        return Rect {
+            left: 40,
+            top: 40,
+            right: 40 + target.width(),
+            bottom: 40 + target.height(),
+        };
     }
     let work = Rect {
         left: info.rcWork.left,
@@ -517,9 +593,18 @@ fn on_screen_spot(target: Rect, hwnd: HWND) -> Rect {
     };
     let width = target.width().min(work.width().max(1));
     let height = target.height().min(work.height().max(1));
-    let x = target.left.clamp(work.left, (work.right - width).max(work.left));
-    let y = target.top.clamp(work.top, (work.bottom - height).max(work.top));
-    Rect { left: x, top: y, right: x + width, bottom: y + height }
+    let x = target
+        .left
+        .clamp(work.left, (work.right - width).max(work.left));
+    let y = target
+        .top
+        .clamp(work.top, (work.bottom - height).max(work.top));
+    Rect {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + height,
+    }
 }
 
 /// Whether the window currently sits where the placement says it should.
@@ -537,7 +622,8 @@ fn at_target(hwnd: HWND, placement: &Placement) -> bool {
         }
         match window::rect_of(hwnd) {
             Some(now) => {
-                (now.left - placement.normal.left).abs() <= 4 && (now.top - placement.normal.top).abs() <= 4
+                (now.left - placement.normal.left).abs() <= 4
+                    && (now.top - placement.normal.top).abs() <= 4
             }
             None => false,
         }
@@ -546,7 +632,9 @@ fn at_target(hwnd: HWND, placement: &Placement) -> bool {
 
 /// Whether the window is drawn across the work area of the monitor it is on.
 fn fills_monitor(hwnd: HWND) -> bool {
-    let Some(now) = window::rect_of(hwnd) else { return false };
+    let Some(now) = window::rect_of(hwnd) else {
+        return false;
+    };
     let work = work_area(hwnd);
     // A maximized window's frame extends a few pixels past the work area for the
     // resize border, so the comparison is allowed to be generous in that
@@ -558,9 +646,17 @@ fn fills_monitor(hwnd: HWND) -> bool {
 pub fn work_area(hwnd: HWND) -> Rect {
     unsafe {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
-            Rect { left: info.rcWork.left, top: info.rcWork.top, right: info.rcWork.right, bottom: info.rcWork.bottom }
+            Rect {
+                left: info.rcWork.left,
+                top: info.rcWork.top,
+                right: info.rcWork.right,
+                bottom: info.rcWork.bottom,
+            }
         } else {
             virtual_bounds()
         }
@@ -578,11 +674,24 @@ pub fn opens_maximized(placement: &Placement) -> bool {
 /// is what made a maximized window look like it opened small first.
 pub fn maximized_rect(normal: Rect) -> Rect {
     unsafe {
-        let rect = RECT { left: normal.left, top: normal.top, right: normal.right, bottom: normal.bottom };
+        let rect = RECT {
+            left: normal.left,
+            top: normal.top,
+            right: normal.right,
+            bottom: normal.bottom,
+        };
         let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
-            Rect { left: info.rcWork.left, top: info.rcWork.top, right: info.rcWork.right, bottom: info.rcWork.bottom }
+            Rect {
+                left: info.rcWork.left,
+                top: info.rcWork.top,
+                right: info.rcWork.right,
+                bottom: info.rcWork.bottom,
+            }
         } else {
             normal
         }
@@ -596,7 +705,15 @@ mod tests {
     #[test]
     fn parking_spot_is_outside_every_monitor() {
         let v = virtual_bounds();
-        let (x, _) = parking_spot((800, 600), Rect { left: 0, top: 0, right: 100, bottom: 100 });
+        let (x, _) = parking_spot(
+            (800, 600),
+            Rect {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+        );
         assert!(x > v.right);
     }
 
@@ -609,11 +726,24 @@ mod tests {
             min_y: -1,
             max_x: -2,
             max_y: -2,
-            normal: Rect { left: 10, top: 20, right: 810, bottom: 620 },
+            normal: Rect {
+                left: 10,
+                top: 20,
+                right: 810,
+                bottom: 620,
+            },
         });
         assert!(parked_minimized(&parked));
         // A window pushed off the right edge is a different kind of hanging.
-        let moved = Parked { parked: Rect { left: 2624, top: 20, right: 3324, bottom: 620 }, ..parked };
+        let moved = Parked {
+            parked: Rect {
+                left: 2624,
+                top: 20,
+                right: 3324,
+                bottom: 620,
+            },
+            ..parked
+        };
         assert!(!parked_minimized(&moved));
     }
 
@@ -629,23 +759,45 @@ mod tests {
         );
         // Other show states are left alone.
         assert_eq!(visible_show_cmd(0, 1), 1);
-        assert_eq!(visible_show_cmd(0, SW_SHOWMAXIMIZED_CMD), SW_SHOWMAXIMIZED_CMD);
+        assert_eq!(
+            visible_show_cmd(0, SW_SHOWMAXIMIZED_CMD),
+            SW_SHOWMAXIMIZED_CMD
+        );
     }
 
     #[test]
     fn quitting_minimizes_without_losing_the_way_back() {
-        let normal = Rect { left: 10, top: 20, right: 810, bottom: 620 };
-        let record = Placement { flags: 0, show_cmd: 1, min_x: -1, min_y: -1, max_x: -2, max_y: -2, normal };
+        let normal = Rect {
+            left: 10,
+            top: 20,
+            right: 810,
+            bottom: 620,
+        };
+        let record = Placement {
+            flags: 0,
+            show_cmd: 1,
+            min_x: -1,
+            min_y: -1,
+            max_x: -2,
+            max_y: -2,
+            normal,
+        };
         let stowed = minimized_placement(&record);
         assert_eq!(stowed.show_cmd, SW_SHOWMINIMIZED_CMD);
         assert_eq!(stowed.normal, normal);
         // It was maximized before: un-minimizing brings it back maximized.
-        let maximized = Placement { show_cmd: SW_SHOWMAXIMIZED_CMD, ..record };
+        let maximized = Placement {
+            show_cmd: SW_SHOWMAXIMIZED_CMD,
+            ..record
+        };
         let stowed = minimized_placement(&maximized);
         assert_eq!(stowed.show_cmd, SW_SHOWMINIMIZED_CMD);
         assert_ne!(stowed.flags & WPF_RESTORETOMAXIMIZED, 0);
         // An ordinary window must not come back maximized.
-        assert_eq!(minimized_placement(&record).flags & WPF_RESTORETOMAXIMIZED, 0);
+        assert_eq!(
+            minimized_placement(&record).flags & WPF_RESTORETOMAXIMIZED,
+            0
+        );
     }
 
     #[test]
@@ -658,14 +810,37 @@ mod tests {
                 min_y: -1,
                 max_x: -2,
                 max_y: -2,
-                normal: Rect { left: 100, top: 200, right: 900, bottom: 800 },
+                normal: Rect {
+                    left: 100,
+                    top: 200,
+                    right: 900,
+                    bottom: 800,
+                },
             },
-            parked: Rect { left: 2624, top: 20, right: 3424, bottom: 620 },
+            parked: Rect {
+                left: 2624,
+                top: 20,
+                right: 3424,
+                bottom: 620,
+            },
             was_maximized: false,
         };
-        let work = Rect { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let work = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
         let centred = centred_on(&record, work);
-        assert_eq!(centred.placement.normal, Rect { left: 560, top: 220, right: 1360, bottom: 820 });
+        assert_eq!(
+            centred.placement.normal,
+            Rect {
+                left: 560,
+                top: 220,
+                right: 1360,
+                bottom: 820
+            }
+        );
         // The place it is parked while hidden does not move.
         assert_eq!(centred.parked, record.parked);
         assert_eq!(centred.placement.show_cmd, record.placement.show_cmd);
@@ -673,8 +848,18 @@ mod tests {
 
     #[test]
     fn a_window_bigger_than_the_work_area_is_cut_down_to_fit() {
-        let work = Rect { left: 100, top: 0, right: 900, bottom: 700 };
-        let big = Rect { left: 0, top: 0, right: 1600, bottom: 1200 };
+        let work = Rect {
+            left: 100,
+            top: 0,
+            right: 900,
+            bottom: 700,
+        };
+        let big = Rect {
+            left: 0,
+            top: 0,
+            right: 1600,
+            bottom: 1200,
+        };
         assert_eq!(centre_in(big, work), work);
     }
 
@@ -682,20 +867,64 @@ mod tests {
     fn a_maximized_record_is_not_centred() {
         // Maximized has no centre: changing the normal rect would make the
         // window come back as a box in the middle of the screen.
-        let normal = Rect { left: 10, top: 20, right: 810, bottom: 620 };
+        let normal = Rect {
+            left: 10,
+            top: 20,
+            right: 810,
+            bottom: 620,
+        };
         let record = Parked {
-            placement: Placement { flags: 0, show_cmd: 3, min_x: -1, min_y: -1, max_x: -2, max_y: -2, normal },
-            parked: Rect { left: 2624, top: 20, right: 3424, bottom: 620 },
+            placement: Placement {
+                flags: 0,
+                show_cmd: 3,
+                min_x: -1,
+                min_y: -1,
+                max_x: -2,
+                max_y: -2,
+                normal,
+            },
+            parked: Rect {
+                left: 2624,
+                top: 20,
+                right: 3424,
+                bottom: 620,
+            },
             was_maximized: true,
         };
-        let work = Rect { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let work = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
         assert_eq!(centred_on(&record, work).placement.normal, normal);
     }
 
     #[test]
     fn a_parked_rect_tolerates_a_rounding_wander() {
-        let spot = Rect { left: 2624, top: 20, right: 3324, bottom: 620 };
-        assert!(is_parked_rect(Rect { left: 2620, top: 24, right: 3320, bottom: 624 }, spot));
-        assert!(!is_parked_rect(Rect { left: 100, top: 20, right: 800, bottom: 620 }, spot));
+        let spot = Rect {
+            left: 2624,
+            top: 20,
+            right: 3324,
+            bottom: 620,
+        };
+        assert!(is_parked_rect(
+            Rect {
+                left: 2620,
+                top: 24,
+                right: 3320,
+                bottom: 624
+            },
+            spot
+        ));
+        assert!(!is_parked_rect(
+            Rect {
+                left: 100,
+                top: 20,
+                right: 800,
+                bottom: 620
+            },
+            spot
+        ));
     }
 }

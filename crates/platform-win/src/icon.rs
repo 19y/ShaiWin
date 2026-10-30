@@ -7,7 +7,8 @@ use std::os::windows::ffi::OsStrExt;
 
 use windows::core::PCWSTR;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, ReleaseDC,
+    DeleteObject, GetDC, GetDIBits, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS,
 };
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
@@ -19,16 +20,28 @@ pub fn for_exe(exe_path: &str, size: u32) -> Option<Image> {
     if exe_path.is_empty() {
         return None;
     }
-    let wide: Vec<u16> = std::ffi::OsStr::new(exe_path).encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = std::ffi::OsStr::new(exe_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         let mut large = HICON::default();
         let mut small = HICON::default();
-        let count =
-            ExtractIconExW(PCWSTR(wide.as_ptr()), 0, Some(&mut large as *mut HICON), Some(&mut small as *mut HICON), 1);
+        let count = ExtractIconExW(
+            PCWSTR(wide.as_ptr()),
+            0,
+            Some(&mut large as *mut HICON),
+            Some(&mut small as *mut HICON),
+            1,
+        );
         if count == 0 {
             return None;
         }
-        let icon = if size >= 32 || small.is_invalid() { large } else { small };
+        let icon = if size >= 32 || small.is_invalid() {
+            large
+        } else {
+            small
+        };
         if icon.is_invalid() {
             return None;
         }
@@ -109,7 +122,11 @@ fn from_icon_bitmaps(info: &ICONINFO) -> Option<Image> {
         if !has_alpha {
             apply_mask(info, w, h, &mut data);
         }
-        Some(Image { width: w, height: h, rgba: data })
+        Some(Image {
+            width: w,
+            height: h,
+            rgba: data,
+        })
     }
 }
 
@@ -165,4 +182,3 @@ fn apply_mask(info: &ICONINFO, w: u32, h: u32, data: &mut [u8]) {
         }
     }
 }
-

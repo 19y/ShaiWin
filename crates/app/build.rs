@@ -79,7 +79,9 @@ fn main() {
     // outside a Developer prompt, and `windres` only ships with GNU toolchains.
     // GNU ld refuses the `.res` that `rc.exe` writes, so on a GNU target the
     // MSVC route goes through `cvtres.exe` first and hands over a COFF object.
-    let msvc = env::var("CARGO_CFG_TARGET_ENV").map(|env| env == "msvc").unwrap_or(false);
+    let msvc = env::var("CARGO_CFG_TARGET_ENV")
+        .map(|env| env == "msvc")
+        .unwrap_or(false);
     let attempts: [Compiler; 2] = if msvc {
         [compile_with_rc, compile_with_windres]
     } else {
@@ -102,7 +104,10 @@ fn main() {
 }
 
 fn icon_path(manifest: &Path) -> Option<PathBuf> {
-    let path = manifest.join("../../assets/shaiwin.ico").canonicalize().ok()?;
+    let path = manifest
+        .join("../../assets/shaiwin.ico")
+        .canonicalize()
+        .ok()?;
     // `canonicalize` gives a verbatim `\\?\` path, which resource compilers do
     // not understand. The drive letter form is what they expect.
     let text = path.display().to_string();
@@ -112,7 +117,10 @@ fn icon_path(manifest: &Path) -> Option<PathBuf> {
 
 /// A path inside a quoted `.rc` string: backslashes doubled, no stray quotes.
 fn quoted_path(path: &Path) -> String {
-    path.display().to_string().replace('\\', "\\\\").replace('"', "'")
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "'")
 }
 
 /// `1.2.3` becomes `1,2,3,0`; `rc.exe` wants exactly four numbers.
@@ -120,7 +128,11 @@ fn packed_version(version: &str) -> String {
     let mut parts: Vec<String> = version
         .split('.')
         .take(3)
-        .map(|part| part.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .map(|part| {
+            part.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
         .map(|part| if part.is_empty() { "0".into() } else { part })
         .collect();
     while parts.len() < 4 {
@@ -132,7 +144,9 @@ fn packed_version(version: &str) -> String {
 fn compile_with_rc(rc: &Path, out_dir: &Path) -> Result<PathBuf, String> {
     let compiler = find_rc().ok_or("rc.exe is neither on PATH nor in the Windows SDK")?;
     let artifact = out_dir.join("shaiwin.res");
-    run(&compiler, "rc.exe", |cmd| cmd.arg("/nologo").arg("/fo").arg(&artifact).arg(rc))?;
+    run(&compiler, "rc.exe", |cmd| {
+        cmd.arg("/nologo").arg("/fo").arg(&artifact).arg(rc)
+    })?;
     Ok(artifact)
 }
 
@@ -162,7 +176,11 @@ fn compile_with_windres(rc: &Path, out_dir: &Path) -> Result<PathBuf, String> {
     let compiler = which("windres").ok_or("windres is not on PATH")?;
     let artifact = out_dir.join("shaiwin_res.o");
     run(&compiler, "windres", |cmd| {
-        cmd.arg("--input").arg(rc).arg("--output-format=coff").arg("--output").arg(&artifact)
+        cmd.arg("--input")
+            .arg(rc)
+            .arg("--output-format=coff")
+            .arg("--output")
+            .arg(&artifact)
     })?;
     Ok(artifact)
 }
@@ -175,13 +193,23 @@ where
     let output = configure(&mut command).output();
     match output {
         Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(format!("{name} said: {}", String::from_utf8_lossy(&output.stderr).trim())),
-        Err(error) => Err(format!("could not run {name} ({}): {error}", compiler.display())),
+        Ok(output) => Err(format!(
+            "{name} said: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Err(format!(
+            "could not run {name} ({}): {error}",
+            compiler.display()
+        )),
     }
 }
 
 fn which(name: &str) -> Option<PathBuf> {
-    let suffix = if env::consts::OS == "windows" { ".exe" } else { "" };
+    let suffix = if env::consts::OS == "windows" {
+        ".exe"
+    } else {
+        ""
+    };
     env::split_paths(&env::var_os("PATH")?)
         .map(|dir| dir.join(format!("{name}{suffix}")))
         .find(|candidate| candidate.is_file())
@@ -197,17 +225,35 @@ fn find_rc() -> Option<PathBuf> {
     // per-user SDK installs put the same tree under `LOCALAPPDATA`.
     let mut roots = Vec::new();
     if let Ok(program_files) = env::var("ProgramFiles(x86)").or_else(|_| env::var("PROGRAMFILES")) {
-        roots.push(PathBuf::from(program_files).join("Windows Kits").join("10").join("bin"));
+        roots.push(
+            PathBuf::from(program_files)
+                .join("Windows Kits")
+                .join("10")
+                .join("bin"),
+        );
     }
     if let Some(local) = env::var_os("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join("Windows Kits").join("10").join("bin"));
+        roots.push(
+            PathBuf::from(local)
+                .join("Windows Kits")
+                .join("10")
+                .join("bin"),
+        );
     }
     let mut newest: Option<(u32, PathBuf)> = None;
     for root in roots.iter().filter(|root| root.is_dir()) {
-        let Ok(versions) = fs::read_dir(root) else { continue };
+        let Ok(versions) = fs::read_dir(root) else {
+            continue;
+        };
         for entry in versions.flatten() {
             let text = entry.file_name().to_string_lossy().to_string();
-            let Some(major) = text.split('.').next().and_then(|part| part.parse::<u32>().ok()) else { continue };
+            let Some(major) = text
+                .split('.')
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+            else {
+                continue;
+            };
             let base = entry.path();
             for candidate in [base.join("x64").join("rc.exe"), base.join("rc.exe")] {
                 if candidate.is_file() && newest.as_ref().is_none_or(|(found, _)| major > *found) {
@@ -227,16 +273,33 @@ fn find_cvtres() -> Option<PathBuf> {
         return Some(on_path);
     }
     let mut newest: Option<(Vec<u32>, PathBuf)> = None;
-    for root in [env::var("ProgramFiles(x86)").ok(), env::var("ProgramFiles").ok()].into_iter().flatten() {
+    for root in [
+        env::var("ProgramFiles(x86)").ok(),
+        env::var("ProgramFiles").ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let studio = PathBuf::from(root).join("Microsoft Visual Studio");
-        let Ok(editions) = fs::read_dir(&studio) else { continue };
+        let Ok(editions) = fs::read_dir(&studio) else {
+            continue;
+        };
         for edition in editions.flatten() {
-            let Ok(products) = fs::read_dir(edition.path()) else { continue };
+            let Ok(products) = fs::read_dir(edition.path()) else {
+                continue;
+            };
             for product in products.flatten() {
                 let tools = product.path().join("VC").join("Tools").join("MSVC");
-                let Ok(versions) = fs::read_dir(&tools) else { continue };
+                let Ok(versions) = fs::read_dir(&tools) else {
+                    continue;
+                };
                 for version in versions.flatten() {
-                    let candidate = version.path().join("bin").join("Hostx64").join("x64").join("cvtres.exe");
+                    let candidate = version
+                        .path()
+                        .join("bin")
+                        .join("Hostx64")
+                        .join("x64")
+                        .join("cvtres.exe");
                     if !candidate.is_file() {
                         continue;
                     }
@@ -276,7 +339,10 @@ mod tests {
 
     #[test]
     fn the_script_names_the_icon_and_the_version() {
-        let script = SCRIPT.replace("{icon}", "C:\\a.ico").replace("{packed}", "1,0,0,0").replace("{version}", "1.0.0");
+        let script = SCRIPT
+            .replace("{icon}", "C:\\a.ico")
+            .replace("{packed}", "1,0,0,0")
+            .replace("{version}", "1.0.0");
         assert!(script.contains("1 ICON \"C:\\a.ico\""));
         assert!(script.contains("FILEVERSION 1,0,0,0"));
         assert!(!script.contains('{'));

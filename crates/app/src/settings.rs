@@ -39,8 +39,6 @@ pub struct Settings {
     pub reduced_motion: bool,
     /// Lower-cased executable names that may not be hung.
     pub excluded: Vec<String>,
-    /// Show the line at the top of every monitor instead of just one.
-    pub all_monitors: bool,
     /// Modifiers and virtual-key code for "hang the foreground window".
     /// A virtual key of 0 means the shortcut is switched off.
     pub hang_mods: u32,
@@ -52,20 +50,37 @@ pub struct Settings {
     /// [`SAG_AUTO`] keeps the curve the program ships with, which is not a
     /// percentage of anything: it is a fixed 26 logical pixels.
     pub sag_percent: f32,
-    /// Hovering the top edge brings the line down immediately. When off — the
-    /// default — the dwell opens a small "expand the line" pill instead, so a
-    /// cursor that merely grazes the top of the screen never takes the screen.
-    pub hover_open: bool,
     /// Explained once that taking a window down keeps it hooked.
     pub hook_taught: bool,
-    /// The line comes down when ShaiWin starts and stays down until it is
-    /// dismissed. Off it again, and a program in the tray looks like a program
-    /// that is not running.
+    /// The line is resident: it stays on screen until the show/hide shortcut
+    /// puts it away. Off, it is a short visit — the top-edge pill opens it, and
+    /// it tucks itself away when the visit is over.
     pub always_on: bool,
     /// Dragging a window to the top of the screen takes part in hanging at all:
     /// the line lights and letting go hangs it. Off — the line never answers a
     /// drag, and windows go up by hotkey or tray.
     pub drag_hang: bool,
+    /// In non-resident mode, how long the line stays out after the pointer
+    /// leaves it. While the pointer is on the rope or a card, or a window/card
+    /// is in hand, the line stays. `0` keeps it out until the user puts it away.
+    /// One second is long enough to come back and short enough to feel like the
+    /// line got out of the way.
+    pub auto_hide_secs: u32,
+}
+
+/// A tag the card can actually carry. Tabs and line breaks would break the
+/// journal, and an essay on a 168 px card helps nobody.
+pub fn clean_tag(tag: &str) -> String {
+    let flat: String = tag
+        .chars()
+        .map(|c| if c == ',' || c.is_control() { ' ' } else { c })
+        .collect();
+    flat.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(24)
+        .collect()
 }
 
 impl Default for Settings {
@@ -74,16 +89,15 @@ impl Default for Settings {
             welcomed: false,
             reduced_motion: false,
             excluded: Vec::new(),
-            all_monitors: false,
             hang_mods: MOD_CONTROL,
             hang_vk: VK_2,
             toggle_mods: MOD_CONTROL,
             toggle_vk: VK_T,
             sag_percent: SAG_AUTO,
-            hover_open: false,
             hook_taught: false,
             always_on: true,
             drag_hang: true,
+            auto_hide_secs: 1,
         }
     }
 }
@@ -108,18 +122,21 @@ impl Settings {
 
     pub fn load() -> Settings {
         let mut s = Settings::default();
-        let Ok(text) = fs::read_to_string(Self::file()) else { return s };
+        let Ok(text) = fs::read_to_string(Self::file()) else {
+            return s;
+        };
         for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else { continue };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
             let value = value.trim();
             match key.trim() {
                 "welcomed" => s.welcomed = value == "1",
                 "reduced_motion" => s.reduced_motion = value == "1",
-                "all_monitors" => s.all_monitors = value == "1",
-                "hover_open" => s.hover_open = value == "1",
                 "hook_taught" => s.hook_taught = value == "1",
                 "always_on" => s.always_on = value != "0",
                 "drag_hang" => s.drag_hang = value != "0",
+                "auto_hide_secs" => s.auto_hide_secs = parse_hide_secs(value),
                 "excluded" => {
                     s.excluded = value
                         .split(',')
@@ -144,21 +161,25 @@ impl Settings {
             let _ = fs::create_dir_all(dir);
         }
         let text = format!(
-            "welcomed={}\nreduced_motion={}\nall_monitors={}\n\
+            "welcomed={}\nreduced_motion={}\n\
              hang_mods={}\nhang_vk={}\ntoggle_mods={}\ntoggle_vk={}\n\
-             sag={}\nhover_open={}\nhook_taught={}\nalways_on={}\ndrag_hang={}\nexcluded={}\n",
+             sag={}\nhook_taught={}\nalways_on={}\ndrag_hang={}\n\
+             auto_hide_secs={}\nexcluded={}\n",
             u8::from(self.welcomed),
             u8::from(self.reduced_motion),
-            u8::from(self.all_monitors),
             self.hang_mods,
             self.hang_vk,
             self.toggle_mods,
             self.toggle_vk,
-            if self.sag_is_auto() { String::new() } else { format!("{:.1}", self.sag_percent) },
-            u8::from(self.hover_open),
+            if self.sag_is_auto() {
+                String::new()
+            } else {
+                format!("{:.1}", self.sag_percent)
+            },
             u8::from(self.hook_taught),
             u8::from(self.always_on),
             u8::from(self.drag_hang),
+            self.auto_hide_secs,
             self.excluded.join(",")
         );
         let _ = fs::write(file, text);
@@ -202,8 +223,12 @@ pub fn hotkey_label(mods: u32, vk: u32) -> String {
 
 fn key_name(vk: u32) -> String {
     match vk {
-        0x30..=0x39 => char::from_u32(vk).map(String::from).unwrap_or_else(|| format!("VK{vk:02X}")),
-        0x41..=0x5A => char::from_u32(vk).map(String::from).unwrap_or_else(|| format!("VK{vk:02X}")),
+        0x30..=0x39 => char::from_u32(vk)
+            .map(String::from)
+            .unwrap_or_else(|| format!("VK{vk:02X}")),
+        0x41..=0x5A => char::from_u32(vk)
+            .map(String::from)
+            .unwrap_or_else(|| format!("VK{vk:02X}")),
         0x70..=0x87 => format!("F{}", vk - 0x6F),
         0x20 => "Space".to_string(),
         0x25 => "Left".to_string(),
@@ -233,6 +258,17 @@ pub fn parse_sag(value: &str) -> f32 {
     }
 }
 
+/// Seconds are deliberately bounded: under one second would tuck the line
+/// while the user is still reaching for a card, and more than thirty is no
+/// longer a quick visit. `0` means "do not hide by itself".
+pub fn parse_hide_secs(value: &str) -> u32 {
+    match value.trim().parse::<u32>() {
+        Ok(0) => 0,
+        Ok(v) => v.clamp(1, 30),
+        Err(_) => 1,
+    }
+}
+
 fn parse_mods(value: &str) -> u32 {
     value.parse::<u32>().map(|v| v & MOD_ALL).unwrap_or(0)
 }
@@ -253,11 +289,34 @@ mod tests {
     }
 
     #[test]
+    fn the_auto_hide_clock_stays_useful() {
+        assert_eq!(parse_hide_secs(""), 1);
+        assert_eq!(parse_hide_secs("nope"), 1);
+        assert_eq!(Settings::default().auto_hide_secs, 1);
+        assert_eq!(parse_hide_secs("0"), 0);
+        assert_eq!(parse_hide_secs("1"), 1);
+        assert_eq!(parse_hide_secs("2"), 2);
+        assert_eq!(parse_hide_secs("600"), 30);
+    }
+
+    #[test]
+    fn a_tag_is_one_short_line() {
+        assert_eq!(clean_tag("  work  "), "work");
+        assert_eq!(clean_tag("a\tb\nc"), "a b c");
+        assert_eq!(clean_tag("read, later"), "read later");
+        assert_eq!(clean_tag(&"x".repeat(40)).chars().count(), 24);
+    }
+
+    #[test]
     fn the_defaults_are_bound() {
         let s = Settings::default();
         assert_eq!(s.hang_label(), "Ctrl+2");
         assert_eq!(s.toggle_label(), "Ctrl+T");
         assert!(s.sag_is_auto());
+        // A fresh install starts with the line resident and the top edge as a
+        // drop target; those are the two behaviours the program is for.
+        assert!(s.always_on);
+        assert!(s.drag_hang);
     }
 
     #[test]
@@ -276,7 +335,11 @@ mod tests {
         // The same settings on a laptop and an ultrawide both get 26 logical pixels.
         for (width, scale) in [(1920.0, 1.0), (2560.0, 1.0), (3440.0, 1.25)] {
             let l = s.layout_for(width, scale);
-            assert!((l.sag() - 26.0 * scale).abs() < 0.01, "{width}@{scale}: sag = {}", l.sag());
+            assert!(
+                (l.sag() - 26.0 * scale).abs() < 0.01,
+                "{width}@{scale}: sag = {}",
+                l.sag()
+            );
         }
         s.sag_percent = 4.0;
         assert!((s.layout_for(2560.0, 1.0).sag() - 102.4).abs() < 0.01);

@@ -20,7 +20,13 @@ pub struct ArcFlight {
 
 impl ArcFlight {
     pub fn new(from: (f32, f32), to: (f32, f32), lift: f32, duration: f32) -> Self {
-        ArcFlight { from, to, lift, duration: duration.max(0.05), t: 0.0 }
+        ArcFlight {
+            from,
+            to,
+            lift,
+            duration: duration.max(0.05),
+            t: 0.0,
+        }
     }
 
     /// Advances the flight. Returns `true` while it is still in the air.
@@ -51,7 +57,10 @@ impl ArcFlight {
         // Control point: halfway, lifted.
         let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0 - self.lift);
         let u = 1.0 - t;
-        (u * u * x0 + 2.0 * u * t * cx + t * t * x1, u * u * y0 + 2.0 * u * t * cy + t * t * y1)
+        (
+            u * u * x0 + 2.0 * u * t * cx + t * t * x1,
+            u * u * y0 + 2.0 * u * t * cy + t * t * y1,
+        )
     }
 
     /// Rotation in degrees along the flight, so the card banks into the line.
@@ -77,7 +86,11 @@ pub fn ease_in_out_cubic(t: f32) -> f32 {
 
 /// A window shrinking into the line should keep its aspect ratio readable;
 /// this maps "window rect" to "card rect" while the flight runs.
-pub fn lerp_rect(from: (f32, f32, f32, f32), to: (f32, f32, f32, f32), t: f32) -> (f32, f32, f32, f32) {
+pub fn lerp_rect(
+    from: (f32, f32, f32, f32),
+    to: (f32, f32, f32, f32),
+    t: f32,
+) -> (f32, f32, f32, f32) {
     let t = ease_in_out_cubic(t);
     (
         from.0 + (to.0 - from.0) * t,

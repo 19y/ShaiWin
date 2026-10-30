@@ -6,8 +6,8 @@ use std::ffi::c_void;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-    HBITMAP, HDC, HGDIOBJ, SelectObject,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
 };
 
 pub struct Dib {
@@ -42,14 +42,22 @@ impl Dib {
                 ..Default::default()
             };
             let mut bits: *mut c_void = std::ptr::null_mut();
-            let bitmap = CreateDIBSection(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let bitmap =
+                CreateDIBSection(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
             if bits.is_null() {
                 let _ = DeleteObject(bitmap.into());
                 let _ = DeleteDC(hdc);
                 return None;
             }
             let old = SelectObject(hdc, bitmap.into());
-            Some(Dib { hdc, bitmap, old, bits: bits as *mut u8, width, height })
+            Some(Dib {
+                hdc,
+                bitmap,
+                old,
+                bits: bits as *mut u8,
+                width,
+                height,
+            })
         }
     }
 

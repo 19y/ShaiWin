@@ -24,7 +24,7 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\testkit.ps1"
 
 $root = Join-Path $env:TEMP "shaiwin-smoke"
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nhover_open=0`nalways_on=1`nexcluded=`n"
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
 Initialize-Fixtures $root
 $journal = Join-Path $state "ShaiWin\parked.txt"
 
@@ -99,10 +99,22 @@ try {
   $dx = [Math]::Abs($back.Left - $origin.Left)
   $dy = [Math]::Abs($back.Top - $origin.Top)
   if ($dx -gt 8 -or $dy -gt 8) { Fail "window did not return to its original position (off by $dx,$dy)" }
-  if (Test-Path $journal) { Fail "parked.txt still exists after taking everything down" }
+  # The window is back the moment `restore` moves it; the journal is rewritten a
+  # few hundred microseconds later, in the same call. Waiting on the file is the
+  # promise ("nothing left hanging means nothing left in the journal"); reading
+  # it the instant the window lands is racing the app's own order of operations.
+  if (-not (Wait-Until ({ -not (Test-Path $journal) }) 3000)) {
+    # Say what is actually in there. "The file exists" is not a bug report.
+    Write-Host "  parked.txt holds:"
+    Get-Content $journal -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    Write-Host "  last lines of the log:"
+    Get-Content (Join-Path (Split-Path $journal) "shaiwin.log") -Tail 12 |
+      ForEach-Object { Write-Host "    $_" }
+    Fail "parked.txt still exists after taking everything down"
+  }
   if ($canPointer) {
-    # The line was brought down on purpose at startup, so emptying it is not a
-    # reason for it to slip away - that is what the toggle shortcut is for.
+    # The line is resident, so emptying it is not a reason for it to slip away;
+    # that is what the toggle shortcut is for.
     if (-not [W]::IsWindowVisible($overlay)) {
       Fail "the pinned line hid itself when the last card came down"
     }

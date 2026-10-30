@@ -32,7 +32,51 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
   [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindowLongPtrW(IntPtr h, int index);
+  [DllImport("user32.dll", EntryPoint="GetWindowLongW")] static extern int GetWindowLongW(IntPtr h, int index);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
+
+  // DWM paints nothing for a cloaked window, even when its style and rectangle
+  // say it is on screen. The input host's CoreWindow is the usual one, and it
+  // spans the whole desktop in some sessions.
+  public static bool IsCloaked(IntPtr h) {
+    int v = 0;
+    return DwmGetWindowAttribute(h, 14, out v, 4) == 0 && v != 0;   // DWMWA_CLOAKED
+  }
+
+  // The overlay's promise to itself is that it only holds the top of the screen
+  // while it is being used, so the tests have to be able to see who is on top.
+  public static bool IsTopmost(IntPtr h) {
+    long ex = (IntPtr.Size == 8)
+      ? GetWindowLongPtrW(h, -20).ToInt64()          // GWL_EXSTYLE
+      : (long)GetWindowLongW(h, -20);
+    return (ex & 0x8) != 0;                          // WS_EX_TOPMOST
+  }
+  // Whether the layer lets clicks through. A demoted line still has to take a
+  // click on a card the user can see; WS_EX_TRANSPARENT is what decides that.
+  public static bool IsClickThrough(IntPtr h) {
+    long ex = (IntPtr.Size == 8)
+      ? GetWindowLongPtrW(h, -20).ToInt64()
+      : (long)GetWindowLongW(h, -20);
+    return (ex & 0x20) != 0;                         // WS_EX_TRANSPARENT
+  }
+  // Is `a` painted over `b`? Walking the z-order from `b` upwards is the only
+  // way to ask: the style bit alone does not answer it, because clearing
+  // WS_EX_TOPMOST puts a window at the head of the normal band - still above the
+  // window the user just clicked into, which is the whole complaint.
+  public static bool IsAbove(IntPtr a, IntPtr b) {
+    IntPtr cur = GetWindow(b, 3);                    // GW_HWNDPREV = the one above
+    for (int i = 0; i < 4096 && cur != IntPtr.Zero; i++) {
+      if (cur == a) return true;
+      cur = GetWindow(cur, 3);
+    }
+    return false;
+  }
   public struct RECT { public int Left, Top, Right, Bottom; }
   public struct POINT { public int X, Y; }
   public struct WINDOWPLACEMENT {
@@ -53,6 +97,13 @@ $script:KitTakeAll = 0x8000 + 11
 $script:KitDumpFrame = 0x8000 + 12
 $script:KitTakeOne = 0x8000 + 13
 $script:KitUnhook = 0x8000 + 14
+# WM_APP + 17: answer pointer questions from (wParam, lParam) instead of the
+# real cursor. Sessions that refuse SetCursorPos use this to drive the
+# z-order rule; wParam 0xFFFFFFFF puts the real pointer back.
+$script:KitPointAt = 0x8000 + 17
+# WM_APP + 18: pretend a window of the user's is being dragged. A headless
+# session cannot start a real move loop; wParam 0 ends the pretend drag.
+$script:KitPretendDrag = 0x8000 + 18
 $script:KitHotkey = 0x0312
 $script:KitClose = 0x0010
 $script:KitMouseMove = 0x0200
@@ -97,10 +148,44 @@ function Test-Window([IntPtr]$h) { return $h -ne [IntPtr]::Zero }
 
 function Get-Overlay { Find-By-Class "ShaiWin.Line" }
 
+# The rope's own always-on-top layer, shown only while the cards have been
+# demoted behind the user's work.
+function Get-Rope { Find-By-Class "ShaiWin.Rope" }
+
+# The app's design sizes are logical pixels; at 150% the rope's grab band and
+# the gaps around it are 1.5x as wide on screen. Tests that reason about those
+# distances have to multiply by this.
+function Get-WindowScale([IntPtr]$h) {
+  $dpi = [W]::GetDpiForWindow($h)
+  if ($dpi -le 0) { return 1.0 }
+  return $dpi / 96.0
+}
+
 function Get-Rect([IntPtr]$h) {
   $r = New-Object W+RECT
   if (-not [W]::GetWindowRect($h, [ref]$r)) { return $null }
   return $r
+}
+
+# The class of the window painted over `(x, y)` that is above `$below`, or "" if
+# that point is bare. This is the app's own "is the card really visible" walk:
+# visible, not click-through, not minimized, not cloaked by DWM, and containing
+# the point. Tests use it to tell "the app refused to raise" from "this session
+# has something covering the line".
+function Get-Coverer([IntPtr]$below, [int]$x, [int]$y) {
+  $cur = [W]::GetWindow($below, 3)             # GW_HWNDPREV = the one above
+  for ($i = 0; $i -lt 512 -and $cur -ne [IntPtr]::Zero; $i++) {
+    $r = Get-Rect $cur
+    if ([W]::IsWindowVisible($cur) -and -not [W]::IsClickThrough($cur) -and
+        -not [W]::IsIconic($cur) -and -not [W]::IsCloaked($cur) -and $r -and
+        $x -ge $r.Left -and $x -lt $r.Right -and $y -ge $r.Top -and $y -lt $r.Bottom) {
+      $sb = New-Object System.Text.StringBuilder 256
+      [void][W]::GetClassNameW($cur, $sb, 256)
+      return $sb.ToString()
+    }
+    $cur = [W]::GetWindow($cur, 3)
+  }
+  return ""
 }
 
 # What Windows remembers about a window: where it comes back to, and in what
@@ -131,12 +216,36 @@ function Get-WorkArea {
   return $r
 }
 
-function Move-Cursor([int]$x, [int]$y) {
-  if (-not [W]::SetCursorPos($x, $y)) { return $false }
-  Start-Sleep -Milliseconds 120
-  $p = New-Object W+POINT
-  if (-not [W]::GetCursorPos([ref]$p)) { return $false }
-  return ($p.X -eq $x -and $p.Y -eq $y)
+# Pretend the pointer is at (x, y). The app answers every hover, raise and
+# visit question from this until Point-Real. A session with no input desktop
+# refuses SetCursorPos, and the z-order rule is entirely "where is the pointer",
+# so this is how those sessions test it.
+function Point-At([IntPtr]$overlay, [int]$x, [int]$y) {
+  Invoke-Wm $overlay $script:KitPointAt ([IntPtr]($x -band 0xFFFFFFFF)) ([IntPtr]$y)
+}
+
+function Point-Real([IntPtr]$overlay) {
+  Invoke-Wm $overlay $script:KitPointAt ([IntPtr]0xFFFFFFFF) ([IntPtr]::Zero)
+}
+
+# Pretend one of his windows is being dragged, the way the system's move loop
+# reports it. The z-order rule is the poll's, not the loop's, so this is enough
+# to prove that a drag never brings the cards up.
+function Drag-Pretend([IntPtr]$overlay, [bool]$on) {
+  Invoke-Wm $overlay $script:KitPretendDrag ([IntPtr]([int]$on)) ([IntPtr]::Zero)
+}
+
+function Move-Cursor([int]$x, [int]$y) {  for ($try = 1; $try -le 4; $try++) {
+    if (-not [W]::SetCursorPos($x, $y)) { Start-Sleep -Milliseconds 150; continue }
+    Start-Sleep -Milliseconds 120
+    $p = New-Object W+POINT
+    if (-not [W]::GetCursorPos([ref]$p)) { continue }
+    if ($p.X -eq $x -and $p.Y -eq $y) { return $true }
+    # Somebody else moved the pointer - a hand on the same machine. Say so and
+    # try again rather than failing the case on the first nudge.
+    Write-Host "    the pointer drifted to ($($p.X),$($p.Y)); trying again"
+  }
+  return $false
 }
 
 # Real mouse input, because that is the only way to reach the line: the overlay
@@ -323,8 +432,11 @@ function Get-CardRects([string]$dir, [int]$appPid, [IntPtr]$overlay) {
   return @(Get-Content $path | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object {
     $f = $_ -split "`t"
     $r = $f[2] -split ","
+    # The "show the line" pill is reported as u64::MAX, which does not fit in a
+    # signed long. Cards keep their normal id; the pill is called out separately.
+    $id = [uint64]$f[0]
     [pscustomobject]@{
-      Id = [long]$f[0]; Hwnd = [long]$f[1]
+      Id = $id; Hwnd = [long]$f[1]; Peek = ($id -eq [uint64]::MaxValue)
       Left = [int]$r[0]; Top = [int]$r[1]; Right = [int]$r[2]; Bottom = [int]$r[3]
     }
   })

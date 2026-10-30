@@ -20,7 +20,13 @@ const SUBSTEP: f32 = 1.0 / 120.0;
 
 impl Spring {
     pub fn new(x: f32, k: f32, c: f32) -> Self {
-        Spring { x, v: 0.0, target: x, k, c }
+        Spring {
+            x,
+            v: 0.0,
+            target: x,
+            k,
+            c,
+        }
     }
 
     /// A spring from a response (seconds, roughly the time to settle) and a

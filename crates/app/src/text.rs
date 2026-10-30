@@ -10,14 +10,15 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 
+use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
-    CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DeleteDC, DeleteObject, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, GdiFlush,
-    GetTextExtentPoint32W, GetTextMetricsW, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor,
-    TEXTMETRICW, TRANSPARENT, TextOutW,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GdiFlush,
+    GetTextExtentPoint32W, GetTextMetricsW, SelectObject, SetBkMode, SetTextColor, TextOutW,
+    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HDC,
+    HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT,
 };
-use windows::core::w;
 
 const FACE: windows::core::PCWSTR = w!("Microsoft YaHei UI");
 const FALLBACK_FACE: windows::core::PCWSTR = w!("Segoe UI");
@@ -28,7 +29,9 @@ const PAD: i32 = 2;
 /// every rebuilt sprite.
 pub struct Text {
     dc: HDC,
-    fonts: HashMap<i32, (HFONT, i32)>,
+    /// Keyed by device size and weight: a tag label is semibold while every
+    /// other caption is regular, and they must not evict each other.
+    fonts: HashMap<(i32, i32), (HFONT, i32)>,
 }
 
 impl Text {
@@ -37,23 +40,26 @@ impl Text {
         if dc.is_invalid() {
             return None;
         }
-        Some(Text { dc, fonts: HashMap::new() })
+        Some(Text {
+            dc,
+            fonts: HashMap::new(),
+        })
     }
 
     /// The font for `px` and the height of its cell. Selecting it into the DC
     /// is part of getting it, because both measuring and drawing read the
     /// selected font.
-    fn font(&mut self, px: f32) -> Option<i32> {
-        let key = px.round().max(1.0) as i32;
+    fn font(&mut self, px: f32, weight: i32) -> Option<i32> {
+        let key = (px.round().max(1.0) as i32, weight);
         if let Some((font, cell)) = self.fonts.get(&key) {
             unsafe {
                 SelectObject(self.dc, HGDIOBJ(font.0));
             }
             return Some(*cell);
         }
-        let mut font = unsafe { make_font(key, FACE) };
+        let mut font = unsafe { make_font(key.0, weight, FACE) };
         if font.is_invalid() {
-            font = unsafe { make_font(key, FALLBACK_FACE) };
+            font = unsafe { make_font(key.0, weight, FALLBACK_FACE) };
         }
         if font.is_invalid() {
             return None;
@@ -73,7 +79,15 @@ impl Text {
     }
 
     pub fn width(&mut self, text: &str, px: f32) -> Option<f32> {
-        self.font(px)?;
+        self.width_weight(text, px, FW_NORMAL.0 as i32)
+    }
+
+    pub fn width_bold(&mut self, text: &str, px: f32) -> Option<f32> {
+        self.width_weight(text, px, FW_SEMIBOLD.0 as i32)
+    }
+
+    fn width_weight(&mut self, text: &str, px: f32, weight: i32) -> Option<f32> {
+        self.font(px, weight)?;
         let wide: Vec<u16> = text.encode_utf16().collect();
         let mut size = SIZE::default();
         unsafe {
@@ -84,8 +98,32 @@ impl Text {
 
     /// `text` as a premultiplied RGBA image: white glyphs on transparent,
     /// tinted to `rgb`.
-    pub fn render(&mut self, text: &str, px: f32, rgb: (u8, u8, u8)) -> Option<(Vec<u8>, u32, u32)> {
-        let cell = self.font(px)?;
+    pub fn render(
+        &mut self,
+        text: &str,
+        px: f32,
+        rgb: (u8, u8, u8),
+    ) -> Option<(Vec<u8>, u32, u32)> {
+        self.render_weight(text, px, rgb, FW_NORMAL.0 as i32)
+    }
+
+    pub fn render_bold(
+        &mut self,
+        text: &str,
+        px: f32,
+        rgb: (u8, u8, u8),
+    ) -> Option<(Vec<u8>, u32, u32)> {
+        self.render_weight(text, px, rgb, FW_SEMIBOLD.0 as i32)
+    }
+
+    fn render_weight(
+        &mut self,
+        text: &str,
+        px: f32,
+        rgb: (u8, u8, u8),
+        weight: i32,
+    ) -> Option<(Vec<u8>, u32, u32)> {
+        let cell = self.font(px, weight)?;
         let wide: Vec<u16> = text.encode_utf16().collect();
         let mut size = SIZE::default();
         unsafe {
@@ -108,7 +146,9 @@ impl Text {
             ..Default::default()
         };
         let mut bits: *mut c_void = ptr::null_mut();
-        let dib = unsafe { CreateDIBSection(Some(self.dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) }.ok()?;
+        let dib =
+            unsafe { CreateDIBSection(Some(self.dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .ok()?;
         if dib.is_invalid() || bits.is_null() {
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(dib.0));
@@ -147,14 +187,14 @@ impl Text {
     }
 }
 
-unsafe fn make_font(px: i32, face: windows::core::PCWSTR) -> HFONT {
+unsafe fn make_font(px: i32, weight: i32, face: windows::core::PCWSTR) -> HFONT {
     unsafe {
         CreateFontW(
             -px,
             0,
             0,
             0,
-            FW_NORMAL.0 as i32,
+            weight,
             0,
             0,
             0,

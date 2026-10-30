@@ -11,17 +11,19 @@
 
 use std::collections::HashMap;
 
+use shaiwin_core::theme::{tag_color, tag_ink};
 use shaiwin_core::{LineLayout, Rgb};
 use shaiwin_platform_win::Rect as WRect;
 use tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, Path, PathBuilder, Pixmap, PixmapPaint,
-    Point, Shader, SpreadMode, Stroke, Transform,
+    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, Path, PathBuilder,
+    Pixmap, PixmapPaint, Point, Shader, SpreadMode, Stroke, Transform,
 };
 
 use crate::line::{Card, Line};
 
 pub struct SpriteKey {
     pub thumb_version: u64,
+    pub tag_version: u64,
     pub scale_milli: u32,
     pub zoom_milli: u32,
     pub zoom_y_milli: u32,
@@ -30,6 +32,7 @@ pub struct SpriteKey {
 impl PartialEq for SpriteKey {
     fn eq(&self, other: &Self) -> bool {
         self.thumb_version == other.thumb_version
+            && self.tag_version == other.tag_version
             && self.scale_milli == other.scale_milli
             && self.zoom_milli == other.zoom_milli
             && self.zoom_y_milli == other.zoom_y_milli
@@ -54,6 +57,10 @@ pub struct Ui<'a> {
     /// A dragged window is near enough for the line to answer: the rope goes
     /// warm and the empty-line hint steps aside.
     pub hot: bool,
+    /// Whether this layer draws the rope. When the card layer has sunk behind
+    /// the user's work, the rope lives in its own always-on-top window instead,
+    /// so drawing it here too would double the line.
+    pub rope: bool,
 }
 
 pub struct Frame {
@@ -68,7 +75,11 @@ pub struct Painter {
 
 impl Painter {
     pub fn new() -> Painter {
-        Painter { text: crate::text::Text::new(), labels: HashMap::new(), sprites: HashMap::new() }
+        Painter {
+            text: crate::text::Text::new(),
+            labels: HashMap::new(),
+            sprites: HashMap::new(),
+        }
     }
 
     pub fn forget(&mut self, id: u64) {
@@ -87,8 +98,29 @@ impl Painter {
         self.labels.get(&key)
     }
 
+    fn label_bold(&mut self, text: &str, px: f32, rgb: (u8, u8, u8)) -> Option<&Pixmap> {
+        let key = format!("b|{text}|{px:.2}|{rgb:?}");
+        if !self.labels.contains_key(&key) {
+            let (rgba, width, height) = self.text.as_mut()?.render_bold(text, px, rgb)?;
+            let mut pix = Pixmap::new(width, height)?;
+            pix.data_mut().copy_from_slice(&rgba);
+            self.labels.insert(key.clone(), pix);
+        }
+        self.labels.get(&key)
+    }
+
     fn text_width(&mut self, text: &str, px: f32) -> f32 {
-        self.text.as_mut().and_then(|t| t.width(text, px)).unwrap_or(text.chars().count() as f32 * px * 0.5)
+        self.text
+            .as_mut()
+            .and_then(|t| t.width(text, px))
+            .unwrap_or(text.chars().count() as f32 * px * 0.5)
+    }
+
+    fn text_width_bold(&mut self, text: &str, px: f32) -> f32 {
+        self.text
+            .as_mut()
+            .and_then(|t| t.width_bold(text, px))
+            .unwrap_or(text.chars().count() as f32 * px * 0.58)
     }
 
     /// Shortens `text` with an ellipsis until it fits `max_w`.
@@ -96,12 +128,31 @@ impl Painter {
         if self.text_width(text, px) <= max_w {
             return text.to_string();
         }
+        self.elide_with(text, px, max_w, false)
+    }
+
+    fn elide_bold(&mut self, text: &str, px: f32, max_w: f32) -> String {
+        if self.text_width_bold(text, px) <= max_w {
+            return text.to_string();
+        }
+        self.elide_with(text, px, max_w, true)
+    }
+
+    fn elide_with(&mut self, text: &str, px: f32, max_w: f32, bold: bool) -> String {
         let ellipsis = "…";
+        let measure = |this: &mut Self, s: &str| {
+            if bold {
+                this.text_width_bold(s, px)
+            } else {
+                this.text_width(s, px)
+            }
+        };
+        let ellipsis_w = measure(self, ellipsis);
         let mut out = String::new();
         let mut width = 0.0;
         for ch in text.chars() {
-            let advance = self.text_width(ch.encode_utf8(&mut [0u8; 4]), px);
-            if width + advance > max_w - self.text_width(ellipsis, px) {
+            let advance = measure(self, ch.encode_utf8(&mut [0u8; 4]));
+            if width + advance > max_w - ellipsis_w {
                 break;
             }
             width += advance;
@@ -114,6 +165,7 @@ impl Painter {
     fn sprite(&mut self, card: &Card, scale: f32) -> Option<&Sprite> {
         let key = SpriteKey {
             thumb_version: card.thumb_version,
+            tag_version: card.tag_version,
             scale_milli: (scale * 1000.0) as u32,
             zoom_milli: (card.zoom * 1000.0) as u32,
             zoom_y_milli: (card.zoom_y * 1000.0) as u32,
@@ -147,18 +199,51 @@ impl Painter {
 
         // Shadow under the card and a tighter one under the pin.
         let mut shadow = Pixmap::new(sw, sh)?;
-        fill_rrect(&mut shadow, x0, y0 + 4.0 * s, card_w, card_h, radius, solid(0, 0, 0, 0.20));
+        fill_rrect(
+            &mut shadow,
+            x0,
+            y0 + 4.0 * s,
+            card_w,
+            card_h,
+            radius,
+            solid(0, 0, 0, 0.20),
+        );
         box_blur(&mut shadow, (5.0 * s).round().max(1.0) as usize);
         let mut pin_shadow = Pixmap::new(sw, sh)?;
-        fill_rrect(&mut pin_shadow, cx - pin_w / 2.0, m + 2.0 * s, pin_w, pin_h, 3.5 * s, solid(0, 0, 0, 0.28));
+        fill_rrect(
+            &mut pin_shadow,
+            cx - pin_w / 2.0,
+            m + 2.0 * s,
+            pin_w,
+            pin_h,
+            3.5 * s,
+            solid(0, 0, 0, 0.28),
+        );
         box_blur(&mut pin_shadow, (2.0 * s).round().max(1.0) as usize);
         draw_layer(&mut pix, &shadow, 0, 0);
         draw_layer(&mut pix, &pin_shadow, 0, 0);
 
         // The card pane. Windows cannot blur what is behind a layered window,
         // so this is a clean translucent pane rather than frosted glass.
-        fill_rrect(&mut pix, x0, y0, card_w, card_h, radius, solid(252, 252, 254, 0.93));
-        stroke_rrect(&mut pix, x0 + 0.5 * s, y0 + 0.5 * s, card_w - s, card_h - s, radius - 0.5 * s, 0.75 * s, solid(255, 255, 255, 0.9));
+        fill_rrect(
+            &mut pix,
+            x0,
+            y0,
+            card_w,
+            card_h,
+            radius,
+            solid(252, 252, 254, 0.93),
+        );
+        stroke_rrect(
+            &mut pix,
+            x0 + 0.5 * s,
+            y0 + 0.5 * s,
+            card_w - s,
+            card_h - s,
+            radius - 0.5 * s,
+            0.75 * s,
+            solid(255, 255, 255, 0.9),
+        );
 
         // Thumbnail.
         let thumb_y = y0 + 5.0 * s;
@@ -175,18 +260,35 @@ impl Painter {
                 let k = (thumb_w / thumb.width() as f32).max(thumb_h / thumb.height() as f32);
                 let dw = thumb.width() as f32 * k;
                 let dh = thumb.height() as f32 * k;
-                let transform = Transform::from_translate(thumb_x + (thumb_w - dw) / 2.0, thumb_y + (thumb_h - dh) / 2.0)
-                    .pre_scale(k, k);
-                let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
+                let transform = Transform::from_translate(
+                    thumb_x + (thumb_w - dw) / 2.0,
+                    thumb_y + (thumb_h - dh) / 2.0,
+                )
+                .pre_scale(k, k);
+                let paint = PixmapPaint {
+                    quality: FilterQuality::Bilinear,
+                    ..Default::default()
+                };
                 pix.draw_pixmap(0, 0, thumb.as_ref(), &paint, transform, Some(&mask));
             }
             None => {
                 // No picture yet: a tinted pane with the icon in the middle, so
                 // the card still says which application it belongs to.
-                fill_rrect(&mut pix, thumb_x, thumb_y, thumb_w, thumb_h, inner_radius, accent_gradient(card.accent, thumb_y, thumb_y + thumb_h));
+                fill_rrect(
+                    &mut pix,
+                    thumb_x,
+                    thumb_y,
+                    thumb_w,
+                    thumb_h,
+                    inner_radius,
+                    accent_gradient(card.accent, thumb_y, thumb_y + thumb_h),
+                );
                 if let Some(icon) = card.icon.as_ref() {
                     let size = 40.0 * s;
-                    let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
+                    let paint = PixmapPaint {
+                        quality: FilterQuality::Bilinear,
+                        ..Default::default()
+                    };
                     let scale = size / icon.width() as f32;
                     let at = Transform::from_translate(
                         thumb_x + (thumb_w - size) / 2.0,
@@ -198,6 +300,75 @@ impl Painter {
             }
         }
 
+        // A tag is the fastest way to find one window on a loaded line, so it
+        // gets a full-width label across the top of the thumbnail. The colour
+        // comes from the words, not from the app: two windows of the same
+        // application can still be told apart at a glance.
+        if !card.tag.is_empty() {
+            let base = tag_color(&card.tag);
+            let ink = tag_ink(base);
+            // The label is how a window is found again on a full line, so it
+            // is the largest thing on the card after the picture itself: 13 px
+            // of semibold on a 26 px band, not a caption.
+            let band_h = 26.0 * s;
+            let band_x = thumb_x + 4.0 * s;
+            let band_y = thumb_y + 4.0 * s;
+            let band_w = thumb_w - 8.0 * s;
+            fill_rrect(
+                &mut pix,
+                band_x,
+                band_y + 1.5 * s,
+                band_w,
+                band_h,
+                6.0 * s,
+                solid(0, 0, 0, 0.24),
+            );
+            fill_rrect(
+                &mut pix,
+                band_x,
+                band_y,
+                band_w,
+                band_h,
+                6.0 * s,
+                tag_gradient(base, band_y, band_y + band_h),
+            );
+            stroke_rrect(
+                &mut pix,
+                band_x + 0.5 * s,
+                band_y + 0.5 * s,
+                band_w - s,
+                band_h - s,
+                5.5 * s,
+                0.75 * s,
+                solid(255, 255, 255, 0.30),
+            );
+            // The punched hole is what makes it read as a luggage tag rather
+            // than a toolbar laid over the picture.
+            let hole = 3.5 * s;
+            fill_rrect(
+                &mut pix,
+                band_x + 7.0 * s,
+                band_y + (band_h - hole) / 2.0,
+                hole,
+                hole,
+                hole / 2.0,
+                solid(255, 255, 255, 0.82),
+            );
+            let text_x = band_x + 16.0 * s;
+            let room = (band_x + band_w - text_x - 8.0 * s).max(20.0);
+            let tag = self.elide_bold(&card.tag, 13.0 * s, room);
+            if let Some(label) = self.label_bold(&tag, 13.0 * s, ink.as_tuple()) {
+                pix.draw_pixmap(
+                    text_x.round() as i32,
+                    (band_y + (band_h - label.height() as f32) / 2.0).round() as i32,
+                    label.as_ref(),
+                    &PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+
         // Footer: application icon, window title, application name. Both lines
         // are measured first and centred as a block, so a long title or a
         // missing app name can never push text past the card's bottom edge.
@@ -205,7 +376,10 @@ impl Painter {
         let icon_size = 16.0 * s;
         let pad = 9.0 * s;
         if let Some(icon) = card.icon.as_ref() {
-            let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..Default::default() };
+            let paint = PixmapPaint {
+                quality: FilterQuality::Bilinear,
+                ..Default::default()
+            };
             let scale = icon_size / icon.width() as f32;
             let at = Transform::from_translate(x0 + pad, footer_top + (footer - icon_size) / 2.0)
                 .pre_scale(scale, scale);
@@ -216,25 +390,68 @@ impl Painter {
         let title = self.elide(&card.title, 11.5 * s, text_w);
         let app = self.elide(&card.app, 9.0 * s, text_w);
         let app_rgb = card.accent.darken(0.25).as_tuple();
-        let title_h = self.label(&title, 11.5 * s, (34, 34, 42)).map_or(0.0, |p| p.height() as f32);
-        let app_h = self.label(&app, 9.0 * s, app_rgb).map_or(0.0, |p| p.height() as f32);
+        let title_h = self
+            .label(&title, 11.5 * s, (34, 34, 42))
+            .map_or(0.0, |p| p.height() as f32);
+        let app_h = self
+            .label(&app, 9.0 * s, app_rgb)
+            .map_or(0.0, |p| p.height() as f32);
         let gap = 1.0 * s;
         let block = title_h + gap + app_h;
         let mut ty = footer_top + ((footer - block) / 2.0).max(1.0);
         if let Some(label) = self.label(&title, 11.5 * s, (34, 34, 42)) {
-            pix.draw_pixmap(text_x as i32, ty as i32, label.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            pix.draw_pixmap(
+                text_x as i32,
+                ty as i32,
+                label.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
             ty += title_h + gap;
         }
         if let Some(label) = self.label(&app, 9.0 * s, app_rgb) {
-            pix.draw_pixmap(text_x as i32, ty as i32, label.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            pix.draw_pixmap(
+                text_x as i32,
+                ty as i32,
+                label.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
         }
 
         // The clothespin, tinted with the application's accent: two windows of
         // the same app get the same clip, which is half of "who belongs to whom".
         let pin_x = cx - pin_w / 2.0;
-        fill_rrect(&mut pix, pin_x, m, pin_w, pin_h + 6.0 * s, 3.5 * s, accent_gradient(card.accent, m, m + pin_h));
-        stroke_rrect(&mut pix, pin_x, m, pin_w, pin_h + 6.0 * s, 3.5 * s, 0.6 * s, solid(255, 255, 255, 0.55));
-        fill_rrect(&mut pix, cx - 2.5 * s, m + 8.0 * s, 5.0 * s, 1.4 * s, 0.7 * s, solid(0, 0, 0, 0.28));
+        fill_rrect(
+            &mut pix,
+            pin_x,
+            m,
+            pin_w,
+            pin_h + 6.0 * s,
+            3.5 * s,
+            accent_gradient(card.accent, m, m + pin_h),
+        );
+        stroke_rrect(
+            &mut pix,
+            pin_x,
+            m,
+            pin_w,
+            pin_h + 6.0 * s,
+            3.5 * s,
+            0.6 * s,
+            solid(255, 255, 255, 0.55),
+        );
+        fill_rrect(
+            &mut pix,
+            cx - 2.5 * s,
+            m + 8.0 * s,
+            5.0 * s,
+            1.4 * s,
+            0.7 * s,
+            solid(0, 0, 0, 0.28),
+        );
 
         // Debug aid: SHAIWIN_DUMP_SPRITES=<dir> writes each card sprite once, at
         // 1:1, which is far easier to inspect than the whole translucent frame.
@@ -243,7 +460,11 @@ impl Painter {
             let _ = pix.save_png(&path);
         }
 
-        Some(Sprite { pix, pivot: (cx, m), card: (x0, y0, card_w, card_h) })
+        Some(Sprite {
+            pix,
+            pivot: (cx, m),
+            card: (x0, y0, card_w, card_h),
+        })
     }
 
     /// Draws the rope, the cards and any hint into `canvas`, which the caller
@@ -261,7 +482,9 @@ impl Painter {
     ) -> Frame {
         canvas.fill(Color::TRANSPARENT);
         let s = layout.scale;
-        draw_rope(canvas, layout, ui.y_off, ui.hot);
+        if ui.rope {
+            draw_rope(canvas, layout, ui.y_off, ui.hot);
+        }
         // A full line shrinks every card by the same factor; the sprites are
         // built at the user's zoom, so this is just a draw-time scale.
         let fit = line.fit(layout);
@@ -292,7 +515,14 @@ impl Painter {
             // The hover pop and the packed fit are both draw-time scales.
             let k = card.scale * fit;
             let transform = card_transform(sprite, pivot_x, pivot_y, angle, k);
-            canvas.draw_pixmap(0, 0, sprite.pix.as_ref(), &PixmapPaint::default(), transform, None);
+            canvas.draw_pixmap(
+                0,
+                0,
+                sprite.pix.as_ref(),
+                &PixmapPaint::default(),
+                transform,
+                None,
+            );
 
             if ui.hover == Some(card.id) {
                 draw_hover_ring(canvas, sprite, s, transform);
@@ -330,13 +560,39 @@ impl Painter {
         Frame { hits }
     }
 
-    /// The alternative to hover-to-open: a small pill at the top of the
-    /// screen that the user can click. It is the only thing drawn, so the rest
-    /// of the strip stays click-through.
-    pub fn compose_peek_into(&mut self, canvas: &mut Pixmap, layout: &LineLayout, hot: bool) -> Frame {
+    /// Draws only the rope, for the always-on-top companion window that keeps
+    /// it visible after the cards sink behind the user's work.
+    pub fn compose_rope_into(
+        &mut self,
+        canvas: &mut Pixmap,
+        layout: &LineLayout,
+        y_off: f32,
+        hot: bool,
+    ) {
+        canvas.fill(Color::TRANSPARENT);
+        draw_rope(canvas, layout, y_off, hot);
+    }
+
+    /// The way into a non-resident line: a small pill at the top of the screen
+    /// that the user can click. Hover only shows this, never the line itself.
+    /// It is the only thing drawn, so the rest of the strip stays click-through.
+    pub fn compose_peek_into(
+        &mut self,
+        canvas: &mut Pixmap,
+        layout: &LineLayout,
+        hot: bool,
+        cards: usize,
+    ) -> Frame {
         let s = layout.scale;
         canvas.fill(Color::TRANSPARENT);
-        let Some(label) = self.label(crate::i18n::t("peek_open"), 13.0 * s, (240, 243, 250)) else {
+        // The count is the reason a tucked line is not a lost line: after the
+        // auto-collapse the pill is the only proof the cards are still hanging.
+        let text = if cards == 0 {
+            crate::i18n::t("peek_open").to_string()
+        } else {
+            format!("{} · {}", crate::i18n::t("peek_open"), cards)
+        };
+        let Some(label) = self.label(&text, 13.0 * s, (240, 243, 250)) else {
             return Frame { hits: Vec::new() };
         };
         let cx = layout.width / 2.0;
@@ -350,7 +606,9 @@ impl Painter {
             right: (cx + w / 2.0).round() as i32,
             bottom: (cy + h / 2.0).round() as i32,
         };
-        Frame { hits: vec![(crate::app::PEEK_ID, rect)] }
+        Frame {
+            hits: vec![(crate::app::PEEK_ID, rect)],
+        }
     }
 }
 
@@ -377,24 +635,90 @@ fn draw_rope(canvas: &mut Pixmap, layout: &LineLayout, y_off: f32, hot: bool) {
         // be clipped on. Warm, not white: a wide white band at the top of the
         // screen reads as a system frame, which is the one thing this must not
         // look like.
-        stroke_path(canvas, &path, rope_paint(w, (255, 186, 84), 0.55), 7.0 * s, Transform::identity());
+        stroke_path(
+            canvas,
+            &path,
+            rope_paint(w, (255, 186, 84), 0.55),
+            7.0 * s,
+            Transform::identity(),
+        );
     }
-    stroke_path(canvas, &path, rope_paint(w, (0, 0, 0), 0.22), 2.2 * s, Transform::from_translate(0.0, s));
-    let core = if hot { (246, 198, 120) } else { (132, 132, 140) };
-    stroke_path(canvas, &path, rope_paint(w, core, 1.0), 1.15 * s, Transform::identity());
-    stroke_path(canvas, &path, rope_paint(w, (255, 255, 255), 0.5), 0.4 * s, Transform::from_translate(0.0, -0.35 * s));
+    stroke_path(
+        canvas,
+        &path,
+        rope_paint(w, (0, 0, 0), 0.22),
+        2.2 * s,
+        Transform::from_translate(0.0, s),
+    );
+    let core = if hot {
+        (246, 198, 120)
+    } else {
+        (132, 132, 140)
+    };
+    stroke_path(
+        canvas,
+        &path,
+        rope_paint(w, core, 1.0),
+        1.15 * s,
+        Transform::identity(),
+    );
+    stroke_path(
+        canvas,
+        &path,
+        rope_paint(w, (255, 255, 255), 0.5),
+        0.4 * s,
+        Transform::from_translate(0.0, -0.35 * s),
+    );
 }
 
 fn rope_paint(width: f32, rgb: (u8, u8, u8), alpha: f32) -> Paint<'static> {
     let stops = vec![
         GradientStop::new(0.0, Color::from_rgba8(rgb.0, rgb.1, rgb.2, 0)),
-        GradientStop::new(0.06, Color::from_rgba8(rgb.0, rgb.1, rgb.2, (alpha * 255.0) as u8)),
-        GradientStop::new(0.94, Color::from_rgba8(rgb.0, rgb.1, rgb.2, (alpha * 255.0) as u8)),
+        GradientStop::new(
+            0.06,
+            Color::from_rgba8(rgb.0, rgb.1, rgb.2, (alpha * 255.0) as u8),
+        ),
+        GradientStop::new(
+            0.94,
+            Color::from_rgba8(rgb.0, rgb.1, rgb.2, (alpha * 255.0) as u8),
+        ),
         GradientStop::new(1.0, Color::from_rgba8(rgb.0, rgb.1, rgb.2, 0)),
     ];
-    let shader = LinearGradient::new(Point::from_xy(0.0, 0.0), Point::from_xy(width, 0.0), stops, SpreadMode::Pad, Transform::identity())
-        .unwrap_or(Shader::SolidColor(Color::TRANSPARENT));
-    Paint { shader, anti_alias: true, ..Default::default() }
+    let shader = LinearGradient::new(
+        Point::from_xy(0.0, 0.0),
+        Point::from_xy(width, 0.0),
+        stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .unwrap_or(Shader::SolidColor(Color::TRANSPARENT));
+    Paint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    }
+}
+
+fn tag_gradient(base: Rgb, y0: f32, y1: f32) -> Paint<'static> {
+    let light = base.lighten(0.12);
+    let dark = base.darken(0.14);
+    let stops = vec![
+        GradientStop::new(0.0, Color::from_rgba8(light.0, light.1, light.2, 255)),
+        GradientStop::new(1.0, Color::from_rgba8(dark.0, dark.1, dark.2, 255)),
+    ];
+    let shader = LinearGradient::new(
+        Point::from_xy(0.0, y0),
+        Point::from_xy(0.0, y1),
+        stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .unwrap_or(Shader::SolidColor(Color::TRANSPARENT));
+    Paint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    }
 }
 
 fn accent_gradient(accent: Rgb, y0: f32, y1: f32) -> Paint<'static> {
@@ -404,15 +728,37 @@ fn accent_gradient(accent: Rgb, y0: f32, y1: f32) -> Paint<'static> {
         GradientStop::new(0.0, Color::from_rgba8(light.0, light.1, light.2, 255)),
         GradientStop::new(1.0, Color::from_rgba8(dark.0, dark.1, dark.2, 255)),
     ];
-    let shader = LinearGradient::new(Point::from_xy(0.0, y0), Point::from_xy(0.0, y1), stops, SpreadMode::Pad, Transform::identity())
-        .unwrap_or(Shader::SolidColor(Color::TRANSPARENT));
-    Paint { shader, anti_alias: true, ..Default::default() }
+    let shader = LinearGradient::new(
+        Point::from_xy(0.0, y0),
+        Point::from_xy(0.0, y1),
+        stops,
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+    .unwrap_or(Shader::SolidColor(Color::TRANSPARENT));
+    Paint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    }
 }
 
 fn draw_hover_ring(canvas: &mut Pixmap, sprite: &Sprite, s: f32, transform: Transform) {
     let (x0, y0, cw, ch) = sprite.card;
-    if let Some(path) = rrect_path(x0 - 1.5 * s, y0 - 1.5 * s, cw + 3.0 * s, ch + 3.0 * s, 15.0 * s) {
-        stroke_path(canvas, &path, solid(255, 255, 255, 0.85), 1.6 * s, transform);
+    if let Some(path) = rrect_path(
+        x0 - 1.5 * s,
+        y0 - 1.5 * s,
+        cw + 3.0 * s,
+        ch + 3.0 * s,
+        15.0 * s,
+    ) {
+        stroke_path(
+            canvas,
+            &path,
+            solid(255, 255, 255, 0.85),
+            1.6 * s,
+            transform,
+        );
     }
 }
 
@@ -437,7 +783,10 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
     let wash = if hot { 0.78 } else { 0.62 };
     let stops = vec![
         GradientStop::new(0.0, Color::from_rgba8(40, 45, 58, (wash * 255.0) as u8)),
-        GradientStop::new(1.0, Color::from_rgba8(18, 21, 29, (wash * 0.8 * 255.0) as u8)),
+        GradientStop::new(
+            1.0,
+            Color::from_rgba8(18, 21, 29, (wash * 0.8 * 255.0) as u8),
+        ),
     ];
     let shader = LinearGradient::new(
         Point::from_xy(x, y),
@@ -447,8 +796,18 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
         Transform::identity(),
     );
     if let (Some(path), Some(shader)) = (rrect_path(x, y, w, h, r), shader) {
-        let paint = Paint { shader, anti_alias: true, ..Default::default() };
-        canvas.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        let paint = Paint {
+            shader,
+            anti_alias: true,
+            ..Default::default()
+        };
+        canvas.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 
     // One light line along the top, where the pill meets the screen edge; the
@@ -459,12 +818,28 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
         pb.move_to(x + r, y + 0.5 * s);
         pb.line_to(x + w - r, y + 0.5 * s);
         if let Some(path) = pb.finish() {
-            stroke_path(canvas, &path, solid(255, 255, 255, 0.26), 1.0 * s, Transform::identity());
+            stroke_path(
+                canvas,
+                &path,
+                solid(255, 255, 255, 0.26),
+                1.0 * s,
+                Transform::identity(),
+            );
         }
     }
     if let Some(path) = rrect_path(x + 0.5 * s, y + 0.5 * s, w - s, h - s, r - 0.5 * s) {
-        let rim = if hot { solid(0xEF, 0x9C, 0x3B, 0.95) } else { solid(255, 255, 255, 0.10) };
-        stroke_path(canvas, &path, rim, if hot { 1.4 * s } else { 1.0 * s }, Transform::identity());
+        let rim = if hot {
+            solid(0xEF, 0x9C, 0x3B, 0.95)
+        } else {
+            solid(255, 255, 255, 0.10)
+        };
+        stroke_path(
+            canvas,
+            &path,
+            rim,
+            if hot { 1.4 * s } else { 1.0 * s },
+            Transform::identity(),
+        );
     }
 
     let paint = PixmapPaint::default();
@@ -481,8 +856,16 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
 // MARK: Shapes and paints
 
 fn solid(r: u8, g: u8, b: u8, a: f32) -> Paint<'static> {
-    let mut paint = Paint { anti_alias: true, ..Default::default() };
-    paint.set_color(Color::from_rgba8(r, g, b, (a.clamp(0.0, 1.0) * 255.0).round() as u8));
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
+    paint.set_color(Color::from_rgba8(
+        r,
+        g,
+        b,
+        (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ));
     paint
 }
 
@@ -508,24 +891,55 @@ fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
 
 fn fill_rrect(pix: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, paint: Paint<'static>) {
     if let Some(path) = rrect_path(x, y, w, h, r) {
-        pix.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pix.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stroke_rrect(pix: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, width: f32, paint: Paint<'static>) {
+fn stroke_rrect(
+    pix: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    width: f32,
+    paint: Paint<'static>,
+) {
     if let Some(path) = rrect_path(x, y, w, h, r) {
         stroke_path(pix, &path, paint, width, Transform::identity());
     }
 }
 
-fn stroke_path(canvas: &mut Pixmap, path: &Path, paint: Paint<'static>, width: f32, transform: Transform) {
-    let stroke = Stroke { width, ..Default::default() };
+fn stroke_path(
+    canvas: &mut Pixmap,
+    path: &Path,
+    paint: Paint<'static>,
+    width: f32,
+    transform: Transform,
+) {
+    let stroke = Stroke {
+        width,
+        ..Default::default()
+    };
     canvas.stroke_path(path, &paint, &stroke, transform, None);
 }
 
 fn draw_layer(dst: &mut Pixmap, layer: &Pixmap, x: i32, y: i32) {
-    dst.draw_pixmap(x, y, layer.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    dst.draw_pixmap(
+        x,
+        y,
+        layer.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
 }
 
 /// Three passes of a box blur approximate a Gaussian, which is what a shadow
@@ -546,13 +960,21 @@ fn box_blur(pix: &mut Pixmap, radius: usize) {
 fn blur_axis(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool) {
     let (lines, len) = if horizontal { (h, w) } else { (w, h) };
     let index = |line: usize, p: usize| -> usize {
-        if horizontal { (line * w + p) * 4 } else { (p * w + line) * 4 }
+        if horizontal {
+            (line * w + p) * 4
+        } else {
+            (p * w + line) * 4
+        }
     };
     let window = (2 * r + 1) as u32;
     for line in 0..lines {
         for c in 0..4 {
             let at = |p: isize| -> u32 {
-                if p < 0 || p >= len as isize { 0 } else { src[index(line, p as usize) + c] as u32 }
+                if p < 0 || p >= len as isize {
+                    0
+                } else {
+                    src[index(line, p as usize) + c] as u32
+                }
             };
             let mut sum: u32 = (0..=r as isize).map(at).sum();
             for p in 0..len {
