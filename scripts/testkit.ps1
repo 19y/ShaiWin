@@ -454,6 +454,32 @@ function Get-CardRects([string]$dir, [int]$appPid, [IntPtr]$overlay) {
   })
 }
 
+# The close button of the card under the pointer, if the frame just dumped drew
+# one. It is drawn only while the pointer is on a card, so an empty answer is
+# the normal one for every other frame - and that is worth asserting: a button
+# parked on a card nobody is pointing at would sit on top of the thumbnail.
+#
+# Kept apart from the card rectangles on purpose. A test that reads the card
+# list is counting cards, and a second rectangle per hovered card would make
+# every one of those counts wrong.
+function Get-CloseRects([string]$dir, [int]$appPid, [IntPtr]$overlay) {
+  $path = Join-Path $dir "closes-$appPid.txt"
+  Remove-Item $path -Force -ErrorAction SilentlyContinue
+  Invoke-Wm $overlay $script:KitDumpFrame ([IntPtr]::Zero) ([IntPtr]::Zero)
+  if (-not (Wait-Until ({ Test-Path $path }) 3000)) {
+    Fail "the app did not report where its close buttons are (no $path)"
+  }
+  Start-Sleep -Milliseconds 120   # the file is written in place, not swapped
+  return @(Get-Content $path | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object {
+    $f = $_ -split "`t"
+    $r = $f[2] -split ","
+    [pscustomobject]@{
+      Id = [uint64]$f[0]; Hwnd = [long]$f[1]
+      Left = [int]$r[0]; Top = [int]$r[1]; Right = [int]$r[2]; Bottom = [int]$r[3]
+    }
+  })
+}
+
 function Get-Center($rect) {
   return New-Object W+POINT -Property @{ X = [int](($rect.Left + $rect.Right) / 2); Y = [int](($rect.Top + $rect.Bottom) / 2) }
 }

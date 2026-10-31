@@ -12,6 +12,9 @@
 #      (it used to wait for a fade that took fifteen seconds)
 #   5. the line must not keep compositing at 60 Hz while nothing moves, which is
 #      what felt sticky
+#   6. the button in a card's corner lets go of the window without putting it
+#      back on the desktop - the same thing the card's menu does, and the whole
+#      point of both: a window nobody wants back must not come back
 #
 # The drag and the clicks need a pointer that can actually be moved; a session
 # with no input desktop skips those steps and still checks 4 and 5.
@@ -52,6 +55,18 @@ function Rects([IntPtr]$overlay) {
   })
 }
 function Rect-For($rects, [IntPtr]$h) { $rects | Where-Object { $_.Hwnd -eq [long]$h } | Select-Object -First 1 }
+# The close buttons, moved into the same screen coordinates as the cards, so the
+# two lists can be compared without either being converted by hand.
+function Closes([IntPtr]$overlay) {
+  $r = Get-Rect $overlay
+  @(Get-CloseRects $shotDir $script:proc.Id $overlay | ForEach-Object {
+    [pscustomobject]@{
+      Hwnd = $_.Hwnd
+      Left = $_.Left + $r.Left; Top = $_.Top + $r.Top
+      Right = $_.Right + $r.Left; Bottom = $_.Bottom + $r.Top
+    }
+  })
+}
 function Hang([IntPtr]$hwnd) { Invoke-Wm (Get-Overlay) $KitHang ([IntPtr]::Zero) ([IntPtr]$hwnd) }
 
 try {
@@ -214,7 +229,76 @@ try {
   }
   Write-Host "  four windows, four slots: $(($byLeft | ForEach-Object { $_.Left }) -join ', ')"
 
-  Write-Host "== 7. take everything down =="
+  Write-Host "== 7. letting a card go leaves its window where it was =="
+  # The whole point of the button in the corner, and of the same entry in the
+  # card's menu: the user lets go of a window because he is not going to open it
+  # again. Bringing it back would be the one thing he then has to undo by hand,
+  # so letting go must remove the card and the record and touch nothing else.
+  #
+  # The button is drawn only on the card under the pointer, which is why this
+  # step is here and not earlier: it needs four cards to prove that exactly one
+  # of them has one.
+  $gone = $byLeft[$byLeft.Count - 1]
+  $button = $null
+  if ($canPointer) {
+    # Rest on the rope just past the card first. A card on a demoted layer is
+    # behind the work, and a click there goes to whatever is really on screen -
+    # the rope is the one thing that always brings the line back.
+    [void](Move-Cursor ([int]($gone.Left - 20)) ([int]$gone.Top))
+    if (Wait-Until ({ [W]::IsTopmost($overlay) }) 2500) {
+      $target = Get-Center $gone
+      [void](Move-Cursor $target.X $target.Y)
+      $deadline = [Environment]::TickCount + 4000
+      while ([Environment]::TickCount -lt $deadline -and -not $button) {
+        $found = @(Closes $overlay)
+        if ($found.Count -gt 0) { $button = $found[0] } else { Start-Sleep -Milliseconds 150 }
+      }
+    } else {
+      $cover = Get-Coverer $overlay ([int]($gone.Left - 20)) ([int]$gone.Top)
+      Write-Host "  the cards would not come to the top in this session (coverer: '$cover')"
+    }
+  }
+
+  if ($button) {
+    if ($button.Hwnd -ne $gone.Hwnd) {
+      Fail "the close button belongs to $($button.Hwnd), not to the card under the pointer ($($gone.Hwnd))"
+    }
+    if ($button.Left -lt $gone.Left -or $button.Right -gt $gone.Right -or
+        $button.Top -lt $gone.Top -or $button.Bottom -gt $gone.Bottom) {
+      Fail "the close button at $($button.Left),$($button.Top)-$($button.Right),$($button.Bottom) is not inside its card ($($gone.Left),$($gone.Top)-$($gone.Right),$($gone.Bottom))"
+    }
+    if ($button.Left -lt [int](($gone.Left + $gone.Right) / 2) -or
+        $button.Top -gt [int](($gone.Top + $gone.Bottom) / 2)) {
+      Fail "the close button is at $($button.Left),$($button.Top), which is not the card's top-right corner"
+    }
+    Write-Host "  one card of four has a button, at $($button.Left),$($button.Top), inside the card"
+
+    $point = Get-Center $button
+    if (-not (Click-At $point.X $point.Y)) { Fail "lost cursor control" }
+  } else {
+    # No pointer, or the pointer could not reach a card that is on top of the
+    # screen. The semantics under test are the app's, not the button's, so ask
+    # the app directly - the same call the button and the menu item both end in.
+    Write-Host "  SKIPPED the button itself: it needs the pointer on a card that is on top"
+    Invoke-Wm $overlay $KitUnhook ([IntPtr]::Zero) ([IntPtr]$gone.Hwnd)
+  }
+
+  $h = [IntPtr]$gone.Hwnd
+  if (-not (Wait-Until ({ @(Rects $overlay).Count -eq 3 }) 5000)) {
+    Fail "the card survived: $(@(Rects $overlay).Count) cards are still on the line, expected 3"
+  }
+  if (Get-Record $journal $h) { Fail "the record for window $h survived letting its card go" }
+  if (-not ([W]::IsIconic($h))) {
+    Fail "window $h is no longer minimized - letting go of a card must not put the window back"
+  }
+  if (Test-OnDesktop $h) { Fail "window $h is on the desktop after its card was let go" }
+  if (-not (Test-Parked $h)) { Fail "window $h is no longer parked where the taskbar can find it" }
+  if (@(Read-Journal $journal).Count -ne 3) {
+    Fail "the journal holds $(@(Read-Journal $journal).Count) records, not the 3 the other cards still need"
+  }
+  Write-Host "  card and record gone; the window is still minimized, still not on the desktop"
+
+  Write-Host "== 8. take everything down =="
   Invoke-Wm (Get-Overlay) $KitTakeAll ([IntPtr]::Zero) ([IntPtr]::Zero)
   if (-not (Wait-Until ({ -not (Test-Path $journal) }) 8000)) { Fail "the journal survived taking everything down" }
   Write-Host "PASS"
