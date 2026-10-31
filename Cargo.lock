@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "shaiwin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "shaiwin-core",
  "shaiwin-platform-win",
@@ -138,18 +138,18 @@ dependencies = [
 
 [[package]]
 name = "shaiwin-core"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "shaiwin-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "shaiwin-core",
 ]
 
 [[package]]
 name = "shaiwin-platform-win"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "windows",
  "windows-core",
