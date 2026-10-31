@@ -61,10 +61,15 @@ pub struct Ui<'a> {
     /// the user's work, the rope lives in its own always-on-top window instead,
     /// so drawing it here too would double the line.
     pub rope: bool,
+    /// The pointer is on the hovered card's close button.
+    pub close_hot: bool,
 }
 
 pub struct Frame {
     pub hits: Vec<(u64, WRect)>,
+    /// Close buttons drawn this frame, in canvas coordinates. At most one: the
+    /// button belongs to the card under the pointer.
+    pub closes: Vec<(u64, WRect)>,
 }
 
 pub struct Painter {
@@ -490,6 +495,7 @@ impl Painter {
         let fit = line.fit(layout);
 
         let mut hits = Vec::new();
+        let mut closes = Vec::new();
         // Draw the card being dragged last, so it stays above its neighbours.
         let mut ordered: Vec<&Card> = line.cards.iter().filter(|c| !c.away).collect();
         if let Some(drag) = line.dragging {
@@ -526,6 +532,13 @@ impl Painter {
 
             if ui.hover == Some(card.id) {
                 draw_hover_ring(canvas, sprite, s, transform);
+                // The card's own way off the line, shown only while the pointer
+                // is on the card: the top-right corner is where the thumbnail's
+                // own content is, and a button parked there for every card would
+                // sit on top of it for a card the user is only looking at.
+                if let Some(rect) = draw_close(canvas, sprite, s, transform, k, ui.close_hot) {
+                    closes.push((card.id, rect));
+                }
             }
 
             // Clickable from the first frame it hangs: a card you can see is a
@@ -557,7 +570,7 @@ impl Painter {
             }
         }
 
-        Frame { hits }
+        Frame { hits, closes }
     }
 
     /// Draws only the rope, for the always-on-top companion window that keeps
@@ -593,7 +606,10 @@ impl Painter {
             format!("{} · {}", crate::i18n::t("peek_open"), cards)
         };
         let Some(label) = self.label(&text, 13.0 * s, (240, 243, 250)) else {
-            return Frame { hits: Vec::new() };
+            return Frame {
+                hits: Vec::new(),
+                closes: Vec::new(),
+            };
         };
         let cx = layout.width / 2.0;
         let cy = 44.0 * s;
@@ -608,6 +624,7 @@ impl Painter {
         };
         Frame {
             hits: vec![(crate::app::PEEK_ID, rect)],
+            closes: Vec::new(),
         }
     }
 }
@@ -617,6 +634,86 @@ fn card_transform(sprite: &Sprite, x: f32, y: f32, angle_deg: f32, scale: f32) -
         .post_rotate(angle_deg)
         .post_scale(scale, scale)
         .post_translate(x, y)
+}
+
+/// The close button's diameter and its inset from the card body's top-right
+/// corner, in logical pixels.
+const CLOSE_SIZE: f32 = 22.0;
+const CLOSE_INSET: f32 = 9.0;
+
+/// Where the close button sits on a card, in sprite coordinates: the disc's
+/// left, top and diameter.
+///
+/// It never grows past a fifth of the card. A card can be zoomed down to well
+/// under its own width, and a fixed-size disc on a small card would cover the
+/// thumbnail it is meant to sit on top of.
+fn close_button(sprite: &Sprite, s: f32) -> (f32, f32, f32) {
+    let (x0, y0, cw, _) = sprite.card;
+    let d = (CLOSE_SIZE * s).min(cw * 0.2);
+    let inset = CLOSE_INSET * s;
+    (x0 + cw - inset - d, y0 + inset, d)
+}
+
+/// Draws the close button and answers with the rectangle it occupies on the
+/// canvas, which is what a click is matched against.
+///
+/// The cross is two strokes rather than a glyph: it stays crisp at every scale
+/// and rotation without re-rasterising text, and the button is drawn per frame
+/// only for the one card under the pointer.
+fn draw_close(
+    canvas: &mut Pixmap,
+    sprite: &Sprite,
+    s: f32,
+    transform: Transform,
+    k: f32,
+    hot: bool,
+) -> Option<WRect> {
+    let (bx, by, d) = close_button(sprite, s);
+    let r = d / 2.0;
+    let cx = bx + r;
+    let cy = by + r;
+    let disc = rrect_path(bx, by, d, d, r)?;
+    canvas.fill_path(
+        &disc,
+        &solid(12, 14, 18, if hot { 0.84 } else { 0.52 }),
+        FillRule::Winding,
+        transform,
+        None,
+    );
+    stroke_path(
+        canvas,
+        &disc,
+        solid(255, 255, 255, if hot { 0.92 } else { 0.55 }),
+        1.1 * s,
+        transform,
+    );
+    let arm = d * 0.23;
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - arm, cy - arm);
+    pb.line_to(cx + arm, cy + arm);
+    pb.move_to(cx + arm, cy - arm);
+    pb.line_to(cx - arm, cy + arm);
+    if let Some(cross) = pb.finish() {
+        stroke_path(
+            canvas,
+            &cross,
+            solid(255, 255, 255, if hot { 1.0 } else { 0.84 }),
+            1.6 * s,
+            transform,
+        );
+    }
+    // The target. The card sways by a fraction of a degree, so the disc's own
+    // square is a faithful outline of where the button landed; what has to be
+    // right is the position, which is why it goes through the transform.
+    let mut c = Point::from_xy(cx, cy);
+    transform.map_point(&mut c);
+    let half = (r * k).max(5.0 * s);
+    Some(WRect {
+        left: (c.x - half).round() as i32,
+        top: (c.y - half).round() as i32,
+        right: (c.x + half).round() as i32,
+        bottom: (c.y + half).round() as i32,
+    })
 }
 
 fn draw_rope(canvas: &mut Pixmap, layout: &LineLayout, y_off: f32, hot: bool) {

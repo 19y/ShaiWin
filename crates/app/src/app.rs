@@ -355,6 +355,14 @@ pub struct App {
 
     hover: Option<u64>,
     hits: Vec<(u64, WRect)>,
+    /// The close button drawn in the last frame, in canvas coordinates. At most
+    /// one, on the card under the pointer.
+    closes: Vec<(u64, WRect)>,
+    /// The pointer is on that button, which is what makes it light up.
+    close_hot: bool,
+    /// A press that started on a close button. It acts on release, like a button
+    /// anywhere else, so a press that slides off the button cancels itself.
+    close_press: Option<u64>,
     click_through: bool,
     /// Whether the card layer is asking Windows for the top of the screen. It
     /// does that while the line is being used and gives it back the moment a
@@ -599,6 +607,9 @@ impl App {
                 frame_ms: FRAME_MS,
                 hover: None,
                 hits: Vec::new(),
+                closes: Vec::new(),
+                close_hot: false,
+                close_press: None,
                 click_through: true,
                 topmost: true,
                 rope_hwnd,
@@ -1072,7 +1083,17 @@ impl App {
             WM_LBUTTONDOWN => {
                 let point = client_point(lp);
                 crate::log!("press at {point:?}: card={:?}", self.card_at(point));
-                if let Some(id) = self.card_at(point) {
+                // The close button sits inside the card's rectangle, so it has
+                // to be answered first: it is the one place on a card that does
+                // not mean "take this window down".
+                if let Some(id) = self.close_at(point) {
+                    crate::tag_ui::close_saving();
+                    self.close_press = Some(id);
+                    unsafe {
+                        SetCapture(self.hwnd);
+                    }
+                    self.invalidate();
+                } else if let Some(id) = self.card_at(point) {
                     if id != PEEK_ID {
                         // The card layer cannot take activation, so a click on a
                         // card is not a deactivation for the tag popover. Close
@@ -1127,7 +1148,17 @@ impl App {
             }
             WM_LBUTTONUP => {
                 let point = client_point(lp);
-                if self.card_press.is_none() && self.peek_at(point) {
+                if let Some(id) = self.close_press.take() {
+                    // Released: the capture goes back before anything moves, and
+                    // the button only fires if the pointer is still on it.
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    if self.close_at(point) == Some(id) {
+                        self.unhook(id);
+                    }
+                    self.invalidate();
+                } else if self.card_press.is_none() && self.peek_at(point) {
                     self.open_from_peek();
                 } else {
                     self.finish_card_press(point);
@@ -1135,6 +1166,7 @@ impl App {
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
+                self.close_press = None;
                 self.cancel_card_press();
                 LRESULT(0)
             }
@@ -1514,20 +1546,24 @@ impl App {
         }
     }
 
-    /// Takes a window down and stops managing it. The card menu offers this;
-    /// a plain click keeps the hook so a later minimize brings the window back.
+    /// Stops managing a window: the card goes, and the record with it, and the
+    /// window is left exactly as it was - a parked one stays minimized, where
+    /// the taskbar can still find it.
+    ///
+    /// Bringing the window back is what a *click* on the card does, and that is
+    /// a different request. The reason to stop managing a window is almost
+    /// always that it is not wanted any more, so putting it back on the desktop
+    /// is work the user did not ask for, and the one thing they would then have
+    /// to undo by hand. The line is the only thing that changes.
     fn unhook(&mut self, id: u64) {
-        if let Some(card) = self.line.get_mut(id) {
-            card.unhook = true;
+        if self.line.get(id).is_none() {
+            return;
         }
-        if self.line.get(id).is_some_and(|c| c.away) {
-            self.painter.forget(id);
-            self.line.remove(id);
-            self.sync_journal();
-            self.invalidate();
-        } else {
-            self.take_down(id);
-        }
+        crate::log!("unhook {id}: card removed, the window is left as it is");
+        self.painter.forget(id);
+        self.line.remove(id);
+        self.sync_journal();
+        self.invalidate();
     }
 
     fn finish_take_down(&mut self, id: u64) {
@@ -2091,8 +2127,19 @@ impl App {
             self.hover = next_hover;
             self.invalidate();
         }
+        // The close button only exists on the hovered card, and the rectangle
+        // comes from the frame that drew it - one poll behind, like every other
+        // hit test here. Light it up while the pointer is on it: it is the one
+        // thing on a card that does not do what clicking a card does.
+        let close_hot = self.revealed && self.close_at(local).is_some();
+        if close_hot != self.close_hot {
+            self.close_hot = close_hot;
+            self.invalidate();
+        }
         let over_card = next_hover.is_some();
-        self.set_click_through(!over_card && !peek_hover && self.card_press.is_none());
+        self.set_click_through(
+            !over_card && !peek_hover && self.card_press.is_none() && self.close_press.is_none(),
+        );
 
         if self.hold_until.is_some_and(|until| now >= until) {
             self.hold_until = None;
@@ -3765,6 +3812,19 @@ impl App {
         }
         let path = dir.join(format!("hits-{}.txt", std::process::id()));
         let _ = std::fs::write(&path, text);
+        // The close buttons on their own: a test that wants to click one needs
+        // its rectangle, and mixing them into the card list would make every
+        // reader of that list count a second rectangle per hovered card.
+        let mut closes = String::new();
+        for (id, rect) in &self.closes {
+            let hwnd = self.line.get(*id).map(|card| card.hwnd).unwrap_or(0);
+            closes.push_str(&format!(
+                "{}\t{}\t{},{},{},{}\n",
+                id, hwnd, rect.left, rect.top, rect.right, rect.bottom
+            ));
+        }
+        let path = dir.join(format!("closes-{}.txt", std::process::id()));
+        let _ = std::fs::write(&path, closes);
     }
 
     /// Composes the frame into `self.canvas`. Returns false when the canvas
@@ -3803,12 +3863,14 @@ impl App {
                 hint: hint.as_deref(),
                 hot,
                 rope: self.topmost,
+                close_hot: self.close_hot,
             };
             self.painter
                 .compose_into(&mut canvas, &self.line, &self.layout, &ui)
         };
         self.canvas = Some(canvas);
         self.hits = frame.hits;
+        self.closes = frame.closes;
         true
     }
 
@@ -3874,6 +3936,24 @@ impl App {
                     && point.0 < rect.right + 4
                     && point.1 >= rect.top - 4
                     && point.1 < rect.bottom + 4
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// The close button under `point`, if one is drawn there. The rectangle
+    /// comes from the last frame, the same way a card's does.
+    ///
+    /// Not inflated like a card's: the button sits inside the card's own
+    /// rectangle, so a forgiving target would eat presses meant for the corner
+    /// under it - the card's resize handle. The drawn size is the target.
+    fn close_at(&self, point: (i32, i32)) -> Option<u64> {
+        self.closes
+            .iter()
+            .find(|(_, rect)| {
+                point.0 >= rect.left
+                    && point.0 < rect.right
+                    && point.1 >= rect.top
+                    && point.1 < rect.bottom
             })
             .map(|(id, _)| *id)
     }
