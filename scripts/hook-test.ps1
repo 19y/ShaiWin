@@ -3,7 +3,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\hook-test.ps1
 #
 # Covers the reported bugs:
-#   1. hang a window, then minimize it the way the taskbar does
+#   1. hang a window, then click its taskbar button
 #      -> the window comes back on screen instead of staying invisible
 #   2. minimize a window that is back on the desktop
 #      -> it is hung up again by itself (the hook), without ever flashing back
@@ -64,7 +64,7 @@ try {
   Write-Host "fixtures A=$a B=$b"
 
   # --- 1 and 2: the taskbar path ----------------------------------------------
-  Write-Host "== 1. hang A, then minimize it the way the taskbar does =="
+  Write-Host "== 1. hang A, then click its taskbar button =="
   Hang $a
   if (-not (Wait-Until ({ Test-Parked $a }) 5000)) { Fail "A was not parked after hanging it" }
   $rec = Record $a
@@ -72,9 +72,16 @@ try {
   if ($rec.Hooked) { Fail "a parked window should not be recorded as hooked away" }
   Write-Host "  A parked and recorded"
 
-  [void][W]::ShowWindow($a, 2)   # SW_MINIMIZE, the same thing the taskbar asks for
+  # Hanging minimizes the window where it stands, so the taskbar button is what
+  # brings it back, and SW_RESTORE is exactly what clicking it asks for. The card
+  # has to go away and the hook has to stay, or a later minimize would not hang
+  # it again. (Under the old off-screen parking the same story was told with
+  # SW_MINIMIZE - the window was visible past the right edge, and minimizing it
+  # was the button's way back. That state does not exist any more: a parked
+  # window is already minimized.)
+  [void][W]::ShowWindow($a, 9)   # SW_RESTORE, what the taskbar button asks for
   if (-not (Wait-Until ({ Test-OnDesktop $a }) 5000)) {
-    Fail "minimizing a hung window left it invisible - the reported taskbar bug"
+    Fail "clicking the taskbar button of a hung window left it invisible - the reported taskbar bug"
   }
   # The window is on the desktop as soon as Windows restores it; the hook flag
   # only follows when the app has written its journal.

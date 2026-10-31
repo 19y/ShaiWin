@@ -83,10 +83,25 @@ try {
     Fail "the cards are not drawn in the order the line keeps them: journal $(@(Order) -join ',') vs drawn $($drawn -join ',')"
   }
 
+  # The drag below is a real one, so the cards have to be on top of whatever else
+  # is on the screen: a card that another window covers is deliberately not a
+  # handle, and the click goes to that window instead - in a session with a
+  # browser over the line the app starts dragging the browser. Raise them the way
+  # the user does, by resting on the rope just past the first card. The real
+  # cursor, not the pointer hook: the hook would leave the app following a
+  # pretend pointer while the drag moves the real one, and every card would stay
+  # click-through.
+  $first = $ordered[0]
+  $last = $ordered[$ordered.Count - 1]
+  $cardsUp = $false
   if ($canPointer) {
+    [void](Move-Cursor ([int]($first.Left - 20)) ([int]$first.Top))
+    $cardsUp = Wait-Until ({ [W]::IsTopmost($overlay) }) 2500
+    if (-not $cardsUp) { Write-Host "  the cards would not come to the top in this session" }
+  }
+
+  if ($canPointer -and $cardsUp) {
     Write-Host "== 2. drag the last card to the front of the line =="
-    $first = $ordered[0]
-    $last = $ordered[$ordered.Count - 1]
     $from = Get-Center $last
     $to = Get-Center $first
     if (-not (Drag-From-To $from.X $from.Y $to.X $to.Y 10)) { Fail "lost cursor control during the drag" }
@@ -143,7 +158,7 @@ try {
     }
     Write-Host "  the clothespin is part of the card"
   } else {
-    Write-Host "== 2-4. SKIPPED: this session has no pointer to move =="
+    Write-Host "== 2-4. SKIPPED: no pointer to move, or the cards cannot hold the top in this session =="
     $d = New-Fixture "D" 3
     Hang $d
     if (-not (Wait-Until ({ @(Rects $overlay).Count -eq 4 }) 6000)) {

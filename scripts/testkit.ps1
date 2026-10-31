@@ -333,13 +333,25 @@ function Test-CursorControl {
   return $ok
 }
 
-# The app parks a hung window past the right edge of the virtual desktop, so
-# where a window physically is tells us what was done to it.
+# The app parks a hung window by minimizing it where it stands. Minimizing is
+# the one "parked" state Windows itself can undo: the window keeps the rectangle
+# it came from, so the taskbar, Alt+Tab and a click on its button all bring it
+# back where the user left it. Moving it past the right edge of the virtual
+# desktop was the old way, and it was a trap - only the process that moved it
+# could undo that, so a killed ShaiWin left the window off screen with nothing
+# to click. "Parked" is that state: minimized, still remembering a place on
+# screen to come back to.
 function Test-Parked([IntPtr]$h) {
-  $r = Get-Rect $h
-  if (-not $r) { return $false }
+  if (-not [W]::IsIconic($h)) { return $false }
+  $wp = Get-Placement $h
+  if (-not $wp) { return $false }
   $v = Get-VirtualBounds
-  return ($r.Left -gt ($v.Right - 4))
+  $r = $wp.rcNormalPosition
+  # "On screen" is what the app means by it - the rectangle meets a monitor -
+  # not "fits inside one": a window can hang off an edge by a few pixels and
+  # still be exactly where the user left it.
+  return ($r.Left -lt $v.Right -and $r.Right -gt $v.Left -and
+          $r.Top -lt $v.Bottom -and $r.Bottom -gt $v.Top)
 }
 
 function Test-OnDesktop([IntPtr]$h) {

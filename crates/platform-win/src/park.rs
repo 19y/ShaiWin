@@ -419,10 +419,13 @@ pub fn restore(hwnd: HWND, parked: &Parked) -> bool {
         // there when the card comes down.
         let animate = !transitions(hwnd, false);
         let applied = placement.apply(hwnd);
-        // A window that is off screen (or busy) can ignore SetWindowPlacement.
-        // Verify, then move it by hand: silently leaving it parked while the
-        // card disappears would strand it.
-        if !applied {
+        // A window that is off screen, minimized, or busy can ignore
+        // SetWindowPlacement - and a minimized one reports success while doing
+        // it: it comes back to the rectangle it remembers instead of the one it
+        // was just given, which is how a window dragged onto the line came back
+        // where it was dragged from instead of in the middle of the screen. The
+        // call's own answer is not the test; where the window ended up is.
+        if !applied || !at_target(hwnd, &placement) {
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }

@@ -58,6 +58,17 @@ function Park-Cursor {
   $v = Get-VirtualBounds
   [void](Move-Cursor ([int](($v.Left + $v.Right) / 2)) ([int]($v.Bottom - 80)))
 }
+# The drags in this test are real ones, so the cards have to be on top of whatever
+# else is on the screen: a card that another window covers is deliberately not a
+# handle, and the click goes to that window instead. Rest on the rope just past
+# the card and wait for the line to come up. The real cursor, not the pointer
+# hook: the hook would leave the app following a pretend pointer while the drag
+# moves the real one, and every card would stay click-through. Parking the cursor
+# between steps sinks the cards again, so every drag starts with this.
+function Raise-Line([IntPtr]$overlay, $card) {
+  [void](Move-Cursor ([int]($card.Left - 20)) ([int]$card.Top))
+  return (Wait-Until ({ [W]::IsTopmost($overlay) }) 2500)
+}
 
 try {
   Write-Host "== 0. start and hang two windows =="
@@ -80,7 +91,17 @@ try {
   if (-not $a0 -or -not $b0) { Fail "the two cards are not both on the line" }
   Write-Host "  A $($a0.Left),$($a0.Top) $($a0.Width)x$($a0.Height); B $($b0.Left),$($b0.Top) $($b0.Width)x$($b0.Height)"
 
+  # The drags below are real ones, so the cards have to be on top of whatever else
+  # is on the screen: a card that another window covers is deliberately not a
+  # handle, and the click goes to that window instead. Raise them the way the user
+  # does, by resting on the rope just past A's left edge.
+  $cardsUp = $false
   if ($canPointer) {
+    $cardsUp = Raise-Line $overlay $a0
+    if (-not $cardsUp) { Write-Host "  the cards would not come to the top in this session" }
+  }
+
+  if ($canPointer -and $cardsUp) {
     Write-Host "== 1. drag A's left edge outwards =="
     $grabY = [int](($a0.Top + $a0.Bottom) / 2)
     $from = $a0.Left + 4
@@ -103,6 +124,9 @@ try {
     if ($a1.Right -gt $b1.Left + 2) { Fail "the widened card covers B: A ends at $($a1.Right), B starts at $($b1.Left)" }
 
     Write-Host "== 1c. drag A's bottom edge down =="
+    # Parking the cursor after the width drag sank the cards; a real drag needs
+    # them on top again.
+    if (-not (Raise-Line $overlay $a1)) { Fail "the cards would not come back to the top for the height drag" }
     $dragX = [int](($a1.Left + $a1.Right) / 2)
     $fromY = $a1.Bottom - 4
     if (-not (Drag-From-To $dragX $fromY $dragX ($fromY + 70) 10)) { Fail "lost cursor control during the height resize" }
@@ -120,7 +144,7 @@ try {
     Write-Host "  recorded height zoom: $zoomY"
     if ($zoomY -lt 1.1) { Fail "the journal did not keep the new height (zoom_y $zoomY)" }
   } else {
-    Write-Host "== 1. SKIPPED: this session has no pointer to move =="
+    Write-Host "== 1. SKIPPED: no pointer to move, or the cards cannot hold the top in this session =="
     Write-Host "== 1c. the bottom edge, driven by window messages =="
     # The same press, moves and release the window manager would deliver, in
     # panel coordinates. It cannot test the hit-test or the capture; what it
@@ -188,6 +212,7 @@ try {
 
   if ($canPointer) {
     Write-Host "== 3. drag A's face past B =="
+    if (-not (Raise-Line $overlay $a2)) { Fail "the cards would not come back to the top for the move drag" }
     $b2 = Rect-For (Rects $overlay) $b
     $grab = Get-Center $a2
     $target = $b2.Right + 240

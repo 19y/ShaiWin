@@ -71,7 +71,7 @@ try {
     Invoke-Wm $overlay $script:Hang ([IntPtr]::Zero) ([IntPtr]$one.Hwnd)
     $hwnd = $one.Hwnd
     if (-not (Wait-Until ({ Test-Parked $hwnd }) 8000)) {
-      Fail "$($one.Name) was never moved off screen"
+      Fail "$($one.Name) was never hung up on the line"
     }
     # The frame line is written by the paint that follows the park, so let it land.
     Start-Sleep -Milliseconds 500
@@ -84,7 +84,7 @@ try {
     $hex = "0x{0:x}" -f [long]$one.Hwnd
     $ask = Find-Line $log "hang ${dec}: preparing"
     $shot = Find-Line $log "shot ${hex}:"
-    $parked = Find-Line $log "parked hwnd=${dec} at"
+    $parked = Find-Line $log "parked hwnd=${dec} minimized="
     $drawn = Find-Line $log "card ${dec} drawn"
     if (-not $ask -or -not $shot -or -not $parked -or -not $drawn) {
       Fail ("$($one.Name) has an incomplete chain in the log (ask=$([bool]$ask) " +

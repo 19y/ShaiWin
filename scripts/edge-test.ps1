@@ -52,8 +52,18 @@ try {
   Write-Host "  one record, A parked"
 
   Write-Host "== 2. put the parked window back by hand =="
-  [void][W]::SetWindowPos($a, [IntPtr]::Zero, $origin.Left, $origin.Top, ($origin.Right - $origin.Left), ($origin.Bottom - $origin.Top), 0x0004)
+  # A parked window is minimized, so putting it back by hand is what clicking its
+  # taskbar button does: restore it. (Under the old off-screen parking this was a
+  # SetWindowPos back onto the desktop - there was a visible window to drag. A
+  # minimized one has to be restored instead.)
+  [void][W]::ShowWindow($a, 9)   # SW_RESTORE
   if (-not (Wait-Until ({ Test-OnDesktop $a }) 5000)) { Fail "A did not come back on screen" }
+  $backA = Get-Rect $a
+  if ($backA) {
+    $dx = [Math]::Abs($backA.Left - $origin.Left)
+    $dy = [Math]::Abs($backA.Top - $origin.Top)
+    if ($dx -gt 8 -or $dy -gt 8) { Fail "A came back at $($backA.Left),$($backA.Top) instead of $($origin.Left),$($origin.Top)" }
+  }
   if (-not (Wait-Until ({ (Get-Record $journal $a).Hooked }) 5000)) { Fail "the hook was lost when the window was put back by hand" }
   if ((Count-Records) -ne 1) { Fail "the record was duplicated or dropped" }
   # Putting it back by hand is not the same as cancelling the hook, so a

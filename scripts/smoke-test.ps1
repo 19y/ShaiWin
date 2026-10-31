@@ -74,7 +74,7 @@ try {
   $origin = Get-Rect $a
   Write-Host "target hwnd $a at $($origin.Left),$($origin.Top) $($origin.Right - $origin.Left)x$($origin.Bottom - $origin.Top)"
   Invoke-Wm $overlay $KitHang ([IntPtr]::Zero) ([IntPtr]$a)
-  if (-not (Wait-Until ({ Test-Parked $a }) 5000)) { Fail "the window was not parked off screen" }
+  if (-not (Wait-Until ({ Test-Parked $a }) 5000)) { Fail "the window was not hung up on the line" }
   if (-not (Test-Path $journal)) { Fail "parked.txt was not written" }
   Copy-Item $journal (Join-Path $env:TEMP "shaiwin-journal-copy.txt") -Force
   if (-not (Wait-Visibility $overlay $true 2500)) { Fail "the line did not appear after hanging a window" }
@@ -90,7 +90,7 @@ try {
   if (-not (Wait-Visibility $overlay $true 2500)) { Fail "the recovered line is not visible" }
   if (-not (Test-Parked $a)) { Fail "the recovered window is not parked any more" }
   Request-Dump (Join-Path $shotDir "shot-02.png")
-  Write-Host "  recovered, window still parked at $((Get-Rect $a).Left)"
+  Write-Host "  recovered, window still hung up where it was: $((Get-Placement $a).rcNormalPosition.Left),$((Get-Placement $a).rcNormalPosition.Top)"
 
   Write-Host "== 4. take everything down =="
   Invoke-Wm $overlay $KitTakeAll ([IntPtr]::Zero) ([IntPtr]::Zero)

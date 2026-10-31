@@ -57,10 +57,10 @@ function Invoke-Case([string]$name, [IntPtr]$h, [bool]$wantZoomed) {
   Write-Host ("  leaving {0},{1} {2}x{3}" -f $before.Left, $before.Top, ($before.Right - $before.Left), ($before.Bottom - $before.Top))
 
   Invoke-Wm (Get-Overlay) $script:KitHang ([IntPtr]::Zero) ([IntPtr]$h)
-  # A maximized window is taken off screen by minimizing it (moving it would
-  # drop it out of the maximized state); a normal window is parked past the
-  # right edge. Both mean the window is on the line.
-  $wentUp = if ($wantZoomed) { { [W]::IsIconic($h) } } else { { Test-Parked $h } }
+  # Hanging minimizes the window where it stands, maximized or not: that is the
+  # only parked state the user can undo from the taskbar, and the only one that
+  # survives ShaiWin being killed. Both cases mean the window is on the line.
+  $wentUp = { Test-Parked $h }
   if (-not (Wait-Until $wentUp 6000)) { Fail "${name}: the window never went up to the line" }
   # A window hung up by hotkey (or by message, which is the same path) comes
   # back where it was, so its record must not ask for the middle of the screen.
