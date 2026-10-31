@@ -123,6 +123,9 @@ struct Dialog {
     /// True once the window is on its way out, so a deactivation fired by
     /// `DestroyWindow` cannot commit a cancelled edit.
     closing: bool,
+    /// The blink tick is in its dark half: the caret is hidden right now and the
+    /// next tick shows it again. See [`keep_caret`].
+    caret_dark: bool,
 }
 
 /// The field is the stock control plus two keys. Nothing else of ours may sit
@@ -321,6 +324,7 @@ pub fn open(
             pressed: Hit::None,
             ready: false,
             closing: false,
+            caret_dark: false,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         OPEN.store(hwnd.0 as isize, Ordering::Relaxed);
@@ -366,10 +370,10 @@ pub fn open(
             // as a picture of an input box. Showing it again now that the window
             // is up is what makes it flash.
             restart_caret(edit);
-            // ...and again on every blink period, because that clock stops on
-            // its own a few seconds later: measured here as a caret left in the
-            // "on" phase for good, with the popover still foreground, active and
-            // focused. See `keep_caret`.
+            // ...and then on every blink period, alternating: this tick hides it,
+            // the next shows it. Re-showing it on *every* tick was the caret left
+            // solid, because a shown caret starts flashing again and so never gets
+            // to be dark. See `keep_caret`.
             let _ = SetTimer(Some(hwnd), CARET_TIMER, blink_ms(), None);
         }
         (*state).ready = true;
@@ -390,9 +394,9 @@ unsafe fn restart_caret(edit: HWND) {
     }
 }
 
-/// How often the caret is re-shown: once per blink period, so the tick lands on
-/// the moment Windows would have shown it anyway. A field whose blink clock is
-/// still running therefore looks exactly as it would without us.
+/// How often the caret changes phase: one blink period, so a full cycle is dark
+/// for one of them and lit for the next - the rhythm Windows itself would have
+/// kept if its clock had not stopped.
 fn blink_ms() -> u32 {
     let blink = unsafe { GetCaretBlinkTime() };
     // 0xFFFF_FFFF means the user asked for no blinking at all; 530 ms is the
@@ -404,21 +408,48 @@ fn blink_ms() -> u32 {
     }
 }
 
-/// Restarts the field's blink clock, if the field is the one with the focus.
+/// Turns the field's caret over: lit, dark, lit. Only while the field is the one
+/// with the focus.
 ///
-/// Windows stops that clock on its own a few seconds after the popover opens
+/// Windows stops the blink clock on its own a few seconds after the popover opens
 /// and leaves the caret painted in whichever phase it was in - a still bar in a
 /// field that is perfectly ready to be typed into. Nothing else brings it back:
 /// measured with the popover foreground, active and focused, `SetCaretBlinkTime`
 /// and `SetFocus` changed nothing, and neither did input; only showing the
-/// caret again restarts the clock. Doing that once per blink period is cheap
-/// and invisible.
-unsafe fn keep_caret(edit: HWND) {
+/// caret again restarts the clock.
+///
+/// Showing it again on every tick, though, is what made the caret stop blinking
+/// for good: `ShowCaret` documents that a caret which becomes visible "begins
+/// flashing automatically", so a tick landing in the dark half lights it, and a
+/// tick landing in the lit half restarts the clock and postpones the dark half.
+/// Either way it never gets to be dark, and a caret that is always lit is a caret
+/// that does not blink. Hiding it on the ticks between the shows is the half that
+/// was missing, and the shows keep restarting the system clock on top of it, so
+/// the two agree on the same rhythm whether or not that clock is still alive.
+///
+/// Every hide is answered by the next show, which matters: the caret's hiding is
+/// cumulative, and two hides in a row is answered only by two shows.
+unsafe fn keep_caret(edit: HWND, dark: &mut bool) {
     unsafe {
-        if edit.is_invalid() || GetFocus() != edit {
+        if edit.is_invalid() {
             return;
         }
-        restart_caret(edit);
+        if GetFocus() != edit {
+            // Not the field's turn. Leave it lit: the stock control shows its own
+            // caret when it gets the focus back, and a caret left dark by the last
+            // tick would be a field that looks like it cannot be typed into.
+            if *dark {
+                let _ = ShowCaret(Some(edit));
+                *dark = false;
+            }
+            return;
+        }
+        if *dark {
+            let _ = ShowCaret(Some(edit));
+        } else {
+            let _ = HideCaret(Some(edit));
+        }
+        *dark = !*dark;
     }
 }
 
@@ -893,6 +924,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         // Becoming active later is the other moment Windows can
                         // leave a painted-but-still caret behind.
                         restart_caret(state.edit);
+                        // That restart leaves it lit, so the tick after it is the
+                        // dark half of the blink.
+                        (*ptr).caret_dark = false;
                     }
                 }
                 LRESULT(0)
@@ -994,7 +1028,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_TIMER if wp.0 == CARET_TIMER => {
                 if !ptr.is_null() {
-                    keep_caret((*ptr).edit);
+                    let state = &mut *ptr;
+                    keep_caret(state.edit, &mut state.caret_dark);
                 }
                 LRESULT(0)
             }
