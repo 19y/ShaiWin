@@ -35,7 +35,17 @@
 #   11. the strip is not a way back up, and it is not the whole overlay window
 #      either: the cards linger `SINK_GRACE` after the pointer leaves the strip
 #      and then go, and a point below the cards is already his work
-#   12. Escape puts a resident line away as well
+#   11. Escape puts a resident line away as well
+#   12. pressing the bubble's button is the other answer to the sentence: the
+#       layer takes the click only where the button is - not on the sentence -
+#       and the press stands the explanation down for good
+#   13. a run that starts already knowing never explains again
+#
+#  The explanation of the raise gesture is checked where it happens: it is up
+#  while the cards are down (0b); taking the rope only ends that showing, so the
+#  next sink puts the bubble straight back up (5); a click on the sentence is not
+#  an answer at all (12); and only pressing "don't remind me" stands it down for
+#  good, for this run and every later one (12, 13).
 #
 # It uses its own LOCALAPPDATA so it can never touch the real journal, and it
 # takes any running instance's windows down before stopping it.
@@ -47,8 +57,10 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\testkit.ps1"
 
 $root = Join-Path $env:TEMP "shaiwin-zorder"
+$ackRoot = Join-Path $env:TEMP "shaiwin-zorder-ack"
 # Resident, because a line that hides itself would answer the wrong question.
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
+$resident = "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
+$state = New-Sandbox $root $resident
 Initialize-Fixtures $root
 
 $shotDir = Join-Path $env:TEMP "shaiwin-zorder-shots"
@@ -116,6 +128,30 @@ try {
   }
   Write-Host "  the hang left the cards down and the rope layer marks the line"
 
+  Write-Host "== 0b. the rope explains the gesture while the cards are down =="
+  # The one gesture nobody guesses from looking at a line: with the cards behind
+  # his window, resting on the rope is the only way back. It has to be said on
+  # the rope's own layer, because that is the only layer still above his work -
+  # and it has to be said where a test can see it, not merely intended.
+  $hint = Get-HintRect $shotDir $proc.Id $overlay
+  if (-not $hint) {
+    Fail "the rope never explained the raise gesture while the cards were down"
+  }
+  if ($hint.Top -lt $ropeY -or ($hint.Right - $hint.Left) -lt 40) {
+    Fail "the explanation is not a bubble hanging under the rope: $hint"
+  }
+  # The button is a place of its own inside the sentence's bubble, not the whole
+  # of it: that is what makes "only the button answers a click" testable at all.
+  if ($hint.Chip.Left -le $hint.Body.Left -or $hint.Chip.Right -gt $hint.Body.Right -or
+      ($hint.Body.Right - $hint.Body.Left) - 2 * ($hint.Chip.Right - $hint.Chip.Left) -lt 40) {
+    Fail "the bubble has no sentence beside its button: body=$($hint.Body) chip=$($hint.Chip)"
+  }
+  $logText = @(Get-Content (Join-Path $state "ShaiWin\shaiwin.log") -ErrorAction SilentlyContinue)
+  if (@($logText | Where-Object { $_ -match "the rope explains the raise gesture" }).Count -lt 1) {
+    Fail "the bubble was drawn but the log never saw it"
+  }
+  Write-Host "  the bubble is up under the rope, $($hint.Right - $hint.Left) x $($hint.Bottom - $hint.Top), button $(($hint.Chip.Right - $hint.Chip.Left)) x $(($hint.Chip.Bottom - $hint.Chip.Top))"
+
   Write-Host "== 1. his work window is in front of the cards =="
   if (-not (Wait-Until ({ -not [W]::IsAbove($overlay, $b) }) 2500)) {
     Fail "the cards stayed painted over the window he moved to"
@@ -182,6 +218,21 @@ try {
   }
   Write-Host "  the rope raised the cards and stepped out of the way"
 
+  # Taking the rope is the gesture, not the acknowledgement. It ends this
+  # showing because the layer the bubble is drawn on goes away with the raise -
+  # it does not stand the explanation down. That distinction is only visible on
+  # the next sink, which is what step 5 asserts; step 12 is where the press that
+  # does say "don't remind me" is tested.
+  $settingsText = @(Get-Content (Join-Path $state "ShaiWin\settings.txt") -ErrorAction SilentlyContinue)
+  if ($settingsText -match "^raise_known=1$") {
+    Fail "taking the rope stood the explanation down for good; only the press may do that"
+  }
+  $logText = @(Get-Content (Join-Path $state "ShaiWin\shaiwin.log") -ErrorAction SilentlyContinue)
+  if (@($logText | Where-Object { $_ -match "stands down" }).Count -ne 0) {
+    Fail "the line recorded an answer the user never gave"
+  }
+  Write-Host "  a rope raise only ended that showing; nothing has been answered"
+
   Write-Host "== 4. once up, staying on a card keeps them up =="
   Point-At $overlay $cardX $cardY
   Start-Sleep -Milliseconds 700
@@ -199,6 +250,23 @@ try {
     Fail "the rope layer did not come back when the cards sank"
   }
   Write-Host "  behind his window again, rope on top"
+
+  # And it says the sentence again, right away: one bubble per sinking of the
+  # cards is the whole rule, so a second sink buys a second showing without any
+  # quiet stretch in between. The log is what proves the second showing rather
+  # than a lucky dump - waiting on the picture alone would also be satisfied by
+  # the first bubble still standing.
+  $again = Wait-Until ({
+    @((Get-Content (Join-Path $state "ShaiWin\shaiwin.log") -ErrorAction SilentlyContinue) |
+      Where-Object { $_ -match "the rope explains the raise gesture" }).Count -ge 2
+  }) 6000
+  if (-not $again) {
+    Fail "the line stayed quiet on the second sinking after a rope raise he never acknowledged"
+  }
+  if (-not (Get-HintRect $shotDir $proc.Id $overlay)) {
+    Fail "the log says it explained the gesture again, but no bubble was on the rope"
+  }
+  Write-Host "  explained again on this sinking: he has not pressed 'don't remind me'"
 
   Write-Host "== 6. the grab band is wider than the rope, but bounded =="
   # 14 logical px each way (core::layout::ROPE_REACH). The stroke is a couple of
@@ -398,10 +466,139 @@ try {
 
   Invoke-Wm $overlay $KitTakeAll ([IntPtr]::Zero) ([IntPtr]::Zero)
   Start-Sleep -Milliseconds 500
+
+  Write-Host "== 12. pressing the bubble's button is the other answer =="
+  # Taking the rope is one proof the sentence landed; pressing "don't remind me"
+  # is the other, and it is a click on a layer that is click-through everywhere
+  # else. Both halves of that click have to be asked: where the window proc would
+  # take a real one, and what the press actually does. The bubble's own body is
+  # deliberately not a target - a click that lands on the sentence is a click on
+  # his work, because turning a stray click into "he read it" is how a prompt
+  # retires itself before anyone has. It needs a run of its own - by now this
+  # one's settings already say the user knows.
+  Stop-ShaiwinWithEverythingDown
+  $ackState = New-Sandbox $ackRoot $resident
+  $proc = Start-Shaiwin $Exe $ackState
+  Start-Sleep -Milliseconds 1400
+  $overlay = Get-Overlay
+  $rope = Get-Rope
+  if (-not (Test-Window $overlay)) { Fail "the restarted line was not created" }
+  if (-not (Test-Window $rope)) { Fail "the restarted line has no rope layer" }
+  Invoke-Wm $overlay $KitHang ([IntPtr]::Zero) ([IntPtr]$a)
+  if (-not (Wait-Until ({ (Test-Cards $overlay) -ge 1 }) 8000)) {
+    Fail "the restarted line did not take the window"
+  }
+  Point-At $overlay $workPointX $workPointY
+  if (-not (Wait-Until ({ -not [W]::IsTopmost($overlay) }) 2500)) {
+    Fail "the restarted line kept the top while the pointer was on his window"
+  }
+  $hint = Get-HintRect $shotDir $proc.Id $overlay
+  if (-not $hint) { Fail "the restarted line never explained the gesture" }
+  $strip = Get-Rect $overlay
+  $chipX = [int]($strip.Left + ($hint.Chip.Left + $hint.Chip.Right) / 2)
+  $chipY = [int]($strip.Top + ($hint.Chip.Top + $hint.Chip.Bottom) / 2)
+  # The sentence's own half of the bubble: inside the body, clear of the button.
+  $bodyX = [int]($strip.Left + $hint.Body.Left + 6)
+  $bodyY = [int]($strip.Top + ($hint.Body.Top + $hint.Body.Bottom) / 2)
+  if ($bodyX -ge ($strip.Left + $hint.Chip.Left)) {
+    Fail "the button is the whole bubble, so the sentence has no place of its own: $hint"
+  }
+
+  # One button wide, and nothing else: the rope layer is the strip, so a hit-test
+  # that said HTCLIENT anywhere would eat a click meant for the top of his work -
+  # including the sentence, which is the part he only has to read.
+  $bareX = [int]($strip.Left + 8)
+  $bareY = [int]($strip.Top + 2)
+  if ((Get-HitTest $rope $chipX $chipY) -ne 1) {
+    Fail "a click on the button would not reach it; the rope layer answered HTTRANSPARENT"
+  }
+  if ((Get-HitTest $rope $bodyX $bodyY) -ne -1) {
+    Fail "the rope layer would take a click on the sentence, which is not a button"
+  }
+  if ((Get-HitTest $rope $bareX $bareY) -ne -1) {
+    Fail "the rope layer would take a click somewhere other than its button"
+  }
+  # The style bit has to agree with the hit-test, or the click is gone before the
+  # window proc ever sees it. Over the sentence the layer stays transparent; over
+  # the button it stops being so.
+  Point-At $overlay $bodyX $bodyY
+  if (-not (Wait-Until ({ [W]::IsClickThrough($rope) }) 1500)) {
+    Fail "the layer stopped letting clicks through with the pointer on the sentence"
+  }
+  Point-At $overlay $chipX $chipY
+  if (-not (Wait-Until ({ -not [W]::IsClickThrough($rope) }) 1500)) {
+    Fail "the rope layer stayed click-through with the pointer on its button"
+  }
+  Write-Host "  the button is the one place on the rope layer that takes a click"
+
+  $ropeRect = Get-Rect $rope
+  # A click on the sentence first: it is his work's click, and it answers nothing.
+  Post-Mouse $rope $KitMouseUp ($bodyX - $ropeRect.Left) ($bodyY - $ropeRect.Top)
+  Start-Sleep -Milliseconds 500
+  if (@((Get-Content (Join-Path $ackState "ShaiWin\settings.txt") -ErrorAction SilentlyContinue) |
+        Where-Object { $_ -match "^raise_known=1$" }).Count -ne 0) {
+    Fail "a click on the sentence stood the explanation down"
+  }
+  Point-At $overlay $chipX $chipY
+  if (-not (Get-HintRect $shotDir $proc.Id $overlay)) {
+    Fail "the bubble went away on a click that was not its button"
+  }
+
+  # Then the press that is its button, in the rope window's own client pixels.
+  Post-Mouse $rope $KitMouseUp ($chipX - $ropeRect.Left) ($chipY - $ropeRect.Top)
+  # Waiting on the settings the press writes, not on the log line: the message is
+  # posted, so the app has not run the handler yet when this reads.
+  if (-not (Wait-Until ({
+        @((Get-Content (Join-Path $ackState "ShaiWin\settings.txt") -ErrorAction SilentlyContinue) |
+          Where-Object { $_ -match "^raise_known=1$" }).Count -eq 1
+      }) 3000)) {
+    Write-Host "  last lines of the log:"
+    Get-Content (Join-Path $ackState "ShaiWin\shaiwin.log") -Tail 10 -ErrorAction SilentlyContinue |
+      ForEach-Object { Write-Host "    $_" }
+    Fail "pressing the button did not stand the explanation down"
+  }
+  $ackLog = @(Get-Content (Join-Path $ackState "ShaiWin\shaiwin.log") -ErrorAction SilentlyContinue)
+  if (@($ackLog | Where-Object { $_ -match "stands down: he pressed the bubble's button" }).Count -ne 1) {
+    Fail "the press was remembered without recording how it was answered"
+  }
+  if (Get-HintRect $shotDir $proc.Id $overlay) {
+    Fail "the bubble was still drawn after he pressed its button"
+  }
+  # Back to letting clicks through: the layer is the whole strip, and the strip
+  # belongs to his work the moment its bubble is answered.
+  if (-not (Wait-Until ({ [W]::IsClickThrough($rope) }) 1500)) {
+    Fail "the rope layer kept taking clicks after its button was pressed"
+  }
+  Write-Host "  pressed once, explained never again on this run"
+
+  Write-Host "== 13. a later run that already knows stays quiet =="
+  Stop-ShaiwinWithEverythingDown
+  $proc = Start-Shaiwin $Exe $ackState
+  Start-Sleep -Milliseconds 1400
+  $overlay = Get-Overlay
+  $rope = Get-Rope
+  if (-not (Test-Window $overlay)) { Fail "the second restart was not created" }
+  Invoke-Wm $overlay $KitHang ([IntPtr]::Zero) ([IntPtr]$a)
+  if (-not (Wait-Until ({ (Test-Cards $overlay) -ge 1 }) 8000)) {
+    Fail "the second restart did not take the window"
+  }
+  Point-At $overlay $workPointX $workPointY
+  if (-not (Wait-Until ({ -not [W]::IsTopmost($overlay) }) 2500)) {
+    Fail "the second restart kept the top over his window"
+  }
+  if (-not (Wait-Until ({ [W]::IsWindowVisible($rope) -and [W]::IsTopmost($rope) }) 2000)) {
+    Fail "the second restart left no rope on screen; the silence below would prove nothing"
+  }
+  if (Get-HintRect $shotDir $proc.Id $overlay) {
+    Fail "a run that started already knowing explained the gesture again"
+  }
+  Write-Host "  no sentence for a user who pressed 'don't remind me' in an earlier run"
+
   Write-Host "PASS"
 } finally {
   Stop-ShaiwinWithEverythingDown
   Remove-Fixtures
   Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item $ackRoot -Recurse -Force -ErrorAction SilentlyContinue
   Write-Host "cleaned up"
 }

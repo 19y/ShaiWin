@@ -152,6 +152,21 @@ const PEEK_LIFE: Duration = Duration::from_secs(6);
 /// this long before the cards come back. Short enough to feel immediate, long
 /// enough that passing over the rope does not cover the window being used.
 const RAISE_DWELL: Duration = Duration::from_millis(140);
+/// How long the bubble that explains the raise gesture hangs under the rope.
+///
+/// Long enough to read a sentence, short enough that a line nobody is using does
+/// not keep a plate of text over the top of somebody's window. It comes back
+/// every time the cards sink - once per sinking - until he presses the bubble's
+/// "don't remind me", which is the only answer that stops it for good.
+const RAISE_HINT_LIFE: Duration = Duration::from_secs(6);
+/// The bubble's button is a target, so a pointer that has come to it - to read
+/// the last words or to press them - must not have the bubble leave mid-reach.
+/// While the pointer is on the bubble its deadline is held out this far.
+const RAISE_HINT_TAIL: Duration = Duration::from_millis(1200);
+/// The bubble's last stretch, during which the whole thing fades. A prompt that
+/// stops abruptly looks like a glitch; one that visibly runs out reads as
+/// something that will come back when it is needed again.
+const RAISE_HINT_FADE: Duration = Duration::from_millis(900);
 /// How long the cards stay up after the pointer leaves the line's strip.
 ///
 /// Reaching for a card at the far end of the line is a diagonal move that can
@@ -431,6 +446,34 @@ pub struct App {
     /// They sink after `SINK_GRACE`, so a crossing that strays out of the strip
     /// and back does not cost the user the trip.
     sink_since: Option<Instant>,
+    /// The bubble under the rope that explains the raise gesture, while it is up.
+    /// It is on screen exactly when the cards are behind the user's window -
+    /// the moment the gesture it describes is the only way back.
+    raise_hint_until: Option<Instant>,
+    /// Where the bubble was drawn, and where its button is, in panel-local
+    /// pixels. The rope layer is a click target only inside the button;
+    /// everywhere else a click belongs to the window the user is working in.
+    hint_body: Option<WRect>,
+    hint_chip: Option<WRect>,
+    /// The pointer is on the button: it lights up, and the layer takes the click.
+    hint_hot: bool,
+    /// The pointer is on the bubble at all. Only the button answers a click, but
+    /// a sentence that leaves mid-read has taught nothing, so the body holds its
+    /// clock open as well.
+    hint_read: bool,
+    /// The next time the cards sink, the rope may explain itself once more.
+    /// Re-armed when the cards come back up, so a bubble that faded while he was
+    /// away does not pop straight back on the same sinking; and it is never
+    /// re-armed again once he has pressed the button.
+    raise_hint_armed: bool,
+    /// The pointer is inside the rope's grab band while the cards are down, so
+    /// the rope lights up before the dwell pays off. It is a state, not an
+    /// event: the poll recomputes it every 50 ms.
+    rope_hot: bool,
+    /// Whether the rope's layer is currently letting clicks through. It keeps
+    /// its own copy because the bubble's button can make it a target while the
+    /// card layer's `click_through` says something else.
+    rope_click_through: bool,
     /// Whether the pointer was on the line at the previous poll, so leaving it
     /// is an edge the visit rules can see once.
     line_hot: bool,
@@ -484,6 +527,8 @@ pub struct App {
     /// `SHAIWIN_DUMP_DIR`, when set: where WM_DUMP_FRAME writes PNGs.
     dump_dir: Option<PathBuf>,
     dump_request: bool,
+    /// This frame's rope layer was asked for, and has not been written yet.
+    dump_rope: bool,
     dump_seq: u32,
     /// Set once if UpdateLayeredWindow refuses a frame, so the log has the
     /// reason without one line per frame.
@@ -631,6 +676,14 @@ impl App {
                 peek_hot: None,
                 raise_since: None,
                 sink_since: None,
+                raise_hint_until: None,
+                hint_body: None,
+                hint_chip: None,
+                hint_hot: false,
+                hint_read: false,
+                raise_hint_armed: true,
+                rope_hot: false,
+                rope_click_through: true,
                 line_hot: false,
                 line_was_empty: true,
                 menu_open: false,
@@ -655,12 +708,18 @@ impl App {
                 card_menu_target: None,
                 dump_dir: std::env::var_os("SHAIWIN_DUMP_DIR").map(PathBuf::from),
                 dump_request: false,
+                dump_rope: false,
                 dump_seq: 0,
                 present_failed: false,
                 quitting: false,
             });
             let ptr = Box::into_raw(app);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+            // The rope layer answers one thing: the bubble's button hanging under
+            // it. It has to reach the same App to know where that was drawn.
+            if !(*ptr).rope_hwnd.is_invalid() {
+                SetWindowLongPtrW((*ptr).rope_hwnd, GWLP_USERDATA, ptr as isize);
+            }
             (*ptr).start();
             Some(ptr)
         }
@@ -1633,6 +1692,100 @@ impl App {
         self.invalidate();
     }
 
+    /// Explains the one gesture that cannot be guessed by looking at the line:
+    /// the cards are behind the window the user just clicked into, and sliding
+    /// the pointer over the rope is what brings them back.
+    ///
+    /// It is a state, not an event. The obvious trigger - the moment the layer
+    /// is demoted - misses the commonest way into this state: a window hung
+    /// with the shortcut, while the pointer is still on the window being used,
+    /// never raises the layer at all. The card flies to a line that is already
+    /// behind the work, so there is no transition to catch. "Cards hanging and
+    /// the layer demoted" is the situation itself, and it is the one worth
+    /// explaining.
+    ///
+    /// The gate is `needs_rope`, not "the cards are down": the bubble is drawn on
+    /// the rope's own layer, and that layer is not always the thing on screen
+    /// (it is not created at all on a failure, and it is slid out with the
+    /// line). An explanation nobody could have seen must not be spent.
+    ///
+    /// Once per sinking, and nothing else limits it. `raise_hint_armed` says
+    /// whether this sinking of the cards has explained itself yet: a showing is
+    /// spent when it goes up, and the next one is bought back by the cards
+    /// coming up again (see `set_topmost`). So a bubble that faded while he was
+    /// away does not pop straight back over the same window, and the line does
+    /// not chatter on every poll - but the sentence is there again the next time
+    /// he is stuck behind his work with only a rope in front of him. That is the
+    /// whole of it: the bubble keeps coming until he presses its button, because
+    /// nothing but the button says he read it.
+    ///
+    /// In non-resident mode the visit would otherwise tuck itself away a second
+    /// after the cards sink, so while the bubble is up `poll_visit` treats it as
+    /// "busy" and holds the line open.
+    fn show_raise_hint(&mut self) {
+        if self.settings.raise_known || !self.raise_hint_armed || self.raise_hint_until.is_some() {
+            return;
+        }
+        if !self.needs_rope() || self.line.hooked_count() == 0 {
+            return;
+        }
+        self.raise_hint_armed = false;
+        self.raise_hint_until = Some(Instant::now() + RAISE_HINT_LIFE);
+        crate::log!("the rope explains the raise gesture");
+        self.invalidate();
+    }
+
+    /// Stands the explanation down for good, once, in the settings.
+    ///
+    /// Only the bubble's own "don't remind me" gets to say this. Resting on the
+    /// rope is not an answer to the sentence - it says he found the gesture today,
+    /// not that he needed telling - so that path only ends the current showing
+    /// (see the RAISE_DWELL branch in `poll`).
+    fn mark_raise_known(&mut self, why: &str) {
+        if self.settings.raise_known {
+            return;
+        }
+        self.settings.raise_known = true;
+        self.settings.save();
+        self.raise_hint_armed = false;
+        crate::log!("the raise hint stands down: {why}");
+    }
+
+    /// Whether `local` (panel-local pixels) is on the bubble's button. It is the
+    /// rope layer's only clickable place: the sentence is there to be read, and a
+    /// click that lands anywhere else - the bubble's own body included - belongs
+    /// to the window the user is working in.
+    fn hint_at(&self, local: (i32, i32)) -> bool {
+        self.on_rect(self.hint_chip, local)
+    }
+
+    /// Whether `local` is on the bubble at all, button included. Used only to
+    /// hold the clock open while he reads.
+    fn hint_body_at(&self, local: (i32, i32)) -> bool {
+        self.on_rect(self.hint_body, local)
+    }
+
+    fn on_rect(&self, rect: Option<WRect>, local: (i32, i32)) -> bool {
+        self.raise_hint_until.is_some()
+            && rect.is_some_and(|r| {
+                local.0 >= r.left && local.0 < r.right && local.1 >= r.top && local.1 < r.bottom
+            })
+    }
+
+    /// A press that lands on the bubble's button. Returning false leaves the
+    /// click to whatever the window proc should do with it.
+    fn ack_raise_hint(&mut self, local: (i32, i32)) -> bool {
+        if !self.hint_at(local) {
+            return false;
+        }
+        self.raise_hint_until = None;
+        self.hint_body = None;
+        self.hint_chip = None;
+        self.mark_raise_known("he pressed the bubble's button");
+        self.invalidate();
+        true
+    }
+
     fn show_hook_hint(&mut self) {
         if self.settings.hook_taught || self.tray_icon.is_invalid() {
             return;
@@ -1957,10 +2110,30 @@ impl App {
         // line moves with it.
         let slide_y_off = (self.slide - 1.0) * self.layout.panel_height();
         let over_rope = self.revealed && self.on_rope(local, slide_y_off);
+        // The bubble's button is a handle: a click that lands on it is the user
+        // answering the line, not the user going back to his work. The body of
+        // the bubble is not one - a click there goes on to the window under it -
+        // but a pointer resting on it is reading the sentence, and a sentence that
+        // leaves mid-read has taught nothing, so the body holds the clock open.
+        let over_chip = self.hint_at(local);
+        if over_chip != self.hint_hot {
+            self.hint_hot = over_chip;
+            self.invalidate();
+        }
+        self.hint_read = self.hint_body_at(local);
+        // The rope answers the pointer before anything is asked of it. Resting
+        // in the grab band lights the line itself, which is the wordless half of
+        // the explanation: the sentence says what to do, and this shows that the
+        // rope is the thing that will do it.
+        let rope_hot = self.revealed && !self.topmost && over_rope;
+        if rope_hot != self.rope_hot {
+            self.rope_hot = rope_hot;
+            self.invalidate();
+        }
         // A handle is something the line answers to: the rope, or a card that is
         // really visible. Clicking anywhere else - including the empty space
         // inside the line's own strip - is the user going back to their work.
-        let on_handle = self.revealed && (over_rope || on_card);
+        let on_handle = self.revealed && (over_rope || on_card || over_chip);
         // The line's own strip, which is not a handle but is not the desktop
         // either. The rope sits at y=26 and the cards start 22 px below it, so
         // between two neighbouring cards there is a corridor as tall as a card
@@ -2071,6 +2244,12 @@ impl App {
                     let since = *self.raise_since.get_or_insert(now);
                     if now.duration_since(since) >= RAISE_DWELL {
                         self.raise_since = None;
+                        // He did the thing the bubble was describing, so the
+                        // bubble has nothing left to say right now: taking the
+                        // top back ends this showing and buys the next one
+                        // (see `set_topmost`). It is not an acknowledgement -
+                        // only pressing the bubble's "don't remind me" is - so
+                        // the next time the cards sink the sentence comes back.
                         self.set_topmost(true);
                     }
                 }
@@ -2115,6 +2294,12 @@ impl App {
             self.sink_since = None;
         }
 
+        // The sentence for the state the line is hardest to discover in: cards
+        // are hanging and the layer is behind the window the user is working in,
+        // so the rope is the only part of the line on screen. Cheap to ask, and
+        // it stops asking the moment he answers it.
+        self.show_raise_hint();
+
         // Hover and click-through: a card is a target wherever the pointer can
         // reach it. Clearing the click-through bit over one is what lets a click
         // land on a demoted layer; where another window is above that point, the
@@ -2140,6 +2325,37 @@ impl App {
         self.set_click_through(
             !over_card && !peek_hover && self.card_press.is_none() && self.close_press.is_none(),
         );
+        // The rope layer keeps letting clicks through to the work except while
+        // the pointer is on the bubble's button. Its window is the whole strip,
+        // so this cannot be a style for the layer as a whole and still be honest
+        // about the rest of it: outside the button the window proc answers
+        // HTTRANSPARENT, which is the per-point version of the same answer.
+        self.set_rope_click_through(!self.hint_hot);
+
+        // The bubble is on a clock of its own, and the clock stops while the
+        // pointer is on it: a sentence that leaves mid-read has taught nothing,
+        // and a button that moves out from under the finger is worse. The
+        // pointer doing what the sentence describes is the quick way out (see
+        // `set_topmost`); this is the slow one, for a user who read it and went
+        // back to what he was doing.
+        if let Some(until) = self.raise_hint_until {
+            if self.hint_read {
+                let tail = now + RAISE_HINT_TAIL;
+                if until < tail {
+                    self.raise_hint_until = Some(tail);
+                }
+            } else if now >= until || !self.needs_rope() {
+                // Out of the way, or the layer it is drawn on has gone: either
+                // way there is nothing left on screen to time out. The next
+                // sinking of the cards buys the explanation back; this one has
+                // had its bubble.
+                self.raise_hint_until = None;
+                self.hint_body = None;
+                self.hint_chip = None;
+                self.hint_hot = false;
+                self.invalidate();
+            }
+        }
 
         if self.hold_until.is_some_and(|until| now >= until) {
             self.hold_until = None;
@@ -2246,7 +2462,11 @@ impl App {
         click_off_line: bool,
         foreground_left: bool,
     ) {
-        let busy = self.in_hand() || taking_away || self.menu_open;
+        let busy = self.in_hand() || taking_away || self.menu_open
+            // While the one-time explanation is on the rope, the line has to
+            // stay up long enough to read it. A non-resident visit would tuck
+            // itself away a second after the cards sink and the hint with it.
+            || self.raise_hint_until.is_some();
         let held = self.hold_until.is_some_and(|until| now < until);
         let Some(after) = self.auto_hide() else {
             return;
@@ -2370,6 +2590,11 @@ impl App {
                 let ex = GetWindowLongPtrW(w, GWL_EXSTYLE) as u32;
                 if IsWindowVisible(w).as_bool()
                     && ex & WS_EX_TRANSPARENT.0 == 0
+                    // The rope is our own layer, and while its button is under
+                    // the pointer it is deliberately not transparent. It covers
+                    // the strip the cards live in, so counting it would make a
+                    // visible card stop being a handle every time the bubble is up.
+                    && w != self.rope_hwnd
                     && !IsIconic(w).as_bool()
                     && window::rect_of(w).is_some_and(|r| {
                         point.0 >= r.left
@@ -3562,6 +3787,13 @@ impl App {
         // for is hidden under the card it belongs to.
         if on {
             crate::tag_ui::raise();
+            // The cards are where the user can see them again, so whatever the
+            // explanation was answering has been answered - and the next time
+            // they sink behind his work, the bubble is owed to him again.
+            self.raise_hint_until = None;
+            self.hint_body = None;
+            self.hint_chip = None;
+            self.raise_hint_armed = true;
         }
         // Cards give the top back, the rope does not. Its own layer keeps the
         // line visible above the window just clicked into; the next pointer
@@ -3655,6 +3887,31 @@ impl App {
             );
         }
         self.invalidate();
+    }
+
+    /// The rope layer's own click-through. It has to be its own because the two
+    /// layers answer for different things under the same pointer: the cards are
+    /// a target wherever one is visible, the rope only where its button is drawn.
+    fn set_rope_click_through(&mut self, on: bool) {
+        if self.rope_click_through == on || self.rope_hwnd.is_invalid() {
+            return;
+        }
+        self.rope_click_through = on;
+        unsafe {
+            let ex = GetWindowLongPtrW(self.rope_hwnd, GWL_EXSTYLE);
+            let bit = WS_EX_TRANSPARENT.0 as isize;
+            let next = if on { ex | bit } else { ex & !bit };
+            SetWindowLongPtrW(self.rope_hwnd, GWL_EXSTYLE, next);
+            let _ = SetWindowPos(
+                self.rope_hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
     }
 
     fn place(&mut self, monitor: Monitor) {
@@ -3790,12 +4047,17 @@ impl App {
                     let _ = canvas.save_png(&path);
                 }
                 self.dump_hits(dir);
+                // The rope's layer is composed later in this same frame, and it
+                // is the only one that can show anything while the cards are
+                // down - the hint that explains the gesture lives there.
+                self.dump_rope = true;
             }
         }
         self.present();
         if self.rope_shown {
             self.present_rope();
         }
+        self.dump_rope = false;
     }
 
     /// Debug aid for the regression tests: the clickable rectangles of the cards
@@ -3911,10 +4173,63 @@ impl App {
         let Some(mut canvas) = self.rope_canvas.take() else {
             return;
         };
-        let hot = self.band_hot && self.drag.is_some();
+        let glow = if self.band_hot && self.drag.is_some() {
+            crate::render::ROPE_GLOW_READY
+        } else if self.rope_hot {
+            crate::render::ROPE_GLOW_NEAR
+        } else {
+            0.0
+        };
         let y_off = (self.slide - 1.0) * self.layout.panel_height();
-        self.painter
-            .compose_rope_into(&mut canvas, &self.layout, y_off, hot);
+        let now = Instant::now();
+        let hint = self.raise_hint_until.map(|until| {
+            let left = until.saturating_duration_since(now);
+            let alpha = if left < RAISE_HINT_FADE {
+                left.as_secs_f32() / RAISE_HINT_FADE.as_secs_f32()
+            } else {
+                1.0
+            };
+            crate::render::RopeHint {
+                text: crate::i18n::t("raise_hint"),
+                hot: self.hint_hot,
+                alpha,
+            }
+        });
+        let bubble =
+            self.painter
+                .compose_rope_into(&mut canvas, &self.layout, y_off, glow, hint.as_ref());
+        self.hint_body = bubble.map(|b| b.body);
+        self.hint_chip = bubble.map(|b| b.chip);
+        // The companion window's own picture, for a test that has to see what
+        // this layer is showing: it is the only surface visible while the cards
+        // are behind the user's work.
+        if std::mem::take(&mut self.dump_rope) {
+            if let Some(dir) = &self.dump_dir {
+                let path = dir.join(format!("rope-{}.png", std::process::id()));
+                let _ = canvas.save_png(&path);
+                // The bubble's two rectangles next to its picture: a test that
+                // wants to press the button, or to prove the body lets the click
+                // through, needs the geometry - and this is the frame that drew
+                // it. Empty file when there is no bubble.
+                let one = bubble
+                    .map(|b| {
+                        format!(
+                            "body,{},{},{},{}\nchip,{},{},{},{}\n",
+                            b.body.left,
+                            b.body.top,
+                            b.body.right,
+                            b.body.bottom,
+                            b.chip.left,
+                            b.chip.top,
+                            b.chip.right,
+                            b.chip.bottom,
+                        )
+                    })
+                    .unwrap_or_default();
+                let path = dir.join(format!("hint-{}.txt", std::process::id()));
+                let _ = std::fs::write(&path, one);
+            }
+        }
         present_layer(
             self.rope_hwnd,
             &canvas,
@@ -4320,12 +4635,56 @@ fn taskbar_created() -> u32 {
 
 unsafe extern "system" fn rope_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        // The rope is still not a target. Every click belongs to the window the
+        // user is working in, even where the line is drawn - except the button
+        // inside the bubble hanging under it, which is the one thing this window
+        // will take off his hands.
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+        if ptr.is_null() {
+            // Every message of the window's own creation, before the App is
+            // attached: this window is still an ordinary invisible popup, and
+            // answering HTTRANSPARENT here is answering it for WM_NCCREATE too,
+            // which is the create failing outright.
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         match msg {
-            // The rope is a visual reminder, not a target. Every click belongs
-            // to the window the user is working in, even when the pointer is on
-            // the rope; the poll watches the pointer and raises the card layer.
-            WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+            WM_NCHITTEST => {
+                let point = screen_point(lp);
+                let local = (point.x - (*ptr).origin.0, point.y - (*ptr).origin.1);
+                let hit = if (*ptr).hint_at(local) {
+                    HTCLIENT as i32
+                } else {
+                    HTTRANSPARENT
+                };
+                LRESULT(hit as isize)
+            }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_SETCURSOR => {
+                // The button says it is one. A hand over the bubble's own body
+                // would promise a click that does not happen, so the answer is
+                // the same rectangle the hit test uses.
+                let (x, y) = monitor::cursor();
+                let local = (x - (*ptr).origin.0, y - (*ptr).origin.1);
+                let icon = if (*ptr).hint_at(local) {
+                    IDC_HAND
+                } else {
+                    IDC_ARROW
+                };
+                if let Ok(cursor) = LoadCursorW(None, icon) {
+                    SetCursor(Some(cursor));
+                }
+                LRESULT(1)
+            }
+            WM_LBUTTONUP => {
+                // The rope window sits exactly on the panel, so its client
+                // coordinates are the bubble's own.
+                let local = client_point(lp);
+                if (*ptr).ack_raise_hint(local) {
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }

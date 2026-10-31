@@ -52,6 +52,11 @@ pub struct Settings {
     pub sag_percent: f32,
     /// Explained once that taking a window down keeps it hooked.
     pub hook_taught: bool,
+    /// The rope no longer explains the raise gesture because the user said so: he
+    /// pressed "don't remind me" on the bubble. Nothing else writes it - taking
+    /// the rope himself proves he found the gesture today, not that he ever
+    /// needed the sentence, and the bubble keeps coming back for that reason.
+    pub raise_known: bool,
     /// The line is resident: it stays on screen until the show/hide shortcut
     /// puts it away. Off, it is a short visit — the top-edge pill opens it, and
     /// it tucks itself away when the visit is over.
@@ -95,6 +100,7 @@ impl Default for Settings {
             toggle_vk: VK_T,
             sag_percent: SAG_AUTO,
             hook_taught: false,
+            raise_known: false,
             always_on: true,
             drag_hang: true,
             auto_hide_secs: 1,
@@ -134,6 +140,7 @@ impl Settings {
                 "welcomed" => s.welcomed = value == "1",
                 "reduced_motion" => s.reduced_motion = value == "1",
                 "hook_taught" => s.hook_taught = value == "1",
+                "raise_known" => s.raise_known = value == "1",
                 "always_on" => s.always_on = value != "0",
                 "drag_hang" => s.drag_hang = value != "0",
                 "auto_hide_secs" => s.auto_hide_secs = parse_hide_secs(value),
@@ -163,7 +170,7 @@ impl Settings {
         let text = format!(
             "welcomed={}\nreduced_motion={}\n\
              hang_mods={}\nhang_vk={}\ntoggle_mods={}\ntoggle_vk={}\n\
-             sag={}\nhook_taught={}\nalways_on={}\ndrag_hang={}\n\
+             sag={}\nhook_taught={}\nraise_known={}\nalways_on={}\ndrag_hang={}\n\
              auto_hide_secs={}\nexcluded={}\n",
             u8::from(self.welcomed),
             u8::from(self.reduced_motion),
@@ -177,6 +184,7 @@ impl Settings {
                 format!("{:.1}", self.sag_percent)
             },
             u8::from(self.hook_taught),
+            u8::from(self.raise_known),
             u8::from(self.always_on),
             u8::from(self.drag_hang),
             self.auto_hide_secs,
@@ -317,6 +325,8 @@ mod tests {
         // drop target; those are the two behaviours the program is for.
         assert!(s.always_on);
         assert!(s.drag_hang);
+        // Nothing has been explained yet on a fresh install.
+        assert!(!s.raise_known);
     }
 
     #[test]

@@ -24,6 +24,7 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
   [DllImport("user32.dll")] public static extern bool SystemParametersInfoW(uint action, uint param, out RECT rect, uint winIni);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
@@ -291,6 +292,16 @@ function Post-Mouse([IntPtr]$overlay, [uint32]$msg, [int]$x, [int]$y) {
   Invoke-Wm $overlay $msg ([IntPtr]::Zero) $lp
 }
 
+# What the window proc would answer the system's hit-test for a real click at
+# this screen point: 1 (HTCLIENT) is "that click is mine", -1 (HTTRANSPARENT) is
+# "it belongs to the window behind". Posted messages skip the hit-test, so this
+# is the half of a click a posted WM_LBUTTONUP cannot prove - and on a layer that
+# is transparent everywhere except one plate, it is the half that matters.
+function Get-HitTest([IntPtr]$hwnd, [int]$x, [int]$y) {
+  $lp = [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF))
+  return [int][W]::SendMessage($hwnd, 0x0084, [IntPtr]::Zero, $lp).ToInt64()
+}
+
 function Drag-By-Messages([IntPtr]$overlay, [int]$x1, [int]$y1, [int]$x2, [int]$y2, [int]$steps) {
   Post-Mouse $overlay $script:KitMouseDown $x1 $y1
   Start-Sleep -Milliseconds 60
@@ -478,6 +489,38 @@ function Get-CloseRects([string]$dir, [int]$appPid, [IntPtr]$overlay) {
       Left = [int]$r[0]; Top = [int]$r[1]; Right = [int]$r[2]; Bottom = [int]$r[3]
     }
   })
+}
+
+# The bubble the rope hangs under itself, if this frame drew one. It lives on the
+# rope's own layer, so a frame with the cards up writes no file at all - and that
+# is exactly the answer a test wants for "the line stopped explaining itself".
+#
+# Two rectangles, not one: the app writes `body,l,t,r,b` and `chip,l,t,r,b`, the
+# body being the sentence he reads and the chip being the only thing on it that
+# answers a click. The flat Left/Top/Right/Bottom are the body, and `.Chip` is
+# the button - a test that presses the bubble has to press the second one.
+function Get-HintRect([string]$dir, [int]$appPid, [IntPtr]$overlay) {
+  $path = Join-Path $dir "hint-$appPid.txt"
+  Remove-Item $path -Force -ErrorAction SilentlyContinue
+  Invoke-Wm $overlay $script:KitDumpFrame ([IntPtr]::Zero) ([IntPtr]::Zero)
+  # The file only appears while the rope layer is on screen, so waiting for it
+  # has to be a question, not an assertion.
+  if (-not (Wait-Until ({ Test-Path $path }) 1500)) { return $null }
+  Start-Sleep -Milliseconds 120   # the file is written in place, not swapped
+  $found = @{}
+  foreach ($line in @(Get-Content $path | Where-Object { $_.Trim().Length -gt 0 })) {
+    $r = $line -split ","
+    if ($r.Count -ne 5) { continue }
+    $found[$r[0].Trim()] = [pscustomobject]@{
+      Left = [int]$r[1]; Top = [int]$r[2]; Right = [int]$r[3]; Bottom = [int]$r[4]
+    }
+  }
+  if (-not $found.body -or -not $found.chip) { return $null }
+  return [pscustomobject]@{
+    Body = $found.body; Chip = $found.chip
+    Left = $found.body.Left; Top = $found.body.Top
+    Right = $found.body.Right; Bottom = $found.body.Bottom
+  }
 }
 
 function Get-Center($rect) {

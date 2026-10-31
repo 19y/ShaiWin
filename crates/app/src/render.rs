@@ -47,6 +47,14 @@ pub struct Sprite {
     pub card: (f32, f32, f32, f32),
 }
 
+/// The rope's halo. `READY` is a dragged window close enough to let go onto the
+/// line; `NEAR` is the pointer resting in the rope's grab band while the cards
+/// are behind his work - the line saying "this part answers you" one moment
+/// before the dwell pays off. Same stroke and colour as `READY`, so the second
+/// reads as the first, only quieter.
+pub const ROPE_GLOW_READY: f32 = 0.55;
+pub const ROPE_GLOW_NEAR: f32 = 0.28;
+
 /// What one frame needs besides the cards.
 pub struct Ui<'a> {
     pub hover: Option<u64>,
@@ -63,6 +71,28 @@ pub struct Ui<'a> {
     pub rope: bool,
     /// The pointer is on the hovered card's close button.
     pub close_hot: bool,
+}
+
+/// The bubble the rope hangs under itself: the gesture explained, and the
+/// button that says the explanation is not needed again. `alpha` is the fade out
+/// at the end of its life; `hot` is the pointer resting on the button, which is
+/// the same lighting the peek pill and a card's close button take.
+pub struct RopeHint<'a> {
+    pub text: &'a str,
+    /// The pointer is on the bubble's button, which is the only thing here that
+    /// answers a click.
+    pub hot: bool,
+    pub alpha: f32,
+}
+
+/// The two rectangles of the explanation: the bubble the sentence is read in,
+/// and the button inside it that stands the sentence down. They are different
+/// because only the button is a target - the rest of the bubble lets the click
+/// go on to whatever is behind it.
+#[derive(Clone, Copy)]
+pub struct Bubble {
+    pub body: WRect,
+    pub chip: WRect,
 }
 
 pub struct Frame {
@@ -488,7 +518,12 @@ impl Painter {
         canvas.fill(Color::TRANSPARENT);
         let s = layout.scale;
         if ui.rope {
-            draw_rope(canvas, layout, ui.y_off, ui.hot);
+            draw_rope(
+                canvas,
+                layout,
+                ui.y_off,
+                if ui.hot { ROPE_GLOW_READY } else { 0.0 },
+            );
         }
         // A full line shrinks every card by the same factor; the sprites are
         // built at the user's zoom, so this is just a draw-time scale.
@@ -566,7 +601,7 @@ impl Painter {
             let center_x = layout.width / 2.0;
             let center_y = layout.rope_y(center_x) + ui.y_off + 36.0 * s;
             if let Some(label) = self.label(hint, 12.0 * s, (238, 241, 248)) {
-                draw_hint(canvas, center_x, center_y, label, s, false);
+                draw_hint(canvas, center_x, center_y, label, s, false, 1.0);
             }
         }
 
@@ -575,15 +610,197 @@ impl Painter {
 
     /// Draws only the rope, for the always-on-top companion window that keeps
     /// it visible after the cards sink behind the user's work.
+    ///
+    /// `hint` is the one sentence that explains the gesture, and it belongs on
+    /// this layer and nowhere else: it is needed exactly when the cards are
+    /// behind the user's window, and anything drawn on the card layer at that
+    /// moment is behind that window too. It hangs under the middle of the rope,
+    /// where the empty line puts its own prompt.
+    ///
+    /// The rectangles it returns are the bubble as drawn, in the same
+    /// panel-local pixels the caller hit-tests the pointer against - so the
+    /// place that answers a click can never drift from the place that is painted.
     pub fn compose_rope_into(
         &mut self,
         canvas: &mut Pixmap,
         layout: &LineLayout,
         y_off: f32,
-        hot: bool,
-    ) {
+        glow: f32,
+        hint: Option<&RopeHint>,
+    ) -> Option<Bubble> {
         canvas.fill(Color::TRANSPARENT);
-        draw_rope(canvas, layout, y_off, hot);
+        draw_rope(canvas, layout, y_off, glow);
+        let hint = hint?;
+        let s = layout.scale;
+        let cx = layout.width / 2.0;
+        let cy = layout.rope_y(cx) + y_off + 46.0 * s;
+        self.draw_bubble(canvas, cx, cy, s, hint)
+    }
+
+    /// The bubble the rope explains itself in: the sentence on the left, and on
+    /// the right the one button that stands the sentence down for good.
+    ///
+    /// A bubble and not a second pill because its tail points at the thing the
+    /// sentence is about - the rope above it. And the button is drawn as a plate
+    /// inside the plate, its own wash and its own rim, because the two halves of
+    /// this prompt ask different things of him: one he only has to read, the
+    /// other he has to find and press. Only the second one answers a click, so it
+    /// has to look like the clickable thing it is.
+    ///
+    /// `alpha` fades the whole bubble at once - body, tail, button and both
+    /// labels - which is how a prompt that is about to leave looks while it is
+    /// being read.
+    fn draw_bubble(
+        &mut self,
+        canvas: &mut Pixmap,
+        cx: f32,
+        cy: f32,
+        s: f32,
+        hint: &RopeHint,
+    ) -> Option<Bubble> {
+        let text = hint.text;
+        let hot = hint.hot;
+        let alpha = hint.alpha;
+
+        // The two labels are asked for one at a time: they live in one cache
+        // behind `self`, so holding both is holding the cache twice. Their
+        // metrics are what the shape needs; the pictures come from the cache
+        // again, cheaply, when there is something to blit.
+        let (tw, th) = {
+            let label = self.label(text, 13.0 * s, (240, 243, 250))?;
+            (label.width() as f32, label.height() as f32)
+        };
+        let (cw, ch) = {
+            let label =
+                self.label_bold(crate::i18n::t("dont_remind"), 12.0 * s, (255, 255, 255))?;
+            (label.width() as f32, label.height() as f32)
+        };
+
+        let chip_w = cw + 26.0 * s;
+        let chip_h = ch + 12.0 * s;
+        let body_w = tw + chip_w + 54.0 * s;
+        let body_h = (th + 26.0 * s).max(chip_h + 16.0 * s);
+        let x = cx - body_w / 2.0;
+        let y = cy - body_h / 2.0;
+        // The point that reaches up to the rope. It aims at `cx` because that is
+        // where the rope hangs lowest, and it is what makes this a bubble about
+        // the rope rather than a sentence floating anywhere on screen.
+        let tip_y = y - 12.0 * s;
+        let tail = 8.0 * s;
+
+        let body = rect_of(x, y, body_w, body_h);
+        let chip_x = x + body_w - 16.0 * s - chip_w;
+        let chip_rect = rect_of(chip_x, cy - chip_h / 2.0, chip_w, chip_h);
+
+        let wash = 0.66 * alpha;
+        let stops = vec![
+            GradientStop::new(0.0, Color::from_rgba8(40, 45, 58, (wash * 255.0) as u8)),
+            GradientStop::new(
+                1.0,
+                Color::from_rgba8(18, 21, 29, (wash * 0.8 * 255.0) as u8),
+            ),
+        ];
+        let path = bubble_path(
+            x,
+            y,
+            body_w,
+            body_h,
+            13.0 * s,
+            Tail {
+                tip_x: cx,
+                tip_y,
+                half: tail,
+            },
+        );
+        if let (Some(path), Some(shader)) = (
+            path.as_ref(),
+            LinearGradient::new(
+                Point::from_xy(x, y),
+                Point::from_xy(x, y + body_h),
+                stops,
+                SpreadMode::Pad,
+                Transform::identity(),
+            ),
+        ) {
+            let paint = Paint {
+                shader,
+                anti_alias: true,
+                ..Default::default()
+            };
+            canvas.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+            stroke_path(
+                canvas,
+                path,
+                solid(255, 255, 255, 0.14 * alpha),
+                1.0 * s,
+                Transform::identity(),
+            );
+        }
+
+        let blit = PixmapPaint {
+            opacity: alpha,
+            ..Default::default()
+        };
+        if let Some(label) = self.label(text, 13.0 * s, (240, 243, 250)) {
+            canvas.draw_pixmap(
+                (x + 20.0 * s).round() as i32,
+                (cy - th / 2.0).round() as i32,
+                label.as_ref(),
+                &blit,
+                Transform::identity(),
+                None,
+            );
+        }
+
+        // The button: lighter than the body it sits in, and rim-lit, so it reads
+        // as the part of the bubble with an edge you can press. The amber is the
+        // line's own "you are on a target" colour, the one the rope and the close
+        // button already use.
+        fill_rrect(
+            canvas,
+            chip_rect.left as f32,
+            chip_rect.top as f32,
+            chip_w,
+            chip_h,
+            chip_h / 2.0,
+            solid(255, 255, 255, if hot { 0.26 } else { 0.14 } * alpha),
+        );
+        if let Some(path) = rrect_path(
+            chip_rect.left as f32 + 0.5 * s,
+            chip_rect.top as f32 + 0.5 * s,
+            chip_w - s,
+            chip_h - s,
+            chip_h / 2.0 - 0.5 * s,
+        ) {
+            stroke_path(
+                canvas,
+                &path,
+                if hot {
+                    solid(0xEF, 0x9C, 0x3B, 0.95 * alpha)
+                } else {
+                    solid(255, 255, 255, 0.42 * alpha)
+                },
+                if hot { 1.4 * s } else { 1.0 * s },
+                Transform::identity(),
+            );
+        }
+        if let Some(label) =
+            self.label_bold(crate::i18n::t("dont_remind"), 12.0 * s, (255, 255, 255))
+        {
+            canvas.draw_pixmap(
+                (chip_x + (chip_w - cw) / 2.0).round() as i32,
+                (cy - ch / 2.0).round() as i32,
+                label.as_ref(),
+                &blit,
+                Transform::identity(),
+                None,
+            );
+        }
+
+        Some(Bubble {
+            body,
+            chip: chip_rect,
+        })
     }
 
     /// The way into a non-resident line: a small pill at the top of the screen
@@ -613,7 +830,7 @@ impl Painter {
         };
         let cx = layout.width / 2.0;
         let cy = 44.0 * s;
-        draw_hint(canvas, cx, cy, label, s, hot);
+        draw_hint(canvas, cx, cy, label, s, hot, 1.0);
         let w = label.width() as f32 + 28.0 * s;
         let h = label.height() as f32 + 16.0 * s;
         let rect = WRect {
@@ -716,7 +933,7 @@ fn draw_close(
     })
 }
 
-fn draw_rope(canvas: &mut Pixmap, layout: &LineLayout, y_off: f32, hot: bool) {
+fn draw_rope(canvas: &mut Pixmap, layout: &LineLayout, y_off: f32, glow: f32) {
     let s = layout.scale;
     let w = layout.width;
     // The rope and the pins must be on the same curve: the cards attach to the
@@ -727,15 +944,14 @@ fn draw_rope(canvas: &mut Pixmap, layout: &LineLayout, y_off: f32, hot: bool) {
     pb.move_to(-20.0 * s, top);
     pb.quad_to(w / 2.0, top + 2.0 * sag, w + 20.0 * s, top);
     let Some(path) = pb.finish() else { return };
-    if hot {
-        // The drag's answer: a warm glow around the rope where the window would
-        // be clipped on. Warm, not white: a wide white band at the top of the
-        // screen reads as a system frame, which is the one thing this must not
-        // look like.
+    if glow > 0.0 {
+        // The rope's own answer. Warm, not white: a wide white band at the top
+        // of the screen reads as a system frame, which is the one thing this
+        // must not look like.
         stroke_path(
             canvas,
             &path,
-            rope_paint(w, (255, 186, 84), 0.55),
+            rope_paint(w, (255, 186, 84), glow),
             7.0 * s,
             Transform::identity(),
         );
@@ -747,7 +963,10 @@ fn draw_rope(canvas: &mut Pixmap, layout: &LineLayout, y_off: f32, hot: bool) {
         2.2 * s,
         Transform::from_translate(0.0, s),
     );
-    let core = if hot {
+    // Only a drop in hand turns the strand itself warm. The quieter glow is a
+    // promise, not an answer, and a rope that changed colour on the way past
+    // every title bar would be noise.
+    let core = if glow >= ROPE_GLOW_READY {
         (246, 198, 120)
     } else {
         (132, 132, 140)
@@ -859,25 +1078,41 @@ fn draw_hover_ring(canvas: &mut Pixmap, sprite: &Sprite, s: f32, transform: Tran
     }
 }
 
+/// The plate's rectangle around `label`, in the canvas's own device pixels. One
+/// function works it out for the drawing and for the hit test, so the place a
+/// pill is clickable can never drift from the place it is painted.
+fn hint_rect(label: &Pixmap, cx: f32, cy: f32, s: f32) -> WRect {
+    let w = label.width() as f32 + 30.0 * s;
+    let h = label.height() as f32 + 16.0 * s;
+    WRect {
+        left: (cx - w / 2.0).round() as i32,
+        top: (cy - h / 2.0).round() as i32,
+        right: (cx + w / 2.0).round() as i32,
+        bottom: (cy + h / 2.0).round() as i32,
+    }
+}
+
 /// The pill the line shows when it has something to say: the "let go" prompt
-/// while a window is over the band, and the "show the line" peek at the top of
-/// the screen.
+/// while a window is over the band, the "show the line" peek at the top of the
+/// screen, and the sentence on the rope.
 ///
 /// Edge's hover strip is the reference: a see-through tint, not a white plate
 /// with a hard edge. Windows will not blur what sits behind a layered window, so
 /// the tint is plain transparency, and legibility comes from a dark wash under
 /// light text with one hairline of light. That pair reads on a white page and on
 /// a black one, which an opaque white pill on a light wallpaper does not.
-fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot: bool) {
-    let pad_x = 15.0 * s;
-    let pad_y = 8.0 * s;
-    let w = label.width() as f32 + pad_x * 2.0;
-    let h = label.height() as f32 + pad_y * 2.0;
-    let x = cx - w / 2.0;
-    let y = cy - h / 2.0;
+///
+/// `alpha` fades the whole plate at once - wash, rim and text - which is how a
+/// prompt that is about to leave looks while it is still being read.
+fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot: bool, alpha: f32) {
+    let rect = hint_rect(label, cx, cy, s);
+    let x = rect.left as f32;
+    let y = rect.top as f32;
+    let w = rect.width() as f32;
+    let h = rect.height() as f32;
     let r = h / 2.0;
 
-    let wash = if hot { 0.78 } else { 0.62 };
+    let wash = if hot { 0.78 } else { 0.62 } * alpha;
     let stops = vec![
         GradientStop::new(0.0, Color::from_rgba8(40, 45, 58, (wash * 255.0) as u8)),
         GradientStop::new(
@@ -918,7 +1153,7 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
             stroke_path(
                 canvas,
                 &path,
-                solid(255, 255, 255, 0.26),
+                solid(255, 255, 255, 0.26 * alpha),
                 1.0 * s,
                 Transform::identity(),
             );
@@ -926,9 +1161,9 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
     }
     if let Some(path) = rrect_path(x + 0.5 * s, y + 0.5 * s, w - s, h - s, r - 0.5 * s) {
         let rim = if hot {
-            solid(0xEF, 0x9C, 0x3B, 0.95)
+            solid(0xEF, 0x9C, 0x3B, 0.95 * alpha)
         } else {
-            solid(255, 255, 255, 0.10)
+            solid(255, 255, 255, 0.10 * alpha)
         };
         stroke_path(
             canvas,
@@ -939,7 +1174,10 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
         );
     }
 
-    let paint = PixmapPaint::default();
+    let paint = PixmapPaint {
+        opacity: alpha,
+        ..Default::default()
+    };
     canvas.draw_pixmap(
         (cx - label.width() as f32 / 2.0).round() as i32,
         (cy - label.height() as f32 / 2.0).round() as i32,
@@ -951,6 +1189,56 @@ fn draw_hint(canvas: &mut Pixmap, cx: f32, cy: f32, label: &Pixmap, s: f32, hot:
 }
 
 // MARK: Shapes and paints
+
+/// The point that leaves a bubble's top edge: where it aims and how wide its
+/// base is. Together, because a tail is one decision, not three numbers.
+#[derive(Clone, Copy)]
+struct Tail {
+    tip_x: f32,
+    tip_y: f32,
+    half: f32,
+}
+
+fn rect_of(x: f32, y: f32, w: f32, h: f32) -> WRect {
+    WRect {
+        left: x.round() as i32,
+        top: y.round() as i32,
+        right: (x + w).round() as i32,
+        bottom: (y + h).round() as i32,
+    }
+}
+
+/// The bubble's outline in one path: a rounded rect with a point on its top edge
+/// aimed at the rope. One path rather than a rect plus a triangle, because two
+/// overlapping fills leave a darker seam across the tail's base and two strokes
+/// leave a hairline through it - and this shape is both filled and rimmed.
+fn bubble_path(x: f32, y: f32, w: f32, h: f32, r: f32, tail: Tail) -> Option<Path> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let Tail { tip_x, tip_y, half } = tail;
+    let r = r.clamp(0.0, w.min(h) / 2.0);
+    let k = 0.552_284_8 * r;
+    let left = (tip_x - half).clamp(x + r, x + w - r);
+    let right = (tip_x + half).clamp(x + r, x + w - r);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    if right - left > 0.5 {
+        pb.line_to(left, y);
+        pb.line_to(tip_x.clamp(left, right), tip_y);
+        pb.line_to(right, y);
+    }
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
 
 fn solid(r: u8, g: u8, b: u8, a: f32) -> Paint<'static> {
     let mut paint = Paint {
