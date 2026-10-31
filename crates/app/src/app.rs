@@ -788,7 +788,7 @@ impl App {
         }
         let entries_len = entries.len();
         let mut survivors: Vec<(journal::Entry, WRect)> = Vec::new();
-        for entry in entries {
+        for mut entry in entries {
             if !window::still_same_window(entry.hwnd, entry.pid, entry.process_start) {
                 continue;
             }
@@ -805,6 +805,20 @@ impl App {
             // it back; there is nothing to recover.
             if !park::still_hung(window::hwnd_of(entry.hwnd), &entry.parked) {
                 continue;
+            }
+            // Entries written by older versions record a window parked past the
+            // edge of the desktop - a state only we could undo, which is how a
+            // killed process used to strand windows. Minimize it now, keeping
+            // the placement, so its taskbar button brings it home by itself from
+            // here on.
+            if !park::parked_minimized(&entry.parked)
+                && park::stow(window::hwnd_of(entry.hwnd), &entry.parked)
+            {
+                crate::log!(
+                    "recover: hwnd={} was parked off screen; minimized it instead",
+                    entry.hwnd
+                );
+                entry.parked = park::hung_up_in_place(entry.placement);
             }
             survivors.push((entry, now));
         }
@@ -1434,15 +1448,15 @@ impl App {
         match park::execute(window::hwnd_of(info.hwnd), &plan) {
             Ok(parked) => {
                 crate::log!(
-                    "parked hwnd={} at {:?} (from {:?})",
+                    "parked hwnd={} minimized={} (from {:?})",
                     info.hwnd,
-                    parked.parked,
+                    park::parked_minimized(&parked),
                     plan.placement.normal
                 );
                 card.parked = parked;
-                // The window is off screen but still in front. Give the foreground
-                // away, so that clicking its taskbar button activates it (which
-                // brings it back down) instead of minimizing it.
+                // Minimizing hands the foreground away by itself; a window that
+                // only went off screen may still be holding it. Either way the
+                // keyboard must not be left on a window the user cannot see.
                 self.recent_park = Some((info.hwnd, Instant::now()));
                 self.hand_focus_off(window::hwnd_of(info.hwnd), Instant::now());
                 let reduced = self.settings.reduced_motion;
@@ -2899,13 +2913,10 @@ impl App {
             }
         }
         if self.line.rehang(id, &self.layout) {
-            if park::parked_minimized(&parked) {
-                crate::log!(
-                    "rehang {id}: hwnd={hwnd} was already minimized; hung it up where it stands"
-                );
-            } else {
-                crate::log!("rehang {id}: hwnd={hwnd} parked at {:?}", parked.parked);
-            }
+            crate::log!(
+                "rehang {id}: hwnd={hwnd} hung up minimized at {:?}",
+                parked.placement.normal
+            );
             // No reveal here: a line the user tucked away stays away. The card
             // is on the line the next time it comes down, and minimizing a
             // window is not a request to see the card that just went up.

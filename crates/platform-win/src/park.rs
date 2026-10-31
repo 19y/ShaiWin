@@ -1,9 +1,18 @@
-//! Parking: moving a real window off screen without losing it.
+//! Parking: putting a real window away without losing it.
 //!
-//! The window is never hidden, destroyed or reparented. It keeps its taskbar
-//! button, its Alt+Tab entry and its place in the z-order, and we remember its
-//! `WINDOWPLACEMENT` first. That combination is the user's escape hatch: even if
-//! ShaiWin is killed, the window can be found and dragged back by hand.
+//! The window is never hidden, destroyed or reparented. It is minimized, with
+//! the `WINDOWPLACEMENT` it had a moment before, so it keeps its taskbar button,
+//! its Alt+Tab entry and its place in the z-order. Minimizing is the only
+//! parked state Windows can undo by itself: a click on the taskbar button
+//! restores the window to the rectangle in that placement - the one it had
+//! before it was hung up - whether or not ShaiWin is still running.
+//!
+//! Moving the window past the edge of the virtual desktop instead looks the
+//! same on screen and keeps it rendering, but it is a state only ShaiWin can
+//! undo. A click on the taskbar button merely activates such a window, in
+//! place, off screen; if the process dies while windows are hung up, the user
+//! is left with windows they cannot see or reach. That is exactly what happened
+//! when the process was killed with a window on the line.
 //!
 //! The work is split in two so the journal can be written *between* the two
 //! halves:
@@ -11,7 +20,7 @@
 //! ```text
 //! plan()      read the placement, work out where it will go   (no mutation)
 //!   ...       write the journal entry                         (disk)
-//! execute()   restore if maximized, move off screen           (mutation)
+//! execute()   minimize, keeping the placement                 (mutation)
 //! ```
 //!
 //! If the process dies between the two, the journal says "this window is about
@@ -145,8 +154,10 @@ pub struct ParkPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Parked {
     pub placement: Placement,
-    /// Where the window physically sits while it is parked. Used to notice
-    /// somebody else moving it (taskbar, Alt+Tab, "Cascade windows", ...).
+    /// Where the window physically sits while it is parked: the iconic spot for
+    /// a minimized window, or the off-screen rectangle for the rare window that
+    /// refused to minimize. Used to notice somebody else moving it (taskbar,
+    /// Alt+Tab, "Cascade windows", ...).
     pub parked: Rect,
     pub was_maximized: bool,
 }
@@ -197,8 +208,9 @@ fn virtual_bounds() -> Rect {
     }
 }
 
-/// Where a window of this size is parked: just past the right edge of the
-/// virtual desktop, aligned with the top of the monitor it came from.
+/// Where a window of this size goes when it refuses to minimize: just past the
+/// right edge of the virtual desktop, aligned with the top of the monitor it
+/// came from. This is the fallback, not the normal way in - see [`execute`].
 pub fn parking_spot(size: (i32, i32), origin: Rect) -> (i32, i32) {
     let v = virtual_bounds();
     let x = v.right + PARK_GAP;
@@ -242,43 +254,45 @@ pub fn plan(hwnd: HWND) -> Result<ParkPlan, ParkError> {
     }
 }
 
-/// Moves a real window out of sight. The snapshot must already have been taken:
-/// once parked, some applications stop repainting.
+/// Takes a real window off the desktop. The snapshot must already have been
+/// taken: once parked, some applications stop repainting.
+///
+/// Minimizing is the whole trick. The placement applied on the way down is the
+/// one the window came in with, so it is what a click on its taskbar button
+/// restores - the window comes back where the user left it even if nothing of
+/// ours is running any more. A window that will not minimize is moved past the
+/// edge of the desktop instead, which is worse in every way (only we can undo
+/// it) but still takes it off the screen.
 pub fn execute(hwnd: HWND, plan: &ParkPlan) -> Result<Parked, ParkError> {
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() {
             return Err(ParkError::Gone);
         }
-        if plan.was_maximized {
-            // A maximized window is not moved at all: SetWindowPos drops it out
-            // of the maximized state on the way, and what comes back is a window
-            // that Windows *reports* as maximized at the size of its normal
-            // rectangle - the "it opens twice, once small" the user sees.
-            // Minimizing is the one way to take it off screen without touching
-            // its state; the placement still says "maximized", so it comes back
-            // full screen. The compositor's minimize animation is disabled for
-            // the trip, so it simply disappears.
-            let animate = !transitions(hwnd, false);
+        // The compositor animates a minimize; the window is supposed to simply
+        // not be there any more.
+        let animate = !transitions(hwnd, false);
+        let placed = minimized_placement(&plan.placement).apply(hwnd);
+        let mut minimized = placed && IsIconic(hwnd).as_bool();
+        if !minimized {
+            // Some windows ignore the show state in SetWindowPlacement but
+            // still minimize when asked directly.
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
-            if animate {
-                let _ = transitions(hwnd, true);
-            }
-            if IsIconic(hwnd).as_bool() {
-                let parked = Rect {
-                    left: ICONIC,
-                    top: ICONIC,
-                    right: ICONIC,
-                    bottom: ICONIC,
-                };
-                return Ok(Parked {
-                    placement: plan.placement,
-                    parked,
-                    was_maximized: true,
-                });
-            }
-            // Minimizing was refused (an elevated window refuses every call from
-            // here); the move below is what reports the refusal properly.
+            minimized = IsIconic(hwnd).as_bool();
         }
+        if animate {
+            let _ = transitions(hwnd, true);
+        }
+        if minimized {
+            return Ok(Parked {
+                placement: plan.placement,
+                parked: iconic_rect(),
+                was_maximized: plan.was_maximized,
+            });
+        }
+        // Last resort: a window that refuses to minimize (an elevated one
+        // refuses every call from here) is moved out of sight. Its taskbar
+        // button will not bring it back by itself, so the journal is the only
+        // way home for it.
         let target = plan.target;
         let moved = SetWindowPos(
             hwnd,
@@ -322,31 +336,38 @@ pub fn park(hwnd: HWND) -> Result<Parked, ParkError> {
 /// Where Windows draws a minimized window. It is not a place on any monitor.
 const ICONIC: i32 = -32000;
 
+/// The rectangle a minimized window reports. Recorded so that "is it still
+/// hanging where we left it" has one answer for both kinds of hanging.
+fn iconic_rect() -> Rect {
+    Rect {
+        left: ICONIC,
+        top: ICONIC,
+        right: ICONIC,
+        bottom: ICONIC,
+    }
+}
+
 /// A window that is minimized is already out of sight, so hanging it up takes no
 /// moving at all: it stays exactly where it stands and only its card goes back
-/// on the line. Moving it instead means restoring it first, and the user sees it
-/// flash onto the desktop before it disappears again.
+/// on the line.
 pub fn hung_up_in_place(placement: Placement) -> Parked {
     Parked {
         placement,
-        parked: Rect {
-            left: ICONIC,
-            top: ICONIC,
-            right: ICONIC,
-            bottom: ICONIC,
-        },
+        parked: iconic_rect(),
         was_maximized: false,
     }
 }
 
-/// Whether the window went onto the line from the minimized state. Its "parked"
-/// rect is the minimized position, so that is what it has to stay at.
+/// Whether the window went onto the line minimized - which is now the normal
+/// way in, and also what a window hung up while already minimized looks like.
+/// Its "parked" rect is the minimized position, so that is what it has to stay
+/// at.
 pub fn parked_minimized(parked: &Parked) -> bool {
     parked.parked.left <= -31000 && parked.parked.top <= -31000
 }
 
-/// Whether the window is still hanging the way we left it: off screen at the
-/// parked rect, or - for a window hung up while minimized - still minimized.
+/// Whether the window is still hanging the way we left it: minimized, or - for
+/// a window that refused to minimize - still sitting at its off-screen rect.
 /// Anything else means the taskbar, Alt+Tab or a virtual-desktop switch put it
 /// back where the user can see it.
 pub fn still_hung(hwnd: HWND, parked: &Parked) -> bool {
@@ -528,11 +549,11 @@ pub fn centred_on(parked: &Parked, work: Rect) -> Parked {
 /// Quietly leaves a parked window minimized.
 ///
 /// Quitting is not "give me all my windows back": a line with eight cards would
-/// throw eight windows onto the desktop at once. The window goes back to its
-/// remembered place with the minimized show state, so its taskbar button is
-/// there and one click brings it back where it belongs. The placement is applied
-/// in a single call, while the window is still off screen, so it is never drawn
-/// in the normal state on the way out.
+/// throw eight windows onto the desktop at once. A window parked the normal way
+/// is already minimized, so this returns at once; it matters for the fallback
+/// (a window that refused to minimize and was moved off screen) and for journal
+/// entries written by older versions. The placement is applied in a single call,
+/// so the window is never drawn in the normal state on the way out.
 pub fn stow(hwnd: HWND, parked: &Parked) -> bool {
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() {
