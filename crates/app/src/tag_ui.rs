@@ -35,20 +35,21 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{EM_SETCUEBANNER, WM_MOUSELEAVE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
+    GetFocus, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
     TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
-    GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HideCaret, IsWindow, LoadCursorW, PostMessageW, RegisterClassExW,
-    SendMessageW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowCaret, ShowWindow, CS_DROPSHADOW, EN_CHANGE, GWLP_USERDATA, GWLP_WNDPROC, HICON,
-    HWND_TOPMOST, IDC_ARROW, IDC_HAND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW,
-    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WNDCLASSEXW, WNDPROC, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCaretBlinkTime,
+    GetClientRect, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, HideCaret, IsWindow, KillTimer, LoadCursorW,
+    PostMessageW, RegisterClassExW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCaret, ShowWindow, CS_DROPSHADOW,
+    EN_CHANGE, GWLP_USERDATA, GWLP_WNDPROC, HICON, HWND_TOPMOST, IDC_ARROW, IDC_HAND,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR,
+    WM_SETFONT, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::app::App;
@@ -67,14 +68,21 @@ const EM_SCROLLCARET: u32 = 0x00B7;
 /// Posted by [`close_saving`], which cannot call `save` directly.
 const WM_SAVE_AND_CLOSE: u32 = WM_APP + 1;
 
+/// Keeps the field's caret blinking; see [`keep_caret`]. The popover owns no
+/// other timer, so any id will do.
+const CARET_TIMER: usize = 0x7A11;
+
 /// Logical geometry. The width is deliberately card-sized: a 300 px popover
 /// hanging under a 168 px card would read as a separate window.
 const WIDTH: f32 = 286.0;
-const HEIGHT: f32 = 142.0;
+const HEIGHT: f32 = 136.0;
 const PAD: f32 = 14.0;
 const TITLE_H: f32 = 16.0;
 const FIELD_GAP: f32 = 8.0;
-const FIELD_H: f32 = 40.0;
+/// Tall enough for one line of the field's font plus even air above and below.
+/// A taller box does not make the field easier to hit; it just leaves the text
+/// stranded in the middle of a lot of nothing.
+const FIELD_H: f32 = 34.0;
 const BUTTON_H: f32 = 30.0;
 const BUTTON_GAP: f32 = 8.0;
 const SAVE_W: f32 = 76.0;
@@ -251,16 +259,23 @@ pub fn open(
         let layout = layout(s);
         let edit_x = layout.field.left + (12.0 * s).round() as i32;
         let edit_w = (layout.field.right - layout.field.left) - (24.0 * s).round() as i32;
-        // A stock single-line edit draws its text from the top of its client
-        // area, so a box sized by eye can shave the bottom of the glyphs on a
-        // display whose font runs a pixel taller. The box asks the font how
-        // tall a line is and keeps a little air around it.
+        // A stock single-line edit draws its line from the top of its client
+        // area: the caret sits at y = 0 and the box below the text is empty.
+        // So the box is cut to one line, and it is the *text* that gets
+        // centred in the field, not the box. A box sized by eye is what made
+        // the label ride high in its own field.
         let field_h = layout.field.bottom - layout.field.top;
-        let text_h = text_height(fonts.edit, s);
-        let edit_h = (text_h + (8.0 * s).round() as i32)
-            .min(field_h - (4.0 * s).round() as i32)
-            .max(text_h + 2);
-        let edit_y = layout.field.top + (field_h - edit_h) / 2;
+        let line_h = text_height(fonts.edit, s);
+        let slack = (2.0 * s).round() as i32;
+        let edit_h = (line_h + slack).min(field_h);
+        // Glyphs do not fill the line box. A font keeps a band below the
+        // baseline for descenders, and a line of CJK or of lower-case Latin
+        // never reaches into it, so a box centred on the field still leaves the
+        // words sitting high with a gap under them. Half that band is what puts
+        // the ink, rather than the box, on the field's centre line.
+        let nudge = ((line_h as f32) * 0.075).round() as i32;
+        let edit_y =
+            (layout.field.top + (field_h - edit_h) / 2 + nudge).min(layout.field.bottom - edit_h);
         let initial_wide = wstr(initial);
         let edit = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -351,6 +366,11 @@ pub fn open(
             // as a picture of an input box. Showing it again now that the window
             // is up is what makes it flash.
             restart_caret(edit);
+            // ...and again on every blink period, because that clock stops on
+            // its own a few seconds later: measured here as a caret left in the
+            // "on" phase for good, with the popover still foreground, active and
+            // focused. See `keep_caret`.
+            let _ = SetTimer(Some(hwnd), CARET_TIMER, blink_ms(), None);
         }
         (*state).ready = true;
     }
@@ -367,6 +387,38 @@ unsafe fn restart_caret(edit: HWND) {
         }
         let _ = HideCaret(Some(edit));
         let _ = ShowCaret(Some(edit));
+    }
+}
+
+/// How often the caret is re-shown: once per blink period, so the tick lands on
+/// the moment Windows would have shown it anyway. A field whose blink clock is
+/// still running therefore looks exactly as it would without us.
+fn blink_ms() -> u32 {
+    let blink = unsafe { GetCaretBlinkTime() };
+    // 0xFFFF_FFFF means the user asked for no blinking at all; 530 ms is the
+    // system default.
+    if (200..=1200).contains(&blink) {
+        blink
+    } else {
+        530
+    }
+}
+
+/// Restarts the field's blink clock, if the field is the one with the focus.
+///
+/// Windows stops that clock on its own a few seconds after the popover opens
+/// and leaves the caret painted in whichever phase it was in - a still bar in a
+/// field that is perfectly ready to be typed into. Nothing else brings it back:
+/// measured with the popover foreground, active and focused, `SetCaretBlinkTime`
+/// and `SetFocus` changed nothing, and neither did input; only showing the
+/// caret again restarts the clock. Doing that once per blink period is cheap
+/// and invisible.
+unsafe fn keep_caret(edit: HWND) {
+    unsafe {
+        if edit.is_invalid() || GetFocus() != edit {
+            return;
+        }
+        restart_caret(edit);
     }
 }
 
@@ -940,6 +992,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
+            WM_TIMER if wp.0 == CARET_TIMER => {
+                if !ptr.is_null() {
+                    keep_caret((*ptr).edit);
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 cancel(hwnd);
                 LRESULT(0)
@@ -949,6 +1007,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), CARET_TIMER);
                 OPEN.store(OPEN_FAILED, Ordering::Relaxed);
                 LRESULT(0)
             }
