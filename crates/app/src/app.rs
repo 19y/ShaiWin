@@ -152,6 +152,16 @@ const PEEK_LIFE: Duration = Duration::from_secs(6);
 /// this long before the cards come back. Short enough to feel immediate, long
 /// enough that passing over the rope does not cover the window being used.
 const RAISE_DWELL: Duration = Duration::from_millis(140);
+/// How long the cards stay up after the pointer leaves the line's strip.
+///
+/// Reaching for a card at the far end of the line is a diagonal move that can
+/// leave the strip for a moment - a hand that overshoots past the card's bottom
+/// edge, a fast flick the poll samples twice. Without the grace that single
+/// sample demotes the layer, and a card behind the user's window is no longer a
+/// handle, so the only way back is the rope again. Short enough that a pointer
+/// that really did go back to work does not keep the cards over it for long,
+/// and any click or foreground change sinks them at once regardless.
+const SINK_GRACE: Duration = Duration::from_millis(700);
 
 /// Non-resident mode: the line is a short visit, not furniture. `auto_hide_secs`
 /// in the settings is the idle clock; these are the events that can end an empty
@@ -409,6 +419,10 @@ pub struct App {
     /// The cards come back after `RAISE_DWELL`, so brushing the rope does not
     /// cover the window being worked in.
     raise_since: Option<Instant>,
+    /// When the pointer first left the line's strip while the cards were up.
+    /// They sink after `SINK_GRACE`, so a crossing that strays out of the strip
+    /// and back does not cost the user the trip.
+    sink_since: Option<Instant>,
     /// Whether the pointer was on the line at the previous poll, so leaving it
     /// is an edge the visit rules can see once.
     line_hot: bool,
@@ -605,6 +619,7 @@ impl App {
                 peek_since: None,
                 peek_hot: None,
                 raise_since: None,
+                sink_since: None,
                 line_hot: false,
                 line_was_empty: true,
                 menu_open: false,
@@ -1902,9 +1917,29 @@ impl App {
         // position - is what always brings a covered line back.
         let card_hit = self.card_at(local).filter(|id| *id != PEEK_ID);
         let on_card = card_hit.is_some() && (self.topmost || !self.covered_at((cx, cy)));
-        let over_rope =
-            self.revealed && self.on_rope(local, (self.slide - 1.0) * self.layout.panel_height());
-        let on_line = self.revealed && (over_rope || on_card);
+        // The panel slides in and out from the top edge, so every shape of the
+        // line moves with it.
+        let slide_y_off = (self.slide - 1.0) * self.layout.panel_height();
+        let over_rope = self.revealed && self.on_rope(local, slide_y_off);
+        // A handle is something the line answers to: the rope, or a card that is
+        // really visible. Clicking anywhere else - including the empty space
+        // inside the line's own strip - is the user going back to their work.
+        let on_handle = self.revealed && (over_rope || on_card);
+        // The line's own strip, which is not a handle but is not the desktop
+        // either. The rope sits at y=26 and the cards start 22 px below it, so
+        // between two neighbouring cards there is a corridor as tall as a card
+        // where the pointer is on neither. Reaching a card at the far end of the
+        // line means crossing one of those corridors, and on a wide screen the
+        // empty space past the outermost card as well. The pointer there is
+        // still reaching for the line.
+        let in_band = self.revealed && self.in_line_area(local, slide_y_off);
+        // The strip only counts while the cards are already up. It must not
+        // raise them - that stays the rope's job, so a pointer merely parked in
+        // the strip cannot pull the wall over somebody's window - and it must
+        // not keep a visit alive on its own, which would leave a line nobody
+        // looked at on screen for as long as the pointer rested near the top.
+        let crossing = in_band && self.topmost;
+        let on_line = on_handle || crossing;
         let in_hand = self.in_hand();
         // Only gestures of the line's own keep the cards up. A window of the
         // user's being dragged past the top is not one: the cards must not come
@@ -1914,11 +1949,13 @@ impl App {
         // A click that lands off the line and moved nothing is the user going
         // elsewhere. Judged when the button is up, from either edge of it: the
         // press that starts dragging a window to the rope also lands off the line,
-        // and the cards must not sink in the middle of that gesture.
+        // and the cards must not sink in the middle of that gesture. It is judged
+        // against the handles, not the strip: a click in the strip's empty space
+        // lands on the window underneath, and that is the user leaving.
         let click_off_line = !left_down
             && (left_released || press_latched)
             && !self.press_dragged
-            && !on_line
+            && !on_handle
             && !in_hand;
         // The window just taken down being dragged about is the same gesture as
         // taking it: as long as its rectangle keeps changing under a held button,
@@ -1955,11 +1992,14 @@ impl App {
         }
 
         // The cards hold the top of the screen only while the line itself is
-        // being used: a card in the hand, the editor, or the pointer on a card
-        // that is actually visible or on the rope. Any other place - his work,
-        // another window, the taskbar - and the layer goes back behind it. That
-        // is the whole rule now: no click or foreground event has to be watched
-        // for, because a pointer that is not on the line is already the answer.
+        // being used: a card in the hand, the editor, the pointer on a card that
+        // is actually visible or on the rope, or a crossing that has not yet
+        // strayed out of the line's strip. Any other place - his work, another
+        // window, the taskbar - and the layer goes back behind it, after
+        // `SINK_GRACE` if the pointer was in the strip a moment ago. A click on
+        // the work or another window taking the foreground skips the grace:
+        // both are the user saying they are done, and waiting would only cover
+        // the window they just chose.
         // The rope's own topmost layer keeps the line in sight while the cards
         // are down, and reaching for it is what brings them back.
         //
@@ -1974,13 +2014,16 @@ impl App {
         if self.revealed && !self.menu_open {
             if holding {
                 self.raise_since = None;
+                self.sink_since = None;
                 self.set_topmost(true);
             } else if dragging {
                 self.raise_since = None;
+                self.sink_since = None;
                 self.set_topmost(false);
             } else if on_card {
                 // A visible card under the pointer means the line is being used.
                 self.raise_since = None;
+                self.sink_since = None;
                 self.set_topmost(true);
             } else if over_rope {
                 // The rope is not a button: a pointer crossing it on the way to
@@ -1995,12 +2038,45 @@ impl App {
                         self.set_topmost(true);
                     }
                 }
-            } else {
+                self.sink_since = None;
+            } else if click_off_line || foreground_left {
+                // The two ways of saying "I am done with the line": a click
+                // that landed on the work, or another window taking the
+                // foreground. Neither waits for the grace - the user has
+                // already answered the question the grace exists to ask.
                 self.raise_since = None;
+                self.sink_since = None;
                 self.set_topmost(false);
+            } else if in_band {
+                // Still inside the line's strip with the cards up: leave the
+                // z-order alone. This is the crossing that used to drop the
+                // cards - rope, then the corridor between two cards, then the
+                // card being reached for - and the pointer was never anywhere
+                // else. It does not raise them: that stays the rope's job, so a
+                // pointer parked in the strip cannot pull the wall down over
+                // somebody's window.
+                self.raise_since = None;
+                self.sink_since = None;
+            } else if !self.topmost {
+                // Nothing to sink and nothing to time. The strip is not a way
+                // back up, so a pointer resting in it must not start a clock.
+                self.raise_since = None;
+                self.sink_since = None;
+            } else {
+                // Off the strip with the cards up. The crossing is allowed to
+                // stray out of it for `SINK_GRACE` before the cards go, so a
+                // hand that overshoots a card's edge and comes back still finds
+                // them up. Past that the pointer really is elsewhere.
+                self.raise_since = None;
+                let since = *self.sink_since.get_or_insert(now);
+                if now.duration_since(since) >= SINK_GRACE {
+                    self.sink_since = None;
+                    self.set_topmost(false);
+                }
             }
         } else {
             self.raise_since = None;
+            self.sink_since = None;
         }
 
         // Hover and click-through: a card is a target wherever the pointer can
@@ -2103,10 +2179,11 @@ impl App {
     ///
     /// The line is a short visit, not furniture. Everything that means "the
     /// user is still using this" restarts the same short clock: the pointer on
-    /// the rope or a card, a card pressed, a window or card in hand, the tag
-    /// editor open, a menu of ours up. When the pointer leaves, `auto_hide_secs`
-    /// (1 s by default) is all it gets to be picked up again; `0` removes the
-    /// clock and leaves only Escape and the shortcut.
+    /// the rope or a card, a crossing between them while the cards are up, a
+    /// card pressed, a window or card in hand, the tag editor open, a menu of
+    /// ours up. When the pointer leaves, `auto_hide_secs` (1 s by default) is
+    /// all it gets to be picked up again; `0` removes the clock and leaves only
+    /// Escape and the shortcut.
     ///
     /// Deliberate leave-taking does not wait for the clock. A click away or
     /// another window taking the foreground ends the visit after the slide-out
@@ -2183,6 +2260,31 @@ impl App {
             self.take_watch = Some(TakeWatch { rect, ..watch });
         }
         moved
+    }
+
+    /// Whether the pointer is inside the strip the line occupies: from just
+    /// above the rope down to the bottom of the cards.
+    ///
+    /// This is the line's own room, not a handle. It never brings the cards
+    /// down - only the rope does that - it only stops them going away while the
+    /// pointer is still in it. The rope sits at `ROPE_TOP` and the cards start
+    /// `CARD_TOP_GAP` below it, so between two neighbouring cards there is a
+    /// corridor as tall as a card that belongs to neither. Reaching for a card
+    /// at the far end of the line means crossing one, and on a wide screen the
+    /// empty space past the outermost card as well; a pointer there is still
+    /// reaching for the line, not for the desktop behind it.
+    ///
+    /// The floor is the bottom of the cards, not the bottom of the overlay
+    /// window: the strip keeps breathing room under the cards, and that room is
+    /// where the user's windows live. The very top of the screen is left out
+    /// for the same reason - that band is where the pointer sits when it is not
+    /// asking for anything, and it is what opens the pill.
+    fn in_line_area(&self, local: (i32, i32), y_off: f32) -> bool {
+        let x = local.0 as f32;
+        let y = local.1 as f32;
+        let top = self.layout.rope_y(0.0) + y_off - self.layout.rope_reach();
+        let bottom = self.layout.card_bottom() + y_off;
+        x >= 0.0 && x < self.layout.width && y >= top && y < bottom
     }
 
     /// Whether the pointer is near the drawn rope. The old answer included the

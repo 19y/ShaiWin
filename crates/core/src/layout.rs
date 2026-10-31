@@ -116,6 +116,17 @@ impl LineLayout {
         self.rope_y(self.width / 2.0) + CARD_TOP_GAP * self.scale
     }
 
+    /// The bottom edge of the cards, in device pixels below the top edge.
+    ///
+    /// The floor of the line's own strip. The cards hang from the deepest point
+    /// of the rope - its middle - so this is the lowest a card reaches; below it
+    /// is the user's desktop, which the line never claims. The strip the overlay
+    /// window occupies is taller (`panel_height`), because it keeps breathing
+    /// room under the cards, and that room is not part of the line.
+    pub fn card_bottom(&self) -> f32 {
+        self.hang_zone() + CARD_H * self.scale
+    }
+
     /// Whether the window being dragged has its own top edge on the line. Where
     /// the pointer is says nothing about that: a window still in the middle of
     /// the screen has never met the rope, and answering for it hangs windows the
@@ -417,6 +428,32 @@ mod tests {
             "lowest = {lowest}, panel = {}",
             deep.panel_height()
         );
+    }
+
+    #[test]
+    fn the_line_stops_at_the_bottom_of_the_cards() {
+        // The floor of the strip the line claims. The overlay window is taller
+        // than the cards - it keeps breathing room under them - and that room
+        // belongs to the user's windows, so the two must not be confused.
+        for scale in [1.0, 1.5] {
+            let l = LineLayout::with_sag(2560.0, scale, 1.5);
+            let want = l.rope_y(1280.0) + (CARD_TOP_GAP + CARD_H) * scale;
+            assert!(
+                (l.card_bottom() - want).abs() < 0.01,
+                "card_bottom = {}, want = {want}",
+                l.card_bottom()
+            );
+            assert!(
+                l.card_bottom() > l.hang_zone(),
+                "the cards end below where they start"
+            );
+            assert!(
+                l.card_bottom() < l.panel_height(),
+                "card_bottom = {} leaves no room under the cards in a {} panel",
+                l.card_bottom(),
+                l.panel_height()
+            );
+        }
     }
 
     #[test]

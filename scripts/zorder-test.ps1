@@ -28,7 +28,14 @@
 #      a point below the band - where a card's own rectangle starts - does not
 #   9. a window of his being dragged never brings the cards up, not even while
 #      the pointer rests on the rope or on a visible card
-#   10. Escape puts a resident line away as well
+#   10. reaching a card at the end of the line works: the corridor between two
+#      cards, where the pointer is on neither the rope nor a card, does not
+#      demote the layer — a demoted card is behind his window and stops being a
+#      handle, so sinking there sent the user back to the rope every time
+#   11. the strip is not a way back up, and it is not the whole overlay window
+#      either: the cards linger `SINK_GRACE` after the pointer leaves the strip
+#      and then go, and a point below the cards is already his work
+#   12. Escape puts a resident line away as well
 #
 # It uses its own LOCALAPPDATA so it can never touch the real journal, and it
 # takes any running instance's windows down before stopping it.
@@ -288,7 +295,89 @@ try {
 
   Point-Real $overlay
 
-  Write-Host "== 8. Escape puts a resident line away =="
+  Write-Host "== 8. reaching for a card at the end of the line =="
+  # The reported loop: sweep the rope, the cards come up, then move towards a
+  # card at the end of the line. Between two neighbouring cards there is a
+  # corridor as tall as a card where the pointer is on neither the rope nor a
+  # card. Crossing it used to demote the layer, and a demoted card is behind the
+  # window he moved to, so it stopped being a handle - the only way back was the
+  # rope again.
+  Point-At $overlay $workPointX $workPointY
+  if (-not (Wait-Until ({ -not [W]::IsTopmost($overlay) }) 2500)) {
+    Fail "the cards did not go down before the crossing test"
+  }
+  $c = New-Fixture "C" 2
+  Invoke-Wm $overlay $KitHang ([IntPtr]::Zero) ([IntPtr]$c)
+  if (-not (Wait-Until ({ (Test-Cards $overlay) -ge 2 }) 8000)) {
+    Fail "the second window did not come up as a card"
+  }
+  $cards = @(Get-Hits $overlay | Where-Object { -not $_.Peek } | Sort-Object Left)
+  $near = $cards[0]
+  $farCard = $cards[-1]
+  # The line has recentred around two cards, so the rope is aimed at again: the
+  # clothespin is on the rope, so a card's top edge IS the rope at that x.
+  $ropeX = [int]($strip.Left + ($near.Left + $near.Right) / 2)
+  $ropeY = [int]($strip.Top + $near.Top)
+  # The corridor between the first two cards: below the rope's grab band, and
+  # well above the bottom of the cards.
+  $gapX = [int]($strip.Left + ($near.Right + $cards[1].Left) / 2)
+  $gapY = [int]($strip.Top + $near.Top + $reach * 3)
+  Write-Host "  the corridor is at ($gapX,$gapY), between cards ending at $($near.Right) and starting at $($cards[1].Left)"
+
+  Point-At $overlay $ropeX $ropeY
+  if (-not (Wait-Until ({ [W]::IsTopmost($overlay) }) 2000)) {
+    Fail "the rope did not raise the cards for the crossing test"
+  }
+  Point-At $overlay $gapX $gapY
+  Start-Sleep -Milliseconds 900     # longer than SINK_GRACE
+  if (-not [W]::IsTopmost($overlay)) {
+    Fail "crossing the corridor between two cards sank them; the card at the end is unreachable without going back to the rope"
+  }
+  Write-Host "  the cards stayed up across the corridor for 0.9 s"
+
+  $farX = [int]($strip.Left + ($farCard.Left + $farCard.Right) / 2)
+  $farY = [int]($strip.Top + $farCard.Top + ($farCard.Bottom - $farCard.Top) * 0.6)
+  Point-At $overlay $farX $farY
+  Start-Sleep -Milliseconds 400
+  if (-not [W]::IsTopmost($overlay)) {
+    Fail "the card at the end of the line was not reachable from the corridor"
+  }
+  if ([W]::IsClickThrough($overlay)) {
+    Fail "the card at the end of the line does not take clicks after the crossing"
+  }
+  Write-Host "  the far card is reachable and clickable without reaching for the rope again"
+
+  Write-Host "== 9. the cards linger, then go =="
+  # The grace is what makes a crossing that strays out of the strip and back
+  # survivable. It is short on purpose: the cards must not stay over his work,
+  # and a click on it sinks them at once.
+  Point-At $overlay $workPointX $workPointY
+  Start-Sleep -Milliseconds 300
+  if (-not [W]::IsTopmost($overlay)) {
+    Fail "the cards sank at once; a crossing that strays out of the strip has nothing to come back to"
+  }
+  if (-not (Wait-Until ({ -not [W]::IsTopmost($overlay) }) 2500)) {
+    Fail "the cards stayed up over his work well past the grace"
+  }
+  Write-Host "  still up at 0.3 s, behind his window by 2.5 s"
+
+  Write-Host "== 10. the floor of the strip is the bottom of the cards =="
+  # The overlay window is taller than the cards. The room under them belongs to
+  # his windows, so a point there must be cold even while the cards are up.
+  $underCards = [int]($strip.Top + $farCard.Bottom + ($strip.Bottom - $strip.Top - $farCard.Bottom) / 2)
+  Point-At $overlay $ropeX $ropeY
+  if (-not (Wait-Until ({ [W]::IsTopmost($overlay) }) 2000)) {
+    Fail "the rope did not raise the cards for the floor test"
+  }
+  Point-At $overlay $farX $underCards
+  if (-not (Wait-Until ({ -not [W]::IsTopmost($overlay) }) 2500)) {
+    Fail "the room under the cards kept them up; that height belongs to his windows"
+  }
+  Write-Host "  a point under the cards is cold"
+
+  Point-Real $overlay
+
+  Write-Host "== 11. Escape puts a resident line away =="
   if ([W]::GetForegroundWindow() -eq [IntPtr]::Zero) {
     # Keys need somewhere to go. A session with no foreground window (a runner
     # with no input desktop) drops them, and that is the harness, not the app.
