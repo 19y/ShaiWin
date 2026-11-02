@@ -40,7 +40,7 @@
 
 **运行要求**：Windows 10 1809+ 或 Windows 11，x64。
 
-> 维护者：`git tag v0.1.2 && git push origin v0.1.2` 就会触发 GitHub Actions，自动跑测试、构建、打包并创建对应的 release（见 `.github/workflows/release.yml`）；本地出同款包用 `scripts\package.ps1`。
+> 维护者：`git tag v0.1.3 && git push origin v0.1.3` 就会触发 GitHub Actions，自动跑测试、构建、打包并创建对应的 release（见 `.github/workflows/release.yml`）；本地出同款包用 `scripts\package.ps1`。
 
 ### 方式二：自己搭建环境构建
 
