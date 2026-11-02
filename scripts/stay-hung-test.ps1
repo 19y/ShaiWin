@@ -9,16 +9,20 @@
 #   1. clicking a card shows its window and leaves the card on the rope
 #   2. clicking it again while it is already open only puts it in front: the
 #      window does not move, the card does not leave
-#   3. minimizing and maximizing change nothing about the line
-#   4. a window moved while it is open comes back where the user left it, not
+#   3. a window that comes down in the moment after a show of our own - Windows
+#      restores a minimized window together with the windows it owns - goes back
+#      up on the line, and its card never leaves; the same window restored with
+#      nothing just shown is the user's own restore and the card follows it
+#   4. minimizing and maximizing change nothing about the line
+#   5. a window moved while it is open comes back where the user left it, not
 #      where it was when it first went up
-#   5. taking a card down is the only way off the rope, and the window is left
+#   6. taking a card down is the only way off the rope, and the window is left
 #      exactly where it stands
-#   6. letting go of a card removes it and touches no window at all
-#   7. kill ShaiWin with a card hanging over an open window, start it again
+#   7. letting go of a card removes it and touches no window at all
+#   8. kill ShaiWin with a card hanging over an open window, start it again
 #      -> the pin is still on the rope and the window was never moved
 #
-# `stay_hung` is left out of the settings file on purpose: all seven steps are
+# `stay_hung` is left out of the settings file on purpose: all eight steps are
 # about what the app does when nobody configured it, which is the default the
 # setting ships on.
 #
@@ -169,8 +173,70 @@ try {
   $focus = if (Test-Foreground $b) { "B holds the focus" } else { "the focus stayed on $([W]::GetForegroundWindow()) - this session grants it to nobody" }
   Write-Host "  each card raises its own window; A is still at $($after.Left),$($after.Top) with its card in the same slot; $focus"
 
-  # --- 3: the window can do what it likes -------------------------------------
-  Write-Host "== 3. minimizing and maximizing are none of the line's business =="
+  # --- 3: the window that came down with the one we showed --------------------
+  Write-Host "== 3. a click on one card does not bring down the card next to it =="
+  # The reported bug: A and B both on the rope, B covering A, click A's card and
+  # B lands on the desktop as well.
+  #
+  # It is not the line opening anything. A minimized window comes back together
+  # with the windows it owns, so restoring one window restores its whole group,
+  # and two cards can be two windows of one application. The app is never told
+  # about the second window - it simply is not parked the next time the windows
+  # are read. The tell is that it arrived in the moment after a show of our own;
+  # a restore the user did himself (taskbar, Alt+Tab, the window's own button) is
+  # his business and the card follows it.
+  #
+  # One half of that tell cannot be read here: a restore the user did also brings
+  # that window the focus, and this session reports no foreground window at all,
+  # so the arrival always looks unfocused. What is tested is the arrival itself.
+  Take $a
+  Take $b
+  if (-not (Wait-Until ({ (-not (Record $a)) -and (-not (Record $b)) }) 6000)) {
+    $left = @(Read-SharedText $journal | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object { ($_ -split "`t")[0] })
+    $alive = [bool](Get-Process -Id $script:proc.Id -ErrorAction SilentlyContinue)
+    Fail "taking A's and B's cards down left a record behind (file=$([bool](Test-Path $journal)) app alive=$alive records=$(($left) -join ', '))"
+  }
+  Hang $a
+  Hang $b
+  if (-not (Wait-Until ({ (Test-Parked $a) -and (Test-Parked $b) }) 6000)) {
+    Fail "A and B did not both go back up on the rope"
+  }
+
+  Open $a
+  if (-not (Wait-Until ({ Test-OnDesktop $a }) 6000)) { Fail "clicking A's card did not put A on the desktop" }
+  $bWasParked = Test-Parked $b
+  [void][W]::ShowWindow($b, 9)   # SW_RESTORE, straight to Windows: the group arrival
+  if (-not (Wait-Until ({ Test-Parked $b }) 6000)) {
+    $why = if (-not $bWasParked) { "B was already on the desktop before the click, so the arrival proves nothing" } else { "it was left out where Windows put it" }
+    Fail "B came down with the window A's card asked for and the line let it stay - ${why}: $(Get-Rect $b)"
+  }
+  Assert-OnLine $b "B was put back on the line after it arrived unasked"
+  if ((Record $b).Shown) { Fail "B's record says the line is keeping a window that is parked" }
+  if (-not (Test-OnDesktop $a)) { Fail "putting B back took A off the desktop too" }
+  # And the app has to say it did it. Without this line the test cannot tell the
+  # repair from a window that never came down at all, and it would pass on a bug.
+  $log = Join-Path $state "ShaiWin\shaiwin.log"
+  $said = @(Read-SharedText $log | Where-Object { $_ -match "came down with the window we just showed" })
+  if (-not $said) {
+    Fail "B is parked again and the line never said it put it back - either the window never arrived, or something else moved it"
+  }
+  Write-Host "  A stayed open, B went back up to the line, its card never left ($($said[0]))"
+
+  # The same arrival when nothing was just shown is the user's own restore, and
+  # the card has to follow it rather than fight it.
+  Start-Sleep -Milliseconds 1300   # past the moment a show of ours can still explain
+  [void][W]::ShowWindow($b, 9)
+  if (-not (Wait-Until ({ Test-OnDesktop $b }) 6000)) {
+    Fail "restoring B with nothing just shown left it parked - the line took back a window the user brought down himself"
+  }
+  if (-not (Wait-Until ({ (Record $b) -and (Record $b).Shown }) 6000)) {
+    Fail "B is on the desktop and its record does not say the card is keeping it"
+  }
+  Assert-OnLine $b "B was restored on its own"
+  Write-Host "  restored again with nobody just shown, B was left on the desktop with its card"
+
+  # --- 4: the window can do what it likes -----------------------------------
+  Write-Host "== 4. minimizing and maximizing are none of the line's business =="
   $place = Get-Rect $a
   $cardBefore = Card-Rect $a
   [void][W]::ShowWindow($a, 6)   # SW_MINIMIZE, the title bar button
@@ -194,8 +260,8 @@ try {
   Assert-OnLine $a "A was maximized"
   Write-Host "  maximized, still hanging"
 
-  # --- 4: the place the user left it ------------------------------------------
-  Write-Host "== 4. a window moved while it is open comes back where it was left =="
+  # --- 5: the place the user left it ------------------------------------------
+  Write-Host "== 5. a window moved while it is open comes back where it was left =="
   [void][W]::ShowWindow($a, 9)   # SW_RESTORE, so the move below is a real move
   if (-not (Wait-Until ({ -not [W]::IsZoomed($a) -and -not [W]::IsIconic($a) }) 3000)) {
     Fail "A would not come out of the maximized state"
@@ -216,8 +282,8 @@ try {
   Assert-OnLine $a "A came back from a minimize"
   Write-Host "  back at $($back.Left),$($back.Top), where the user had put it"
 
-  # --- 5: the only way off ----------------------------------------------------
-  Write-Host "== 5. taking a card down is final, and leaves the window alone =="
+  # --- 6: the only way off ----------------------------------------------------
+  Write-Host "== 6. taking a card down is final, and leaves the window alone =="
   $where = Get-Rect $a
   Take $a
   if (-not (Wait-Until ({ $null -eq (Record $a) }) 6000)) { Fail "taking A's card down left a record behind" }
@@ -229,8 +295,8 @@ try {
   if (-not (Test-OnDesktop $a)) { Fail "A is not on the desktop after its card was taken down: $still" }
   Write-Host "  card and record gone; A stays at $($still.Left),$($still.Top)"
 
-  # --- 6: letting go ----------------------------------------------------------
-  Write-Host "== 6. letting go of a card touches no window =="
+  # --- 7: letting go ----------------------------------------------------------
+  Write-Host "== 7. letting go of a card touches no window =="
   $where = Get-Rect $b
   LetGo $b
   if (-not (Wait-Until ({ $null -eq (Record $b) }) 5000)) { Fail "letting go of B's card left a record behind" }
@@ -241,16 +307,15 @@ try {
   }
   Write-Host "  gone from the rope, still where it was"
 
-  # --- 7: across a crash ------------------------------------------------------
-  Write-Host "== 7. kill ShaiWin with a pin over an open window, start it again =="
+  # --- 8: across a crash ------------------------------------------------------
+  Write-Host "== 8. kill ShaiWin with a pin over an open window, start it again =="
   $c = New-Fixture "C" 2
   Hang $c
   if (-not (Wait-Until ({ Test-Parked $c }) 6000)) { Fail "C was not hung up" }
   Open $c
   if (-not (Wait-Until ({ (Record $c) -and (Record $c).Shown }) 5000)) { Fail "C is open and its card is not recorded as keeping it" }
   $where = Get-Rect $c
-  Get-Process shaiwin -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Milliseconds 600
+  Stop-OurShaiwin
   $script:proc = Start-Shaiwin $Exe $state
   Start-Sleep -Milliseconds 2200
   if (-not (Test-Window (Get-Overlay))) { Fail "the overlay is gone after the restart" }
@@ -263,7 +328,7 @@ try {
   }
   Write-Host "  the pin came back and C did not move"
 
-  Write-Host "== 8. take everything down =="
+  Write-Host "== 9. take everything down =="
   Invoke-Wm (Get-Overlay) $KitTakeAll ([IntPtr]::Zero) ([IntPtr]::Zero)
   if (-not (Wait-Until ({ -not (Test-Path $journal) }) 8000)) { Fail "the journal survived taking everything down" }
   $script:passed = $true

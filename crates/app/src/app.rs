@@ -141,6 +141,15 @@ const REHANG_GRACE: Duration = Duration::from_millis(650);
 /// has just moved, short enough that Alt+Tabbing to a card that has been hanging
 /// for a moment still brings it back.
 const PARK_FOREGROUND_GRACE: Duration = Duration::from_millis(1200);
+/// How long after *showing* a window another window arriving on the desktop is
+/// still explained by that show.
+///
+/// The one measured case is Windows' own group restore: a minimized window comes
+/// back together with the windows it owns, so showing one card's window can land
+/// a neighbouring card's window on the desktop in the same moment without a word
+/// to the app. Two polls is all that takes, and nobody Alt+Tabs inside 900 ms of
+/// clicking a card.
+const SHOW_GRACE: Duration = Duration::from_millis(900);
 /// How often to retry handing the focus away from a parked window that took it
 /// from a hand-over and is still holding it. Each attempt activates another
 /// window, and the shell repaints the taskbar for every activation, so there is
@@ -510,6 +519,12 @@ pub struct App {
     /// would read that as "the user asked to see it" and take the card straight
     /// back down again.
     recent_park: Option<(isize, Instant)>,
+    /// The card whose window we ourselves just put onto the desktop, and when.
+    /// A minimized window comes back together with the windows it owns, so
+    /// showing one card's window can land a neighbouring card's window on the
+    /// desktop in the same moment, without a word to the app. The stamp is what
+    /// makes that second window's arrival recognisable as ours to undo.
+    last_show: Option<(u64, Instant)>,
     /// A card that is hung but has not been painted yet, and when its window was
     /// moved off screen. The gap is the part of a hang the user actually waits
     /// for: everything before it happens while the window is still on screen.
@@ -702,6 +717,7 @@ impl App {
                 pending_foreground: None,
                 stuck_foreground: None,
                 recent_park: None,
+                last_show: None,
                 hang_undrawn: None,
                 window_icon,
                 tray_icon,
@@ -1714,6 +1730,10 @@ impl App {
         if self.line.dragging == Some(id) {
             self.line.dragging = None;
         }
+        // Both paths above touched this window - one restored it, the other raised
+        // it - so any window that comes down in the next moment alongside this one
+        // came down with it, not because somebody asked for it.
+        self.last_show = Some((id, Instant::now()));
         if let Some(card) = self.line.get_mut(id) {
             card.shown = true;
         }
@@ -1808,6 +1828,11 @@ impl App {
         }
         if self.line.dragging == Some(id) {
             self.line.dragging = None;
+        }
+        if !already_out {
+            // This window is on the desktop because we put it there, so anything
+            // that arrives beside it in the next moment arrived with it.
+            self.last_show = Some((id, Instant::now()));
         }
         if unhook {
             self.painter.forget(id);
@@ -3254,6 +3279,18 @@ impl App {
                 // or bring it back from where it was put away.
                 let shown_now = !window::minimized(h) && window::on_screen(h);
                 let was_shown = self.line.get(id).is_some_and(|card| card.shown);
+                if !was_shown && shown_now && self.arrived_with_our_show(id, h) {
+                    crate::log!(
+                        "card {id}: window {hwnd} came down with the window we just showed"
+                    );
+                    if park::stow(h, &parked) {
+                        continue;
+                    }
+                    // It would not go back; the card keeps describing it.
+                    self.line.mark_shown(id, true);
+                    changed = true;
+                    continue;
+                }
                 if was_shown && !shown_now {
                     // The window went out of sight by itself. Remember the place
                     // it was standing in, so the next click brings it back there
@@ -3330,6 +3367,25 @@ impl App {
             .iter()
             .find(|c| c.hwnd == hwnd && !c.away && !c.leaving && !c.shown)
             .map(|c| c.id)
+    }
+
+    /// True when the window of `id` landed on the desktop as a side effect of the
+    /// show we just did for another card.
+    ///
+    /// A minimized window is restored together with the windows it owns, and two
+    /// cards can be hung windows of one application: the click asked for one and
+    /// Windows brought both down, without a word to the line. The tell is the
+    /// focus. A restore the user did himself - taskbar, Alt+Tab, a click on the
+    /// window - brings that window forward with it; a group restore leaves the new
+    /// arrival sitting on the desktop holding nothing.
+    fn arrived_with_our_show(&self, id: u64, h: HWND) -> bool {
+        let Some((shown, at)) = self.last_show else {
+            return false;
+        };
+        if shown == id || at.elapsed() >= SHOW_GRACE {
+            return false;
+        }
+        window::foreground() != Some(h)
     }
 
     /// The focus fell on a parked window without being asked for. Give it to a
@@ -3893,7 +3949,19 @@ impl App {
             // screen until some unrelated event asked again.
             let started = Instant::now();
             self.redraw();
-            self.pace_frame(started.elapsed().as_secs_f32());
+            // Nothing the user is watching closely is moving: only the ambient
+            // sway. Slow the rhythm so a line that hangs all day is not paying
+            // for sixty full-strip uploads a second. Anything under a pointer,
+            // in a hand, or mid-slide is not ambient - that is the motion the
+            // user is waiting on a frame for.
+            let ambient = self.line.ambient_only()
+                && (self.slide - target).abs() <= 0.0005
+                && self.drag.is_none()
+                && self.card_press.is_none()
+                && self.tag_card.is_none()
+                && !self.menu_open
+                && !self.peek;
+            self.pace_frame(started.elapsed().as_secs_f32(), ambient);
             if let Some((hwnd, parked_at)) = self.hang_undrawn.take() {
                 crate::log!(
                     "card {hwnd} drawn {} ms after the park",
@@ -3914,26 +3982,30 @@ impl App {
         }
     }
 
-    /// Slows the frame timer when a frame costs more than its slot.
+    /// Slows the frame timer when a frame costs more than its slot, and always to
+    /// at least half rate for ambient motion.
     ///
     /// Ten milliseconds of work cannot keep a sixteen-millisecond rhythm once
     /// the timer and Windows' own delivery are counted, and a screen-wide
     /// layered window uploaded faster than the machine can blend it holds up
     /// every other window on the desktop. Half the frame rate costs a little
     /// smoothness and gives the desktop back.
-    fn pace_frame(&mut self, cost: f32) {
+    fn pace_frame(&mut self, cost: f32, ambient: bool) {
         self.frame_cost = if self.frame_cost <= 0.0 {
             cost
         } else {
             self.frame_cost * 0.8 + cost * 0.2
         };
-        let want = if self.frame_cost > 0.018 {
+        let mut want = if self.frame_cost > 0.018 {
             FRAME_MS_SLOW
         } else if self.frame_cost > 0.009 {
             FRAME_MS_HALF
         } else {
             FRAME_MS
         };
+        if ambient {
+            want = want.max(FRAME_MS_HALF);
+        }
         if want == self.frame_ms {
             return;
         }

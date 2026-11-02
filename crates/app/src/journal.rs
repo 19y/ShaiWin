@@ -197,6 +197,12 @@ fn line(entry: &Entry) -> String {
     )
 }
 
+/// How the journal gets to disk.
+///
+/// Both the swap and the clear need delete-access to the file, which a reader
+/// that did not ask for delete sharing denies for as long as it holds it - so
+/// anything that reads this file while the app is running has to grant it (the
+/// tests do, in `Read-SharedText` in scripts/testkit.ps1).
 pub fn save(entries: &[Entry]) {
     let file = file();
     if let Some(dir) = file.parent() {

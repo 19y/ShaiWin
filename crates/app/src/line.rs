@@ -706,6 +706,29 @@ impl Line {
         })
     }
 
+    /// True while the only thing moving is the ambient sway - no card is being
+    /// dragged, hovered, dropped or leaving. A rope breathing in the wind once
+    /// every ten seconds does not need sixty frames a second, and the whole strip
+    /// uploaded sixty times a second is what a line that keeps its cards costs
+    /// while nobody touches it.
+    pub fn ambient_only(&self) -> bool {
+        if self.dragging.is_some() {
+            // A card in hand is drawn at the pointer, not at its spring, so it
+            // moves every frame while its own springs sit still.
+            return false;
+        }
+        let mut swaying = false;
+        for card in self.cards.iter().filter(|c| !c.away) {
+            if card.leaving || !card.x.at_rest() || (card.scale - card.scale_goal).abs() > 0.001 {
+                return false;
+            }
+            if !card.sway.at_rest() {
+                swaying = true;
+            }
+        }
+        swaying
+    }
+
     /// Maybe starts a gust. Returns true when it did, so the caller knows a
     /// redraw is needed.
     pub fn gauge(&mut self, now: Instant) -> bool {
@@ -890,7 +913,10 @@ mod tests {
         assert_eq!(line.live_count(), 2);
         assert_eq!(line.hooked_count(), 2);
         run(&mut line, &l, 1.0);
-        assert!(!line.animating(), "a window out on the desktop kept the line moving");
+        assert!(
+            !line.animating(),
+            "a window out on the desktop kept the line moving"
+        );
         assert!(line.take_down(1));
     }
 
@@ -915,6 +941,44 @@ mod tests {
         assert!(line.animating(), "a gust did not start anything moving");
         run(&mut line, &l, 2.5);
         assert!(!line.animating(), "the swing outlasted 2.5 s");
+    }
+
+    #[test]
+    fn only_the_ambient_swing_can_be_drawn_slowly() {
+        // A line that keeps its cards hangs there all day, and each gust used to
+        // cost sixty full-strip uploads a second for a swing nobody is looking at.
+        // Everything the user is waiting on a frame for has to stay at full rate.
+        let l = layout();
+        let mut line = Line::new();
+        hung(&mut line, &[1, 2], &l);
+        assert!(
+            !line.ambient_only(),
+            "a line that is standing still has nothing to draw slowly"
+        );
+
+        for card in line.cards.iter_mut() {
+            card.sway.retarget(2.4);
+        }
+        assert!(line.ambient_only(), "a gust is not ambient motion");
+
+        // A card in hand is drawn under the pointer, springs sitting still and all.
+        line.dragging = Some(1);
+        assert!(!line.ambient_only(), "a card being dragged is ambient");
+        line.dragging = None;
+
+        // A card that has not reached its slot is the motion the user asked for.
+        let slots = line.targets(&l);
+        line.cards[0].x.retarget(slots[slots.len() - 1] + 120.0);
+        assert!(!line.ambient_only(), "a card still travelling is ambient");
+        line.cards[0].x.settle();
+        assert!(
+            line.ambient_only(),
+            "settled the slot and the swing is back"
+        );
+
+        // A card leaving the line is a window coming down: every frame of it.
+        assert!(line.take_down(1));
+        assert!(!line.ambient_only(), "a leaving card is ambient");
     }
 
     /// Where each hanging card belongs, in the order `step` walks the line.

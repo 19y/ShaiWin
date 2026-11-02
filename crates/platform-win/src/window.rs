@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetForegroundWindow,
     SetWindowPos, ShowWindow, WindowFromPoint, GA_PARENT, GA_ROOT, GUITHREADINFO, GUI_INMOVESIZE,
     GWL_EXSTYLE, GW_HWNDNEXT, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
-    WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_EX_TOOLWINDOW,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 use crate::Rect;
