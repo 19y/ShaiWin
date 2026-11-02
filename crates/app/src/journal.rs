@@ -48,6 +48,11 @@ pub struct Entry {
     /// The user's short label for the card. Empty when untagged. Mainly so a
     /// loaded line can be read at a glance; it never affects parking.
     pub tag: String,
+    /// The line was keeping its cards and this window was out on the desktop:
+    /// the card hangs, and nothing is waiting to be put back. Recorded so the
+    /// pins survive a restart of ShaiWin - dropping the record would take a card
+    /// off the rope the user never took down.
+    pub shown: bool,
 }
 
 fn file() -> PathBuf {
@@ -68,7 +73,7 @@ pub fn load() -> Vec<Entry> {
 }
 
 fn parse(line: &str) -> Option<Entry> {
-    let mut f = line.splitn(18, '\t');
+    let mut f = line.splitn(19, '\t');
     let hwnd = f.next()?.parse().ok()?;
     let pid = f.next()?.parse().ok()?;
     let process_start = f.next()?.parse().ok()?;
@@ -93,6 +98,8 @@ fn parse(line: &str) -> Option<Entry> {
     let centred = f.next() == Some("1");
     // The tag arrived last, so every record written before it still reads.
     let tag = f.next().map(unescape).unwrap_or_default();
+    // And the shown flag after it, which no record written before has.
+    let shown = f.next() == Some("1");
     Some(Entry {
         hwnd,
         pid,
@@ -128,6 +135,7 @@ fn parse(line: &str) -> Option<Entry> {
         offset,
         centred,
         tag,
+        shown,
     })
 }
 
@@ -157,7 +165,7 @@ fn unescape(s: &str) -> String {
 fn line(entry: &Entry) -> String {
     let p = &entry.placement;
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{}\t{},{}\t{},{}\t{},{},{},{}\t{},{}\t{}\t{:.3}\t{:.1}\t{:.3}\t{}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{},{},{},{}\t{},{}\t{},{}\t{},{},{},{}\t{},{}\t{}\t{:.3}\t{:.1}\t{:.3}\t{}\t{}\t{}\n",
         entry.hwnd,
         entry.pid,
         entry.process_start,
@@ -185,6 +193,7 @@ fn line(entry: &Entry) -> String {
         entry.zoom_y,
         u8::from(entry.centred),
         escape(&entry.tag),
+        u8::from(entry.shown),
     )
 }
 
@@ -269,6 +278,7 @@ mod tests {
             offset: -42.0,
             centred: true,
             tag: "work".to_string(),
+            shown: true,
         };
         let text = line(&entry);
         let back = parse(text.trim_end()).expect("parses");
@@ -280,6 +290,7 @@ mod tests {
         assert_eq!(back.hooked_away, entry.hooked_away);
         assert!(back.centred);
         assert_eq!(back.tag, entry.tag);
+        assert!(back.shown);
         assert!((back.zoom - entry.zoom).abs() < 0.001);
         assert!((back.zoom_y - entry.zoom_y).abs() < 0.001);
         assert!((back.offset - entry.offset).abs() < 0.1);
@@ -338,6 +349,7 @@ mod tests {
             offset: 0.0,
             centred: false,
             tag: String::new(),
+            shown: false,
         };
         // An old record is today's line with the fields added since removed.
         let full = line(&entry).trim_end_matches('\n').to_string();
@@ -357,9 +369,9 @@ mod tests {
 
     #[test]
     fn a_record_from_before_the_height_still_keeps_its_zoom_and_offset() {
-        // The height and the centring flag are the last fields, so an old
-        // record's zoom and offset are still read from where they were, and
-        // only those last two default.
+        // The height, the centring flag, the tag and the shown flag came last, so
+        // an old record's zoom and offset are still read from where they were,
+        // and only the fields added since default.
         let entry = Entry {
             hwnd: 7,
             pid: 8,
@@ -410,10 +422,13 @@ mod tests {
             offset: -37.0,
             centred: true,
             tag: String::new(),
+            shown: true,
         };
         let full = line(&entry).trim_end_matches('\n').to_string();
-        // Drop the tag, the centring flag and the height that came after it.
+        // Drop the shown flag, the tag, the centring flag and the height that
+        // came after them.
         let old = full.rsplit_once('\t').expect("more than one field").0;
+        let old = old.rsplit_once('\t').expect("more than one field").0;
         let old = old.rsplit_once('\t').expect("more than one field").0;
         let old = old.rsplit_once('\t').expect("more than one field").0;
         let back = parse(old).expect("parses");
@@ -421,6 +436,7 @@ mod tests {
         assert_eq!(back.offset, -37.0);
         assert_eq!(back.zoom_y, 1.0);
         assert!(!back.centred);
+        assert!(!back.shown);
         assert!(back.hooked_away);
     }
 }

@@ -244,6 +244,11 @@ pub struct Card {
     /// The take-down was a request to stop managing this window; remove the
     /// card instead of keeping the hook.
     pub unhook: bool,
+    /// The window is out on the desktop while its card still hangs. Only used
+    /// by the line that keeps its cards (`stay_hung`), where showing a window is
+    /// not a take-down: this is what tells a click whether the window has to be
+    /// brought back or only raised.
+    pub shown: bool,
 }
 
 impl Card {
@@ -474,6 +479,7 @@ impl Line {
         card.away = false;
         card.away_at = None;
         card.unhook = false;
+        card.shown = false;
         self.cards.push(card);
         let index = self
             .cards
@@ -544,6 +550,7 @@ impl Line {
             card.away = false;
             card.away_at = None;
             card.unhook = false;
+            card.shown = false;
             card.leaving = false;
             card.sway = tilt(sway0);
             // A fresh snapshot arrives shortly; until then the old thumbnail
@@ -573,6 +580,20 @@ impl Line {
             card.away_at = Some(now);
             card.leaving = false;
         }
+    }
+
+    /// Records that the window is out on the desktop while its card stays on the
+    /// line. Returns false when nothing changed, so a poll that sees the same
+    /// state twice does not repaint and rewrite the journal for it.
+    pub fn mark_shown(&mut self, id: u64, shown: bool) -> bool {
+        let Some(card) = self.get_mut(id) else {
+            return false;
+        };
+        if card.shown == shown {
+            return false;
+        }
+        card.shown = shown;
+        true
     }
 
     /// Moves an on-line card to a new position in the line. `target` is an
@@ -776,6 +797,7 @@ mod tests {
             away: false,
             away_at: None,
             unhook: false,
+            shown: false,
         }
     }
 
@@ -850,6 +872,26 @@ mod tests {
         assert!(line.rehang(1, &l));
         assert!(!line.get(1).unwrap().away);
         assert_eq!(line.live_count(), 2);
+    }
+
+    #[test]
+    fn a_shown_card_is_still_part_of_the_line() {
+        // The line that keeps its cards: the window is out on the desktop and the
+        // card has not stopped being a card. It keeps its slot, it is still
+        // clickable, and it can still be taken down for good.
+        let l = layout();
+        let mut line = Line::new();
+        hung(&mut line, &[1, 2], &l);
+        assert!(line.mark_shown(1, true));
+        // Saying the same thing twice changes nothing, or every poll would repaint
+        // and rewrite the journal for a line that is standing still.
+        assert!(!line.mark_shown(1, true));
+        assert_eq!(live_ids(&line), vec![1, 2]);
+        assert_eq!(line.live_count(), 2);
+        assert_eq!(line.hooked_count(), 2);
+        run(&mut line, &l, 1.0);
+        assert!(!line.animating(), "a window out on the desktop kept the line moving");
+        assert!(line.take_down(1));
     }
 
     #[test]

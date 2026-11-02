@@ -36,7 +36,9 @@ $ErrorActionPreference = "Stop"
 $root = Join-Path $env:TEMP "shaiwin-reveal"
 # A non-resident line has its own state machine, so this test runs with the
 # always-on mode off; the resident default is covered by smoke-test.ps1.
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=0`nauto_hide_secs=2`nexcluded=`n"
+# stay_hung=0: every step below is about the line that hands its card over to the
+# desktop when the window comes down; scripts\stay-hung-test.ps1 covers the other.
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=0`nauto_hide_secs=2`nexcluded=`nstay_hung=0`n"
 Initialize-Fixtures $root
 $journal = Join-Path $state "ShaiWin\parked.txt"
 

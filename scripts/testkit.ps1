@@ -39,6 +39,9 @@ public static class W {
   [DllImport("user32.dll")] public static extern IntPtr GetWindowLongPtrW(IntPtr h, int index);
   [DllImport("user32.dll", EntryPoint="GetWindowLongW")] static extern int GetWindowLongW(IntPtr h, int index);
   [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  // GetTopWindow(NULL) is the documented way to ask for the window at the very
+  // top of the z-order; GetWindow needs a window that is already in it.
+  [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
 
@@ -105,6 +108,11 @@ $script:KitPointAt = 0x8000 + 17
 # WM_APP + 18: pretend a window of the user's is being dragged. A headless
 # session cannot start a real move loop; wParam 0 ends the pretend drag.
 $script:KitPretendDrag = 0x8000 + 18
+# WM_APP + 19: the click on a card, asked for by HWND instead of by a pointer
+# that has to be parked exactly on the card's rectangle. Which is the whole point
+# for the line that keeps its cards: what a click does is the thing under test,
+# and it is not the same thing as the menu item next to it.
+$script:KitOpen = 0x8000 + 19
 $script:KitHotkey = 0x0312
 $script:KitClose = 0x0010
 $script:KitMouseMove = 0x0200
@@ -430,6 +438,9 @@ function Read-Journal([string]$path) {
       # True when the window was dragged onto the line, so it comes back in the
       # middle of the screen rather than where it was grabbed.
       Centred = ($f.Length -ge 17 -and $f[16] -eq "1")
+      # True when the line keeps its cards and this window is out on the desktop
+      # with its card still hanging: nothing is waiting to be put back.
+      Shown = ($f.Length -ge 19 -and $f[18] -eq "1")
       Fields = $f
     }
   })

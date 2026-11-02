@@ -67,16 +67,17 @@ cargo run -p shaiwin                          # 开发构建
 ### 验证
 
 ```powershell
-cargo test --workspace                                                   # 82 个单元测试
+cargo test --workspace                                                   # 83 个单元测试
 cargo clippy --workspace --all-targets -- -D warnings
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 ```
 
-十个端到端脚本共用 `scripts/testkit.ps1`（Win32 声明、临时夹具窗口、独立 `LOCALAPPDATA`），跑的是真实窗口管理器，不碰你自己的窗口：
+十一个端到端脚本共用 `scripts/testkit.ps1`（Win32 声明、临时夹具窗口、独立 `LOCALAPPDATA`），跑的是真实窗口管理器，不碰你自己的窗口：
 
 | 脚本 | 覆盖 |
 | --- | --- |
 | `smoke-test.ps1` | 挂起 → 渲染 → 强杀恢复 → 取下 |
+| `stay-hung-test.ps1` | 默认那条线：点开后卡片仍挂、只置顶不挪窝、放大缩小与绳无关、取下才是终点 |
 | `hook-test.ps1` | 钩子、取消挂起、真鼠标拖拽上架 |
 | `edge-test.ps1` | 重复挂起、外部恢复、最大化、程序退出 |
 | `reveal-test.ps1` | 非常驻时的悬停、胶囊、展开/收起 |
@@ -86,6 +87,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 | `resize-test.ps1` | 侧边调宽、底边调高、重启后保持 |
 | `settings-shot.ps1` | 设置窗口截图，并真的点快捷键框、点 ×、点保存 |
 | `hang-latency.ps1` | 挂起链路分段计时 |
+
+除 `stay-hung-test.ps1` 外，每个脚本的沙盒里都写死 `stay_hung=0`，跑的是「点卡片就是把窗口取下」那条旧线。
 
 改完请跑上面三条命令。要动渲染或挂起判定，先在真机上手工验一遍，机器验不了的在说明里写清楚「还没验的」，不要写成做完了。
 
@@ -101,10 +104,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 | `Ctrl+2`（可改） | 挂起当前窗口 |
 | `Ctrl+T`（可改） | 展开 / 收起晾衣架 |
 | 鼠标停在屏幕最顶端（非常驻时） | 弹出展开气泡滑过或悬停时「展开晾衣架 · 卡片」 |
-| 点击卡片 | 窗口长回原来的大小，**仍然挂着钩**；拖上架的回到屏幕正中，热键挂起的回原位置 |
+| 点击卡片 | 窗口长回原来的大小并置顶，**卡片仍挂在绳上**；本来就开着的那一下只置顶，位置一动不动 |
+| 关掉「点开后卡片仍挂在绳上」后点卡片 | 取下的语义：窗口长回原来的大小、**仍然挂着钩**，拖上架的回到屏幕正中，热键挂起的回原位置 |
 | 右键卡片 | 取下 / 取消挂起 / 设置或清除标签 |
 
-「取下」和「取消挂起」是两件事：前者只是把窗口放回桌面，之后它最小化还会自动回来；后者才是彻底不管这个窗口，而且**不碰它**——本来最小化的继续最小化。卡片上的 × 就是「取消挂起」。
+「取下」和「取消挂起」是两件事。默认那条线上，取下就是终点：卡片没了，窗口留在原地，再最小化也不会挂回去；关掉设置后，取下只是把窗口放回桌面，它最小化还会自己回来。「取消挂起」在两种设置下都是**不碰它**——本来最小化的继续最小化。卡片上的 × 就是「取消挂起」。
 
 衣架收起时，把窗口移到屏幕顶端不会点亮衣架，也不会把它挂上去；想用拖拽挂起，先让衣架展开。
 
@@ -113,6 +117,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 - **沿绳拖动卡片**换位置，停在放手的地方；多张卡片各占一格，不会重叠。
 - **拖卡片侧边 / 下边缘 / 底角**调宽 / 调高 / 同时调，重启后保持。
 - 卡片多到一屏放不下时，按住卡片横向拖动。
+- 开着「点开后卡片仍挂在绳上」（默认）时，卡片是钉子不是托盘：点开、放大、最小化都还挂在原来那一格，只有取下或按 × 才离绳。
 - 衣架可以设成常驻，也可以只在鼠标贴到屏幕顶端时露头；非常驻时指针离开后 1 秒收起，空绳至少留 4 秒。
 - 右键卡片 →「设置标签…」可以起个短标签，卡片顶部出现彩色标签带，颜色由文字决定；输入时卡片实时变化。
 - 卡片层不常驻顶层：鼠标离开晾衣绳就沉到当前窗口下面，滑过或悬浮晾衣绳时置顶显示卡片窗口；
@@ -144,7 +149,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 
 右键托盘图标：全部取下、展开/收起、设置、开机启动、退出。
 
-托盘「设置」打开一个独立窗口：两个快捷键、晾衣架弧度、衣架常驻、拖到顶部挂起。
+托盘「设置」打开一个独立窗口：两个快捷键、晾衣架弧度、衣架常驻、拖到顶部挂起、点开后卡片仍挂在绳上。
 
 设置也写在 `%LOCALAPPDATA%\ShaiWin\settings.txt`，窗口没覆盖的项可以直接改文件。常用键：
 
@@ -156,6 +161,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 | `auto_hide_secs` | 非常驻时指针离开后多久收起，默认 `1`；`0` 只手动收起 |
 | `always_on` | 衣架常驻 |
 | `drag_hang` | 拖窗口到顶部挂起，`0` 可整个关掉 |
+| `stay_hung` | 点开后卡片仍挂在绳上，默认 `1`；`0` 时点卡片就是取下 |
 | `reduced_motion` | 减弱动画 |
 | `excluded` | 按可执行文件名的排除名单 |
 | `raise_known` | 点过气泡的「不再提示」就是 `1`；删掉这行重启会再弹 |
@@ -175,6 +181,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 - [ ] 卡片重排动画：插入/移除时邻居平滑让位
 - [ ] 「减弱动态效果」跟随系统设置（`SPI_GETCLIENTAREAANIMATION`）
 - [ ] 空线时的引导：绳上一张卡片都没有时该怎么挂上去，还没有话
+- [ ] 卡片留在绳上时（默认）的快照只在点开那一下重拍一次；窗口后来变了内容，卡片仍是旧画面，还没有定期重拍
 - [ ] 自定义卡片特征信息
 
 
@@ -258,7 +265,7 @@ ShaiWin/
 │   │   ├── journal.rs          挂起日志与崩溃恢复的四重校验
 │   │   ├── tray.rs             托盘图标与菜单
 │   │   ├── settings.rs         settings.txt 读写
-│   │   ├── settings_ui.rs      设置窗口（五个自绘控件）
+│   │   ├── settings_ui.rs      设置窗口（六个自绘控件）
 │   │   ├── tag_ui.rs           卡片标签编辑弹层
 │   │   ├── text.rs             GDI 文字位图
 │   │   ├── i18n.rs             中英文
@@ -279,7 +286,7 @@ ShaiWin/
 │           └── ShaiWin/        最小 AppKit 入口
 ├── scripts/
 │   ├── testkit.ps1             端到端脚本共用的 Win32 声明与夹具窗口
-│   ├── smoke-test.ps1 等 10 个 端到端测试
+│   ├── smoke-test.ps1 等 11 个 端到端测试
 │   ├── package.ps1             本地打出与 release 相同的 zip
 │   ├── build-icon.mjs          SVG → 九个尺寸 → assets/shaiwin.ico
 │   ├── preview-icon.mjs        把九个尺寸拼成 assets/icon-preview.png 供肉眼检查

@@ -94,6 +94,11 @@ const WM_POINT_AT: u32 = WM_APP + 17;
 /// A headless session cannot start a real move loop, and the rule under test -
 /// a drag never brings the cards up - is the poll's, not the loop's.
 const WM_PRETEND_DRAG: u32 = WM_APP + 18;
+/// Automation hook: click a card by HWND in lParam - the same call the card
+/// itself makes, so a headless test exercises the click rather than the menu
+/// item next to it. Which is which depends on the line: one that hands its cards
+/// over to the desktop takes the card down, one that keeps them leaves it there.
+const WM_OPEN_HWND: u32 = WM_APP + 19;
 
 /// The sentinel hit rectangle for the "show the line" pill (see `peek`).
 pub const PEEK_ID: u64 = u64::MAX;
@@ -880,9 +885,11 @@ impl App {
             let Some(now) = window::rect_of(window::hwnd_of(entry.hwnd)) else {
                 continue;
             };
-            if entry.hooked_away {
-                // The window was on the desktop, hooked, when we stopped. No
-                // window to put back: only the hook is worth recovering.
+            if entry.hooked_away || entry.shown {
+                // The window was on the desktop when we stopped, with the hook
+                // behind a hidden card or in front of a card that stayed on the
+                // line. Either way there is no window to put back: only the
+                // record is worth recovering.
                 survivors.push((entry, now));
                 continue;
             }
@@ -912,9 +919,12 @@ impl App {
             journal::save(&[]);
             return;
         }
-        let parked_count = survivors.iter().filter(|(e, _)| !e.hooked_away).count();
+        let parked_count = survivors
+            .iter()
+            .filter(|(e, _)| !e.hooked_away && !e.shown)
+            .count();
         crate::log!(
-            "recover: {} of {} entries still parked, {} hooked on the desktop",
+            "recover: {} of {} entries still parked, {} on the desktop",
             parked_count,
             entries_len,
             survivors.len() - parked_count
@@ -938,7 +948,7 @@ impl App {
                 accent: accent_for(&entry.exe),
                 placement: entry.placement,
                 parked: entry.parked,
-                window_rect: if entry.hooked_away {
+                window_rect: if entry.hooked_away || entry.shown {
                     now
                 } else {
                     entry.placement.normal
@@ -961,6 +971,7 @@ impl App {
                 away: entry.hooked_away,
                 away_at: None,
                 unhook: false,
+                shown: entry.shown,
             };
             revealed_any |= !entry.hooked_away;
             self.line.recover(card, &self.layout);
@@ -1031,6 +1042,18 @@ impl App {
                     .map(|c| c.id)
                 {
                     self.take_down(id);
+                }
+                LRESULT(0)
+            }
+            WM_OPEN_HWND => {
+                if let Some(id) = self
+                    .line
+                    .cards
+                    .iter()
+                    .find(|c| c.hwnd == lp.0)
+                    .map(|c| c.id)
+                {
+                    self.open_from_line(id);
                 }
                 LRESULT(0)
             }
@@ -1468,6 +1491,27 @@ impl App {
             self.rehang(id, Some(source));
             return;
         }
+        // A line that keeps its cards shows a window without unhanging it, so the
+        // same window can be on the desktop with its card still on the rope.
+        // Hanging it again then means putting it away, and answering that with
+        // "already hung" would leave the user holding a window the line says is
+        // already there.
+        if self.settings.stay_hung {
+            if let Some(id) = self
+                .line
+                .cards
+                .iter()
+                .find(|c| c.hwnd == hwnd && c.shown && !c.leaving)
+                .map(|c| c.id)
+            {
+                crate::log!("hang {hwnd}: shown window parked back under its card");
+                if self.park_window(id, Some(source)) {
+                    self.sync_journal();
+                    self.invalidate();
+                }
+                return;
+            }
+        }
         if self.line.contains_hwnd(hwnd) {
             self.complain(t("already_hung").to_string());
             return;
@@ -1544,6 +1588,7 @@ impl App {
             away: false,
             away_at: None,
             unhook: false,
+            shown: false,
         };
 
         // Journal first, then move: if we die in between, startup recovery puts
@@ -1600,9 +1645,107 @@ impl App {
     /// click and the window being in front reads as "the click did nothing",
     /// and the card is gone by then, so the user has nothing left to click.
     fn take_down(&mut self, id: u64) {
+        // On a line that keeps its cards, taking one down is the only way off and
+        // there is no hook to fall back on: a card that merely hid itself would
+        // read as the click having been ignored.
+        if self.settings.stay_hung {
+            if let Some(card) = self.line.get_mut(id) {
+                card.unhook = true;
+            }
+        }
         if self.line.take_down(id) {
             self.finish_take_down(id);
         }
+    }
+
+    /// The user asked to see this window.
+    ///
+    /// Two lines answer that differently: one that hands its cards over to the
+    /// desktop takes the card down with the window, and one that keeps its cards
+    /// shows the window and leaves the card hanging there for the next time.
+    fn open_from_line(&mut self, id: u64) {
+        if self.settings.stay_hung {
+            self.show_kept(id);
+        } else {
+            self.take_down(id);
+        }
+    }
+
+    /// Brings a card's window in front without taking the card down.
+    ///
+    /// A window that is already on the desktop only needs the raise - moving it
+    /// would knock it out from under the user's hand. One that is minimized, or
+    /// parked off screen, comes back exactly the way a take-down brings it back,
+    /// and then the card stays where it is: the line is a row of pins in this
+    /// mode, and clicking a pin is never an unpin.
+    fn show_kept(&mut self, id: u64) {
+        let Some(card) = self.line.get(id) else {
+            return;
+        };
+        if card.leaving {
+            return;
+        }
+        let hwnd = card.hwnd;
+        let parked = restore_record(card, self.monitor.work);
+        let h = window::hwnd_of(hwnd);
+        let already_out = !window::minimized(h) && window::on_screen(h);
+        let ok = if already_out {
+            window::raise(h);
+            true
+        } else {
+            // Same order as a take-down: paint the frame without this card's
+            // window still in it, so the card does not sit on top of the window
+            // that just appeared.
+            self.redraw();
+            park::restore(h, &parked)
+        };
+        let after = window::rect_of(h);
+        crate::log!(
+            "show {id}: hwnd={hwnd} ok={ok} raised={already_out} before={:?} after={after:?} card stays hung",
+            parked.placement.normal
+        );
+        if !ok {
+            // Nothing moved: the window is still off screen and the card is still
+            // the only way back to it.
+            self.complain(t("restore_failed").to_string());
+            self.invalidate();
+            return;
+        }
+        if self.line.dragging == Some(id) {
+            self.line.dragging = None;
+        }
+        if let Some(card) = self.line.get_mut(id) {
+            card.shown = true;
+        }
+        // The picture on the line is the one taken when the window went up. It is
+        // about to be a live window the user is looking at, so ask for a fresh one.
+        self.worker.send(Job::Snapshot { id, hwnd });
+        self.visit_after_showing(hwnd, after.unwrap_or(parked.placement.normal));
+        self.sync_journal();
+        self.invalidate();
+    }
+
+    /// A card's window just came down onto the desktop. The user is about to move
+    /// it aside and reach for the next card, so the line waits for that instead
+    /// of leaving on the ordinary visit clocks.
+    fn visit_after_showing(&mut self, hwnd: isize, rect: WRect) {
+        if !self.revealed {
+            return;
+        }
+        let now = Instant::now();
+        self.keep_alive(now, VISIT_AFTER_TAKE);
+        self.hold_until = Some(self.hold_until.map_or(now + VISIT_AFTER_TAKE, |until| {
+            until.max(now + VISIT_AFTER_TAKE)
+        }));
+        // The window is back on the desktop and the user is about to move it out
+        // of the way. That is this gesture, not the next one: while its rectangle
+        // keeps changing under a held button the visit stays open, instead of the
+        // line leaning on a grace period to stay out.
+        self.take_watch = Some(TakeWatch {
+            hwnd,
+            rect,
+            until: now + Duration::from_secs(6),
+        });
     }
 
     /// Stops managing a window: the card goes, and the record with it, and the
@@ -1632,7 +1775,12 @@ impl App {
         let hwnd = card.hwnd;
         let parked = restore_record(card, self.monitor.work);
         let unhook = card.unhook;
-        let before = window::rect_of(window::hwnd_of(hwnd));
+        let h = window::hwnd_of(hwnd);
+        // A line that keeps its cards can be asked to take down a card whose
+        // window is already out on the desktop. It is already where the user wants
+        // it; restoring it would knock it back to where it was when it went up.
+        let already_out = !window::minimized(h) && window::on_screen(h);
+        let before = window::rect_of(h);
         // The line is topmost and the window is about to come back underneath
         // it. The frame on screen still has this card painted in it, so during
         // the restore the card sits on top of the window that just appeared -
@@ -1640,10 +1788,14 @@ impl App {
         // with the card already gone first; the restore then lands on a screen
         // that no longer shows it.
         self.redraw();
-        let ok = park::restore(window::hwnd_of(hwnd), &parked);
-        let after = window::rect_of(window::hwnd_of(hwnd));
+        let ok = if already_out {
+            true
+        } else {
+            park::restore(h, &parked)
+        };
+        let after = window::rect_of(h);
         crate::log!(
-            "take_down {id}: hwnd={hwnd} ok={ok} unhook={unhook} before={before:?} after={after:?} target={:?}",
+            "take_down {id}: hwnd={hwnd} ok={ok} unhook={unhook} left_where_it_was={already_out} before={before:?} after={after:?} target={:?}",
             parked.placement.normal
         );
         if !ok {
@@ -1672,22 +1824,7 @@ impl App {
         // as well as long-deadlined, because opening that window changed the
         // foreground, and a foreground change is one of the reasons a visit is
         // normally over - it must not cut the grace short in the same poll.
-        if self.revealed {
-            let now = Instant::now();
-            self.keep_alive(now, VISIT_AFTER_TAKE);
-            self.hold_until = Some(self.hold_until.map_or(now + VISIT_AFTER_TAKE, |until| {
-                until.max(now + VISIT_AFTER_TAKE)
-            }));
-            // The window is back on the desktop and the user is about to move it
-            // out of the way. That is this gesture, not the next one: while its
-            // rectangle keeps changing under a held button the visit stays open,
-            // instead of the line leaning on a grace period to stay out.
-            self.take_watch = Some(TakeWatch {
-                hwnd,
-                rect: after.unwrap_or(parked.placement.normal),
-                until: now + Duration::from_secs(6),
-            });
-        }
+        self.visit_after_showing(hwnd, after.unwrap_or(parked.placement.normal));
         self.sync_journal();
         self.invalidate();
     }
@@ -1804,11 +1941,13 @@ impl App {
     fn take_all(&mut self) {
         // Windows that are already on the desktop only need their hooks
         // dropped; restoring them would move them back to where they came from.
+        // A line that keeps its cards has a second kind of those: the card is
+        // still hanging and the window is open in front of the user.
         let away: Vec<u64> = self
             .line
             .cards
             .iter()
-            .filter(|c| c.away)
+            .filter(|c| c.away || c.shown)
             .map(|c| c.id)
             .collect();
         for id in away {
@@ -1853,14 +1992,22 @@ impl App {
     /// off screen with nothing pointing at it would strand it.
     fn stow_all_now(&mut self) {
         let work = self.monitor.work;
-        let cards: Vec<(u64, isize, Parked, bool)> = self
+        let cards: Vec<(u64, isize, Parked, bool, bool)> = self
             .line
             .cards
             .iter()
-            .map(|c| (c.id, c.hwnd, restore_record(c, work), c.away))
+            .map(|c| (c.id, c.hwnd, restore_record(c, work), c.away, c.shown))
             .collect();
-        for (id, hwnd, parked, away) in cards {
-            if !away && window::is_alive(hwnd) && !park::stow(window::hwnd_of(hwnd), &parked) {
+        for (id, hwnd, parked, away, shown) in cards {
+            // A card the line was keeping while its window stayed open describes
+            // a window the user is looking at. Quitting takes the line away, not
+            // the window: hiding it here would be the app doing on exit the
+            // setting exists to stop it doing at all.
+            if !away
+                && !shown
+                && window::is_alive(hwnd)
+                && !park::stow(window::hwnd_of(hwnd), &parked)
+            {
                 crate::log!("quit: hwnd={hwnd} would not stay minimized; putting it back instead");
                 park::restore(window::hwnd_of(hwnd), &parked);
             }
@@ -2038,7 +2185,7 @@ impl App {
                     if window::focus_handed_over(previous, self.self_pid) {
                         self.keep_on_line(id, window::hwnd_of(parked), now);
                     } else {
-                        self.take_down(id);
+                        self.open_from_line(id);
                     }
                 }
             }
@@ -3100,6 +3247,29 @@ impl App {
                 continue;
             }
             let h = window::hwnd_of(hwnd);
+            if self.settings.stay_hung {
+                // The card hangs whatever the window does: up, minimized, moved
+                // aside. The only thing worth noticing is which of those it is,
+                // because the next click has to know whether to raise the window
+                // or bring it back from where it was put away.
+                let shown_now = !window::minimized(h) && window::on_screen(h);
+                let was_shown = self.line.get(id).is_some_and(|card| card.shown);
+                if was_shown && !shown_now {
+                    // The window went out of sight by itself. Remember the place
+                    // it was standing in, so the next click brings it back there
+                    // rather than to where it was when it first went up.
+                    if let Some(placement) = park::Placement::capture(h) {
+                        if let Some(card) = self.line.get_mut(id) {
+                            card.placement = placement;
+                            card.parked.placement = placement;
+                        }
+                    }
+                }
+                if self.line.mark_shown(id, shown_now) {
+                    changed = true;
+                }
+                continue;
+            }
             if window::minimized(h) {
                 if park::parked_minimized(&parked) {
                     // We hung it up while it was already minimized, so this is
@@ -3150,11 +3320,15 @@ impl App {
     }
 
     /// The card of a window that is on the line right now, if it is still ours.
+    ///
+    /// A card whose window is out on the desktop is not parked, whatever the line
+    /// says: the user can see that window, so the foreground reaching it is not a
+    /// hand-over to something invisible.
     fn parked_card(&self, hwnd: isize) -> Option<u64> {
         self.line
             .cards
             .iter()
-            .find(|c| c.hwnd == hwnd && !c.away && !c.leaving)
+            .find(|c| c.hwnd == hwnd && !c.away && !c.leaving && !c.shown)
             .map(|c| c.id)
     }
 
@@ -3202,42 +3376,41 @@ impl App {
         false
     }
 
-    /// The user minimized a window they had taken down. Park it again and
-    /// animate its card back onto the line. The old thumbnail is kept: the
-    /// window has not been drawn on screen long enough for a fresh, reliable
-    /// snapshot, and a black one would be worse.
-    /// Puts a hooked window back on the line, keeping its record.
+    /// Takes a window that the user can currently see back off the screen,
+    /// keeping its card where it is.
     ///
     /// `source` is the request that asked for it, when a request did: hanging a
-    /// window again is a fresh decision about where it opens, so a window
-    /// dragged onto the line now comes back centred even if it was hooked by
-    /// hotkey before. `None` is the automatic re-hang when the user minimizes
-    /// the window, which is not a new choice and keeps the old one.
-    fn rehang(&mut self, id: u64, source: Option<HangSource>) {
+    /// window again is a fresh decision about where it opens, so a window dragged
+    /// onto the line now comes back centred even if it was hooked by hotkey
+    /// before. `None` is the automatic re-hang when the user minimizes the window,
+    /// which is not a new choice and keeps the old one.
+    ///
+    /// False means the window is gone - the card has been dropped, which is the
+    /// whole answer - or it refused to move, so the caller must leave the line as
+    /// it stands.
+    fn park_window(&mut self, id: u64, source: Option<HangSource>) -> bool {
         let Some(card) = self.line.get(id) else {
-            return;
+            return false;
         };
-        if !card.away {
-            return;
-        }
         let hwnd = card.hwnd;
         let pid = card.pid;
         let start = card.process_start;
-        let h = window::hwnd_of(hwnd);
+        let where_it_was = card.window_rect;
         if !window::still_same_window(hwnd, pid, start) {
             self.painter.forget(id);
             self.line.remove(id);
             self.sync_journal();
             self.invalidate();
-            return;
+            return false;
         }
+        let h = window::hwnd_of(hwnd);
         let (placement, parked, before) = if window::minimized(h) {
             // The window is already out of sight. Moving it would first mean
             // bringing it back, and the user would watch it flash onto the
             // desktop before it vanished again. So it hangs up where it stands
             // and only the card moves.
             let Some(placement) = park::Placement::capture(h) else {
-                return;
+                return false;
             };
             (
                 placement,
@@ -3246,7 +3419,7 @@ impl App {
             )
         } else {
             let previous = window::foreground();
-            let before = window::rect_of(h).unwrap_or(card.window_rect);
+            let before = window::rect_of(h).unwrap_or(where_it_was);
             let result =
                 park::plan(h).and_then(|plan| park::execute(h, &plan).map(|parked| (plan, parked)));
             match result {
@@ -3272,8 +3445,8 @@ impl App {
                     (plan.placement, parked, before)
                 }
                 Err(error) => {
-                    crate::log!("rehang {id}: hwnd={hwnd} failed: {error:?}");
-                    return;
+                    crate::log!("park {id}: hwnd={hwnd} refused: {error:?}");
+                    return false;
                 }
             }
         };
@@ -3282,15 +3455,30 @@ impl App {
             card.placement = placement;
             card.parked = parked;
             card.window_rect = before;
+            card.shown = false;
             if let Some(source) = source {
                 card.centred = source.centred();
             }
         }
+        crate::log!(
+            "park {id}: hwnd={hwnd} back off screen at {:?}",
+            parked.placement.normal
+        );
+        true
+    }
+
+    /// The user minimized a window they had taken down. Park it again and animate
+    /// its card back onto the line. The old thumbnail is kept: the window has not
+    /// been drawn on screen long enough for a fresh, reliable snapshot, and a
+    /// black one would be worse.
+    fn rehang(&mut self, id: u64, source: Option<HangSource>) {
+        if !self.line.get(id).is_some_and(|card| card.away) {
+            return;
+        }
+        if !self.park_window(id, source) {
+            return;
+        }
         if self.line.rehang(id, &self.layout) {
-            crate::log!(
-                "rehang {id}: hwnd={hwnd} hung up minimized at {:?}",
-                parked.placement.normal
-            );
             // No reveal here: a line the user tucked away stays away. The card
             // is on the line the next time it comes down, and minimizing a
             // window is not a request to see the card that just went up.
@@ -3503,6 +3691,7 @@ impl App {
         sag_percent: f32,
         always_on: bool,
         drag_hang: bool,
+        stay_hung: bool,
     ) -> Result<(), String> {
         self.apply_hotkeys(hang.0, hang.1, toggle.0, toggle.1)?;
         self.settings.hang_mods = hang.0;
@@ -3516,6 +3705,8 @@ impl App {
         };
         self.settings.always_on = always_on;
         self.settings.drag_hang = drag_hang;
+        let was_stay = self.settings.stay_hung;
+        self.settings.stay_hung = stay_hung;
         self.settings.save();
         // Applying the mode immediately is the difference between a setting and
         // a promise: turning "keep the line on screen" on should bring it down,
@@ -3535,8 +3726,49 @@ impl App {
                 self.transient_until = None;
             }
         }
+        // Switching between the two kinds of line moves no window: the setting
+        // changes what a card means, so only the cards are re-read. A toggle that
+        // brought a window back to the desktop with it would be the app doing the
+        // one thing the user is still deciding about.
+        if !was_stay && stay_hung {
+            // Cards that hid themselves waiting for a minimize go back on the
+            // rope: here a window being open and its card being on the line are
+            // not alternatives.
+            let ids: Vec<u64> = self
+                .line
+                .cards
+                .iter()
+                .filter(|c| c.away)
+                .map(|c| c.id)
+                .collect();
+            for id in ids {
+                if self.line.rehang(id, &self.layout) {
+                    self.line.mark_shown(id, true);
+                }
+            }
+        } else if was_stay && !stay_hung {
+            // And the reverse: pinned cards whose windows are open hide
+            // themselves again, and the hook waits for a minimize as it used to.
+            let ids: Vec<u64> = self
+                .line
+                .cards
+                .iter()
+                .filter(|c| c.shown)
+                .map(|c| c.id)
+                .collect();
+            for id in ids {
+                if let Some(card) = self.line.get_mut(id) {
+                    card.shown = false;
+                }
+                self.line.detach(id, Instant::now());
+            }
+        }
+        if was_stay != stay_hung {
+            self.sync_journal();
+            self.invalidate();
+        }
         crate::log!(
-            "settings saved: hang={} toggle={} sag={} always_on={} drag_hang={}",
+            "settings saved: hang={} toggle={} sag={} always_on={} drag_hang={} stay_hung={}",
             self.settings.hang_label(),
             self.settings.toggle_label(),
             if self.settings.sag_is_auto() {
@@ -3545,7 +3777,8 @@ impl App {
                 format!("{:.1}%", self.settings.sag_percent)
             },
             always_on,
-            drag_hang
+            drag_hang,
+            stay_hung
         );
         // A different sag changes the strip height and where the cards sit.
         self.relayout();
@@ -4401,7 +4634,7 @@ impl App {
             self.hold_until = Some(Instant::now() + Duration::from_secs(1));
             self.invalidate();
         } else {
-            self.take_down(press.id);
+            self.open_from_line(press.id);
         }
     }
 
@@ -4565,6 +4798,7 @@ fn journal_entry(card: &Card) -> journal::Entry {
         offset: card.offset,
         centred: card.centred,
         tag: card.tag.clone(),
+        shown: card.shown,
     }
 }
 

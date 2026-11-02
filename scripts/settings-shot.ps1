@@ -180,7 +180,10 @@ try {
   $saved = Get-Content (Join-Path $session.state "ShaiWin\settings.txt") -Raw
   if ($saved -notmatch "toggle_vk=0") { Fail "the cleared shortcut was not saved:`n$saved" }
   if ($saved -notmatch "hang_vk=50") { Fail "the untouched shortcut moved:`n$saved" }
-  Write-Host "saved: toggle_vk=0, hang_vk=50"
+  # Nobody touched the switches in this session, so this is the shipped default
+  # of the one that keeps the cards on the rope - and it is on.
+  if ($saved -notmatch "stay_hung=1") { Fail "the cards staying on the rope is not the default:`n$saved" }
+  Write-Host "saved: toggle_vk=0, hang_vk=50, stay_hung=1"
 } finally {
   Close-Settings $session
 }
@@ -200,9 +203,12 @@ try {
   Save-Shot $session.wnd (Join-Path $shotDir "settings-before.png")
 
   $switches = Get-Children-Sorted $session.wnd "ShaiWin.Settings.Switch"
-  if ($switches.Count -lt 2) { Fail "expected two switches, found $($switches.Count)" }
-  # The top one is 常驻显示 (always_on); the row order is the file order.
+  if ($switches.Count -lt 3) { Fail "expected three switches, found $($switches.Count)" }
+  # The rows go in the order the panel lays them out: 常驻显示 (always_on) at the
+  # top, then 拖到屏幕顶端就挂上 (drag_hang), then the cards staying on the rope.
+  # Sorting by the rect, because the child enumeration is by z-order.
   Click-Middle $switches[0]
+  Click-Middle $switches[2]
 
   $ropes = @(Get-Children $session.wnd "ShaiWin.Settings.Rope")
   if ($ropes.Count -ne 1) { Fail "expected one rope tile, found $($ropes.Count)" }
@@ -230,8 +236,9 @@ try {
   Start-Sleep -Milliseconds 800
   $saved = Get-Content (Join-Path $session.state "ShaiWin\settings.txt") -Raw
   if ($saved -notmatch "always_on=1") { Fail "the switch click did not save:`n$saved" }
+  if ($saved -notmatch "stay_hung=0") { Fail "the bottom switch is the cards staying on the rope, and it did not save:`n$saved" }
   if ($saved -notmatch "sag=9.1") { Fail "the pull did not save (wanted 4 + 4 + 1 + 0.1):`n$saved" }
-  Write-Host "saved: always_on=1, sag=9.1"
+  Write-Host "saved: always_on=1, stay_hung=0, sag=9.1"
 } finally {
   Close-Settings $session
 }

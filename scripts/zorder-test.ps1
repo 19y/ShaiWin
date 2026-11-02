@@ -59,7 +59,9 @@ $ErrorActionPreference = "Stop"
 $root = Join-Path $env:TEMP "shaiwin-zorder"
 $ackRoot = Join-Path $env:TEMP "shaiwin-zorder-ack"
 # Resident, because a line that hides itself would answer the wrong question.
-$resident = "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
+# stay_hung=0: every step below is about the line that hands its card over to the
+# desktop when the window comes down; scripts\stay-hung-test.ps1 covers the other.
+$resident = "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`nstay_hung=0`n"
 $state = New-Sandbox $root $resident
 Initialize-Fixtures $root
 

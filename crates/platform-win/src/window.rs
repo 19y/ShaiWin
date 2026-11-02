@@ -22,8 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetShellWindow,
     GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetForegroundWindow,
-    ShowWindow, WindowFromPoint, GA_PARENT, GA_ROOT, GUITHREADINFO, GUI_INMOVESIZE, GWL_EXSTYLE,
-    GW_HWNDNEXT, SW_RESTORE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SetWindowPos, ShowWindow, WindowFromPoint, GA_PARENT, GA_ROOT, GUITHREADINFO, GUI_INMOVESIZE,
+    GWL_EXSTYLE, GW_HWNDNEXT, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
+    WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_EX_TOOLWINDOW,
 };
 
 use crate::Rect;
@@ -470,6 +471,82 @@ pub fn force_foreground(hwnd: HWND) {
             let _ = AttachThreadInput(our_thread, fg_thread, false);
         }
     }
+}
+
+/// Puts a window that is already on the desktop at the top of the stack and
+/// gives it the focus, leaving it exactly where the user left it.
+///
+/// Used when a card on the line is clicked and its window is already visible:
+/// the only thing wrong with it is that something is on top of it. Only the
+/// z-order of the normal layer moves, so our own strip stays above it.
+///
+/// `HWND_TOP` is the position the user asked for, but Windows reserves the right
+/// to move a window in the stack for the process that holds the foreground, and
+/// refuses everyone else without saying so: measured in this project's headless
+/// test session, the call answers "ok" and the window stays behind the one
+/// covering it. The same slot is granted to anyone who asks for it relative to the
+/// window currently at the front of the layer, so that is the fallback - put this
+/// window behind the front one, then put the front one behind it. Two windows
+/// move, the rest of the stack is as it was, and the result is the slot `HWND_TOP`
+/// means.
+pub fn raise(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        if !topmost(hwnd) {
+            if let Some(front) = front_of_layer() {
+                if front != hwnd {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(front),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    let _ = SetWindowPos(
+                        front,
+                        Some(hwnd),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+        force_foreground(hwnd);
+    }
+}
+
+/// Whether this window is pinned above everything that is not pinned.
+fn topmost(hwnd: HWND) -> bool {
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 }
+}
+
+/// The window at the front of the normal layer: the first one in the stack that
+/// is not pinned above everything else. `None` when the walk finds no window.
+fn front_of_layer() -> Option<HWND> {
+    let mut cur = unsafe { GetTopWindow(None).unwrap_or_default() };
+    for _ in 0..4096 {
+        if cur.0.is_null() {
+            return None;
+        }
+        if !topmost(cur) {
+            return Some(cur);
+        }
+        cur = next_window(cur);
+    }
+    None
 }
 
 /// Hands the foreground over to another window before `avoid` disappears.

@@ -43,7 +43,9 @@ function Find-Line($log, [string]$pattern) {
 }
 
 $root = Join-Path $env:TEMP "shaiwin-latency"
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`ndrag_hang=1`nexcluded=`n"
+# stay_hung=0: every step below is about the line that hands its card over to the
+# desktop when the window comes down; scripts\stay-hung-test.ps1 covers the other.
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`ndrag_hang=1`nexcluded=`nstay_hung=0`n"
 $fixtureDir = Join-Path $root "fixtures"
 New-Item -ItemType Directory -Force -Path $fixtureDir | Out-Null
 Initialize-Fixtures $fixtureDir

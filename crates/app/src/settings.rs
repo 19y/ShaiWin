@@ -71,6 +71,12 @@ pub struct Settings {
     /// One second is long enough to come back and short enough to feel like the
     /// line got out of the way.
     pub auto_hide_secs: u32,
+    /// Clicking a card shows its window, and the card stays on the rope. The
+    /// line is then a row of pins the user sets up once: opening, minimizing or
+    /// closing a window never takes a card down - only taking it down does.
+    /// Off, a click is a take-down: the card comes off the line and the hook
+    /// catches the window again when it is minimized.
+    pub stay_hung: bool,
 }
 
 /// A tag the card can actually carry. Tabs and line breaks would break the
@@ -104,6 +110,7 @@ impl Default for Settings {
             always_on: true,
             drag_hang: true,
             auto_hide_secs: 1,
+            stay_hung: true,
         }
     }
 }
@@ -144,6 +151,7 @@ impl Settings {
                 "always_on" => s.always_on = value != "0",
                 "drag_hang" => s.drag_hang = value != "0",
                 "auto_hide_secs" => s.auto_hide_secs = parse_hide_secs(value),
+                "stay_hung" => s.stay_hung = value != "0",
                 "excluded" => {
                     s.excluded = value
                         .split(',')
@@ -171,7 +179,7 @@ impl Settings {
             "welcomed={}\nreduced_motion={}\n\
              hang_mods={}\nhang_vk={}\ntoggle_mods={}\ntoggle_vk={}\n\
              sag={}\nhook_taught={}\nraise_known={}\nalways_on={}\ndrag_hang={}\n\
-             auto_hide_secs={}\nexcluded={}\n",
+             auto_hide_secs={}\nstay_hung={}\nexcluded={}\n",
             u8::from(self.welcomed),
             u8::from(self.reduced_motion),
             self.hang_mods,
@@ -188,6 +196,7 @@ impl Settings {
             u8::from(self.always_on),
             u8::from(self.drag_hang),
             self.auto_hide_secs,
+            u8::from(self.stay_hung),
             self.excluded.join(",")
         );
         let _ = fs::write(file, text);
@@ -325,6 +334,9 @@ mod tests {
         // drop target; those are the two behaviours the program is for.
         assert!(s.always_on);
         assert!(s.drag_hang);
+        // And with the cards staying on the rope, which is the whole reason a
+        // card is worth clicking between two windows.
+        assert!(s.stay_hung);
         // Nothing has been explained yet on a fresh install.
         assert!(!s.raise_known);
     }

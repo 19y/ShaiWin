@@ -83,6 +83,7 @@ const TOGGLE_ID: i32 = 102;
 const ROPE_ID: i32 = 103;
 const ALWAYS_ID: i32 = 104;
 const DRAG_ID: i32 = 105;
+const STAY_ID: i32 = 106;
 
 // --- the panel -----------------------------------------------------------------
 //
@@ -158,6 +159,8 @@ const LOGICAL_H: f32 = PAD
     + ITEM_H
     + ITEM_GAP
     + ITEM_H
+    + ITEM_GAP
+    + ITEM_H
     + FOOT_GAP
     + BUTTON_H
     + PAD_BOTTOM;
@@ -210,6 +213,7 @@ struct State {
     rope: HWND,
     always: HWND,
     drag_hang: HWND,
+    stay: HWND,
     save: HWND,
     cancel: HWND,
     /// The curve as it was when the window opened, for putting it back if the
@@ -241,6 +245,9 @@ struct Layout {
     drag_title: RECT,
     drag_note: RECT,
     switch_drag: RECT,
+    stay_title: RECT,
+    stay_note: RECT,
+    switch_stay: RECT,
     save: RECT,
     cancel: RECT,
 }
@@ -299,6 +306,15 @@ fn measure(client_w: i32, s: f32) -> Layout {
     l.drag_title = band(x0, label_x1, y, TITLE_H * s);
     l.drag_note = band(x0, x1, y + TITLE_H * s, NOTE_H * s);
     l.switch_drag = band(
+        switch_x,
+        x1,
+        y + (TITLE_H - SWITCH_BOX_H) / 2.0 * s,
+        SWITCH_BOX_H * s,
+    );
+    y += (ITEM_H + ITEM_GAP) * s;
+    l.stay_title = band(x0, label_x1, y, TITLE_H * s);
+    l.stay_note = band(x0, x1, y + TITLE_H * s, NOTE_H * s);
+    l.switch_stay = band(
         switch_x,
         x1,
         y + (TITLE_H - SWITCH_BOX_H) / 2.0 * s,
@@ -483,6 +499,7 @@ pub fn open(
             rope: HWND::default(),
             always: HWND::default(),
             drag_hang: HWND::default(),
+            stay: HWND::default(),
             save: HWND::default(),
             cancel: HWND::default(),
             initial_sag: settings.sag_percent,
@@ -539,6 +556,7 @@ impl State {
                 reduced,
             );
             self.drag_hang = self.switch(hwnd, l.switch_drag, DRAG_ID, settings.drag_hang, reduced);
+            self.stay = self.switch(hwnd, l.switch_stay, STAY_ID, settings.stay_hung, reduced);
             self.save = self.button(hwnd, t("settings_save"), SAVE_ID, l.save, true);
             self.cancel = self.button(hwnd, t("settings_cancel"), CANCEL_ID, l.cancel, false);
 
@@ -769,6 +787,22 @@ impl State {
                 l.drag_note,
                 DT_TOP | DT_LEFT,
             );
+            self.text(
+                hdc,
+                t("settings_stay"),
+                F_TITLE,
+                INK,
+                l.stay_title,
+                DT_TOP | DT_LEFT,
+            );
+            self.text(
+                hdc,
+                t("settings_stay_note"),
+                F_NOTE,
+                MUTED,
+                l.stay_note,
+                DT_TOP | DT_LEFT,
+            );
 
             let _ = DeleteObject(paper.into());
             let _ = DeleteObject(rule.into());
@@ -835,6 +869,7 @@ impl State {
             self.rope,
             self.always,
             self.drag_hang,
+            self.stay,
             self.save,
             self.cancel,
         ];
@@ -886,6 +921,9 @@ impl State {
                 // The switch reads "拖到屏幕顶端就挂上", which is the stored
                 // value itself: what you see is what the setting says.
                 self.checked(self.drag_hang),
+                // Same here: "点开后卡片仍挂在绳上" is on when the line is the
+                // kind that keeps its cards.
+                self.checked(self.stay),
             ) {
                 Ok(()) => {
                     self.saved = true;
@@ -2329,10 +2367,15 @@ mod tests {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let l = measure((LOGICAL_W * scale).round() as i32, scale);
             assert_eq!(l.head_keys.top, (PAD * scale).round() as i32);
-            assert_eq!(
-                l.save.bottom + (PAD_BOTTOM * scale).round() as i32,
-                (LOGICAL_H * scale).round() as i32,
-                "the panel is not the height it claims at scale {scale}"
+            // The walk and the sum are the same content; they can only part
+            // company by the rounding of their parts. A row missing from
+            // `LOGICAL_H`, or one the panel stopped drawing, is off by tens.
+            let measured = l.save.bottom as f32 + PAD_BOTTOM * scale;
+            assert!(
+                (measured - LOGICAL_H * scale).abs() <= 1.0,
+                "the panel is not the height it claims at scale {scale}: the rows end at \
+                 {measured}, the window is {}",
+                LOGICAL_H * scale
             );
 
             // Rows go down the page and never run into each other.
@@ -2347,6 +2390,7 @@ mod tests {
                 l.rule_b,
                 l.always_title,
                 l.drag_title,
+                l.stay_title,
                 l.save,
             ];
             for pair in rows.windows(2) {
@@ -2358,12 +2402,14 @@ mod tests {
             assert!(l.field_toggle.left > l.label_toggle.right);
             assert!(l.switch_always.left >= l.always_title.right);
             assert!(l.switch_drag.left >= l.drag_title.right);
+            assert!(l.switch_stay.left >= l.stay_title.right);
             assert_eq!(l.save.bottom, l.cancel.bottom);
             assert!(l.cancel.right < l.save.left);
             // The note is the second line of its item, so it must still be
             // inside the band the item was given.
             assert!(l.always_note.bottom <= l.always_title.top + (ITEM_H * scale).round() as i32);
             assert!(l.drag_note.bottom <= l.drag_title.top + (ITEM_H * scale).round() as i32);
+            assert!(l.stay_note.bottom <= l.stay_title.top + (ITEM_H * scale).round() as i32);
         }
     }
 

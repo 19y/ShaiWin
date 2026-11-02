@@ -23,7 +23,9 @@ $ErrorActionPreference = "Stop"
 $canPointer = Test-CursorControl
 
 $root = Join-Path $env:TEMP "shaiwin-position"
-$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`n"
+# stay_hung=0: every step below is about the line that hands its card over to the
+# desktop when the window comes down; scripts\stay-hung-test.ps1 covers the other.
+$state = New-Sandbox $root "welcomed=1`nreduced_motion=0`nall_monitors=0`nalways_on=1`nexcluded=`nstay_hung=0`n"
 Initialize-Fixtures $root
 $journal = Join-Path $state "ShaiWin\parked.txt"
 $shotDir = Join-Path $root "shots"
