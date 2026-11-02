@@ -83,8 +83,7 @@ try {
   Request-Dump (Join-Path $shotDir "shot-01.png")
 
   Write-Host "== 3. kill and recover =="
-  Get-Process shaiwin | Stop-Process -Force
-  Start-Sleep -Milliseconds 600
+  Stop-OurShaiwin
   if (-not (Test-Path $journal)) { Fail "journal vanished after a forced kill" }
   $proc = Start-Shaiwin $Exe $state
   Start-Sleep -Milliseconds 2200
@@ -108,7 +107,7 @@ try {
   if (-not (Wait-Until ({ -not (Test-Path $journal) }) 3000)) {
     # Say what is actually in there. "The file exists" is not a bug report.
     Write-Host "  parked.txt holds:"
-    Get-Content $journal -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    Read-SharedText $journal | ForEach-Object { Write-Host "    $_" }
     Write-Host "  last lines of the log:"
     Get-Content (Join-Path (Split-Path $journal) "shaiwin.log") -Tail 12 |
       ForEach-Object { Write-Host "    $_" }

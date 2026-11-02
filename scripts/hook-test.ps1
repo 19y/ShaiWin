@@ -130,8 +130,7 @@ try {
   Take-One $b
   if (-not (Wait-Until ({ Test-OnDesktop $b }) 5000)) { Fail "B was not taken down" }
   if (-not (Wait-Until ({ (Record $b) -and (Record $b).Hooked }) 5000)) { Fail "B should be recorded as hooked before the restart" }
-  Get-Process shaiwin -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Milliseconds 600
+  Stop-OurShaiwin
   $proc = Start-Shaiwin $Exe $state
   Start-Sleep -Milliseconds 1800
   $overlay = Get-Overlay

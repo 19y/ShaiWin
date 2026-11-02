@@ -45,6 +45,15 @@ public static class W {
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
 
+  // Reading a file the ordinary way grants the reader read and write sharing but
+  // not delete sharing, and the app swaps the journal in by renaming a sibling
+  // over it and clears it by deleting it. Both are refused while a reader of
+  // that kind holds the file, so a test that polls the journal every few
+  // milliseconds inhibits the very write it is waiting for. Asking for all three
+  // sharing modes is what a bystander means to do.
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr template);
+
   // DWM paints nothing for a cloaked window, even when its style and rectangle
   // say it is on screen. The input host's CoreWindow is the usual one, and it
   // spans the whole desktop in some sessions.
@@ -128,6 +137,14 @@ function Invoke-Wm([IntPtr]$hwnd, [uint32]$msg, [IntPtr]$wp, [IntPtr]$lp) {
 function Find-By-Class([string]$want) {
   $cb = [W+EnumProc]{
     param($h, $lp)
+    # Every class looked up here is one of ShaiWin's own, and only the instances
+    # this script started may be answered to. One ShaiWin per session holds the
+    # mutex, so the instance that would otherwise answer is the one the user is
+    # working with - and a test that hangs his windows and kills his app is not
+    # a test.
+    $tpid = [uint32]0
+    [void][W]::GetWindowThreadProcessId($h, [ref]$tpid)
+    if ($script:shaiwinPids -notcontains [int]$tpid) { return $true }
     $sb = New-Object System.Text.StringBuilder 256
     [void][W]::GetClassNameW($h, $sb, 256)
     if ($sb.ToString() -eq $want) { $script:found = $h; return $false }
@@ -424,11 +441,46 @@ function Wait-Visibility([IntPtr]$h, [bool]$want, [int]$timeoutMs) {
 
 # --- the journal ---------------------------------------------------------------
 
-# One tab-separated record per hung window; the thirteenth field says the
-# window is back on the desktop but still hooked.
-function Read-Journal([string]$path) {
+# One reader for everything the tests read that the app also writes - the journal
+# above all. `Get-Content` is not it: .NET grants a reader read and write sharing
+# but never delete sharing, and the journal is swapped in by renaming a sibling
+# over it and cleared by deleting it. Both are refused for as long as such a
+# reader holds the file, so a test that polls the journal every few milliseconds
+# inhibits the very write it is waiting for - it then sees a record that is only
+# still there because of the test. CreateFile with all three sharing modes is
+# what a bystander means to do.
+function Read-SharedText([string]$path) {
   if (-not (Test-Path $path)) { return @() }
-  $lines = @(Get-Content $path -Encoding UTF8 -ErrorAction SilentlyContinue)
+  # 1 = FILE_READ_DATA, 7 = read|write|delete sharing, 3 = OPEN_EXISTING,
+  # 0x80 = FILE_ATTRIBUTE_NORMAL. Not GENERIC_READ: PowerShell 5.1 turns that
+  # literal into a negative number and refuses to hand it to a uint32 parameter.
+  $last = 0
+  for ($try = 1; $try -le 5; $try++) {
+    $h = [W]::CreateFileW($path, 1, 7, [IntPtr]::Zero, 3, 0x80, [IntPtr]::Zero)
+    if ($h -ne [IntPtr](-1)) {
+      $sh = New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($h, $true)
+      $fs = New-Object System.IO.FileStream($sh, [System.IO.FileAccess]::Read)
+      $reader = New-Object System.IO.StreamReader($fs)
+      $text = $reader.ReadToEnd()
+      $reader.Dispose()
+      return @($text -split "`r?`n")
+    }
+    $last = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    # The file is being swapped in this instant. Back off and ask again; a reader
+    # that gives up at once would report a journal that is there as one that is
+    # not, and a test cannot be trusted to notice the difference.
+    Start-Sleep -Milliseconds 40
+  }
+  if (-not (Test-Path $path)) { return @() }
+  Fail "the journal is at $path and this script cannot read it (Win32 error $last)"
+  return @()
+}
+
+function Read-Journal([string]$path) {
+  # One tab-separated record per hung window. Field 13 is the window being back on
+  # the desktop but still hooked, and field 19 the line keeping its card while the
+  # window sits out; a record from before either of them simply lacks the column.
+  $lines = @(Read-SharedText $path)
   return @($lines | Where-Object { $_.Trim().Length -gt 0 } | ForEach-Object {
     $f = $_ -split "`t"
     [pscustomobject]@{
@@ -608,16 +660,55 @@ function Remove-Fixtures {
 
 # --- the app itself ------------------------------------------------------------
 
+# The instances this script started. Everything the tests drive - the window they
+# send messages to, the process they wait for or stop - comes out of this list.
+# Only one ShaiWin can hold the session mutex, so the instance that would
+# otherwise answer is the user's own line, and a test that hangs his windows and
+# kills his app is not a test, it is a support call.
+$script:shaiwinPids = @()
+
+function Get-OurShaiwin {
+  if (-not $script:shaiwinPids) { return @() }
+  @(Get-Process -Id $script:shaiwinPids -ErrorAction SilentlyContinue)
+}
+
+# Refuse to run alongside an instance this script did not start. There is no
+# safe way to tell the leftover of an aborted run from the line someone is
+# working with, so the human decides.
+function Assert-NoForeignShaiwin {
+  $foreign = @(Get-Process shaiwin -ErrorAction SilentlyContinue |
+    Where-Object { $script:shaiwinPids -notcontains $_.Id })
+  if ($foreign) {
+    Fail ("a ShaiWin this script did not start is running (pid $(($foreign | ForEach-Object { $_.Id }) -join ', ')). " +
+          "Quit it from the tray and run this again; if it is the leftover of an aborted run, stop it yourself. " +
+          "The tests will not stop it for you - it may be the line you are working with.")
+  }
+}
+
 function Stop-ShaiwinWithEverythingDown {
-  $old = Get-Process shaiwin -ErrorAction SilentlyContinue
-  if (-not $old) { return }
+  Assert-NoForeignShaiwin
+  if (-not $script:shaiwinPids) { return }
   $overlay = Get-Overlay
   if ($overlay -ne [IntPtr]::Zero) {
     Invoke-Wm $overlay $script:KitTakeAll ([IntPtr]::Zero) ([IntPtr]::Zero)
     Start-Sleep -Milliseconds 1800
   }
-  $old | Stop-Process -Force
+  foreach ($owned in $script:shaiwinPids) {
+    Stop-Process -Id $owned -Force -ErrorAction SilentlyContinue
+  }
+  $script:shaiwinPids = @()
   Start-Sleep -Milliseconds 500
+}
+
+# Hard-stop the instances this script started and leave their windows exactly
+# where they stand - the way a crash leaves them, which is what the tests about
+# coming back want.
+function Stop-OurShaiwin {
+  foreach ($owned in $script:shaiwinPids) {
+    Stop-Process -Id $owned -Force -ErrorAction SilentlyContinue
+  }
+  $script:shaiwinPids = @()
+  Start-Sleep -Milliseconds 600
 }
 
 # A private LOCALAPPDATA so the tests can never write the real journal or the
@@ -631,7 +722,12 @@ function New-Sandbox([string]$root, [string]$settings) {
 }
 
 function Start-Shaiwin([string]$exe, [string]$state) {
+  Assert-NoForeignShaiwin
   $saved = $env:LOCALAPPDATA
   $env:LOCALAPPDATA = $state
-  try { return Start-Process -FilePath $exe -PassThru } finally { $env:LOCALAPPDATA = $saved }
+  try {
+    $proc = Start-Process -FilePath $exe -PassThru
+    $script:shaiwinPids += $proc.Id
+    return $proc
+  } finally { $env:LOCALAPPDATA = $saved }
 }

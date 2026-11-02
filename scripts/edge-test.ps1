@@ -113,11 +113,11 @@ try {
   $end = [Environment]::TickCount + 6000
   while ([Environment]::TickCount -lt $end) {
     if (Test-OnDesktop $d) { $flashed = $true }
-    if (-not (Get-Process shaiwin -ErrorAction SilentlyContinue)) { break }
+    if (-not (Get-OurShaiwin)) { break }
     Start-Sleep -Milliseconds 15
   }
   if ($flashed) { Fail "D was shown on the desktop while the app was quitting" }
-  if (-not (Wait-Until ({ -not (Get-Process shaiwin -ErrorAction SilentlyContinue) }) 6000)) { Fail "shaiwin did not exit on WM_CLOSE" }
+  if (-not (Wait-Until ({ -not (Get-OurShaiwin) }) 6000)) { Fail "shaiwin did not exit on WM_CLOSE" }
   if (-not (Wait-Until ({ [W]::IsIconic($d) }) 4000)) {
     Fail "D was not minimized on quit - quitting must not throw every card's window back onto the desktop"
   }
