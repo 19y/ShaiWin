@@ -67,12 +67,12 @@ cargo run -p shaiwin                          # 开发构建
 ### 验证
 
 ```powershell
-cargo test --workspace                                                   # 83 个单元测试
+cargo test --workspace                                                   # 97 个单元测试
 cargo clippy --workspace --all-targets -- -D warnings
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 ```
 
-十一个端到端脚本共用 `scripts/testkit.ps1`（Win32 声明、临时夹具窗口、独立 `LOCALAPPDATA`），跑的是真实窗口管理器，不碰你自己的窗口：
+十二个端到端脚本共用 `scripts/testkit.ps1`（Win32 声明、临时夹具窗口、独立 `LOCALAPPDATA`），跑的是真实窗口管理器，不碰你自己的窗口：
 
 | 脚本 | 覆盖 |
 | --- | --- |
@@ -86,9 +86,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 | `position-test.ps1` | 六种情形下点卡片回原坐标 |
 | `resize-test.ps1` | 侧边调宽、底边调高、重启后保持 |
 | `settings-shot.ps1` | 设置窗口截图，并真的点快捷键框、点 ×、点保存 |
+| `lang-import-test.ps1` | 以一个普通用户的身份把 `languages\ru.txt` 丢进语言文件夹：切过去、看每个屏幕、再切回跟随系统 |
 | `hang-latency.ps1` | 挂起链路分段计时 |
 
 除 `stay-hung-test.ps1` 外，每个脚本的沙盒里都写死 `stay_hung=0`，跑的是「点卡片就是把窗口取下」那条旧线。
+
+`languages\ru.txt` 是仓库里备着的一份完整俄语包，程序不内置它——它就是普通用户要丢进语言文件夹的那种文件，`lang-import-test.ps1` 走的正是这条路。句子太长撑满窗口时程序不会悄悄截断：设置面板逐条量过再画，量不下的写进 `shaiwin.log`（`the panel has no room for ...`），标签气泡则按词语自己撑宽。
 
 改完请跑上面三条命令。要动渲染或挂起判定，先在真机上手工验一遍，机器验不了的在说明里写清楚「还没验的」，不要写成做完了。
 
@@ -129,7 +132,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 - 抓不到画面时（Chrome / Electron / 部分游戏的空白客户区），显示**应用色渐变 + 大图标 + 标题**的占位卡，而不是一块白；崩溃后恢复出来的卡片也是这一张。
 - 同一个应用的卡片同色（FNV-1a 哈希落到 12 色板）。
 - 弧线飞行、弹簧落针、阵风摆动，落针不是硬切。
-- 中英文界面与托盘菜单跟随系统语言。
+- 中英文界面与托盘菜单跟随系统语言；其他语言是语言文件夹里的一个文本文件，见「语言」。
 
 ### 资源与性能
 
@@ -149,7 +152,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 
 右键托盘图标：全部取下、展开/收起、设置、开机启动、退出。
 
-托盘「设置」打开一个独立窗口：两个快捷键、晾衣架弧度、衣架常驻、拖到顶部挂起、点开后卡片仍挂在绳上。
+托盘「设置」打开一个独立窗口：两个快捷键、晾衣架弧度、衣架常驻、拖到顶部挂起、点开后卡片仍挂在绳上、界面语言。
+
+### 语言
+
+界面跟随 Windows 的显示语言：中文系统出中文，其余出英文；也可以在设置里直接指定，保存后托盘、晾衣架、卡片和设置窗口一起换，不用重启。
+
+导入一门自己的语言，就是往 `%LOCALAPPDATA%\ShaiWin\languages\` 放一个 `<标签>.txt`——`ja.txt` 就是 `ja`，设置面板里的「语言文件…」直接打开这个文件夹。一行一句，`#` 开头是注释：
+
+```
+_name = Français
+settings_save = Enregistrer
+```
+
+`_name` 是这门语言对自己的称呼，`_font` 可以另指定字体。程序每次启动会把自带的中英文完整导出成 `en.txt`、`zh-CN.txt`（已有文件绝不覆盖），复制一份改下去就是新语言；没写的句子先用该语言自带的，再用英文，所以二十行也能用。设置里选不到语言时，检查文件名是不是就是标签本身。
 
 设置也写在 `%LOCALAPPDATA%\ShaiWin\settings.txt`，窗口没覆盖的项可以直接改文件。常用键：
 
@@ -162,6 +178,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 | `always_on` | 衣架常驻 |
 | `drag_hang` | 拖窗口到顶部挂起，`0` 可整个关掉 |
 | `stay_hung` | 点开后卡片仍挂在绳上，默认 `1`；`0` 时点卡片就是取下 |
+| `lang` | 界面语言：`auto` 跟随系统，或 `en`、`zh-CN`、语言文件自己的标签 |
 | `reduced_motion` | 减弱动画 |
 | `excluded` | 按可执行文件名的排除名单 |
 | `raise_known` | 点过气泡的「不再提示」就是 `1`；删掉这行重启会再弹 |

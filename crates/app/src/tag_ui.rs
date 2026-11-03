@@ -18,18 +18,18 @@ use shaiwin_core::theme::{tag_color, tag_ink};
 use shaiwin_platform_win::monitor::Monitor;
 use shaiwin_platform_win::Rect as WRect;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
-    DrawTextW, EndPaint, FillRect, GetDC, GetStockObject, GetTextMetricsW, InvalidateRect,
-    ReleaseDC, RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH,
-    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID, TEXTMETRICW,
-    TRANSPARENT,
+    DrawTextW, EndPaint, FillRect, GetDC, GetStockObject, GetTextExtentPoint32W, GetTextMetricsW,
+    InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    SetWindowRgn, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_GUI_FONT,
+    DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ,
+    OUT_DEFAULT_PRECIS, PS_SOLID, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -85,6 +85,11 @@ const FIELD_GAP: f32 = 8.0;
 const FIELD_H: f32 = 34.0;
 const BUTTON_H: f32 = 30.0;
 const BUTTON_GAP: f32 = 8.0;
+/// Room inside a button between its edge and the word on it.
+const BUTTON_X: f32 = 12.0;
+/// The least the row of three buttons may have between the ghost on the left and
+/// the pair on the right; below this the popover itself grows.
+const ROW_FLEX: f32 = 24.0;
 const SAVE_W: f32 = 76.0;
 const CANCEL_W: f32 = 62.0;
 const CLEAR_W: f32 = 72.0;
@@ -113,6 +118,11 @@ struct Dialog {
     edit: HWND,
     original: String,
     scale: f32,
+    /// The popover's width and the three buttons' widths, both measured from the
+    /// words the current language puts on them. `layout` is a pure function of
+    /// these, so the paint, the hit-test and the edit control cannot disagree.
+    width: i32,
+    row: [i32; 3],
     fonts: Fonts,
     field: HBRUSH,
     hover: Hit,
@@ -194,7 +204,21 @@ pub fn open(
             return;
         };
         let s = monitor.scale.max(1.0);
-        let width = (WIDTH * s).round() as i32;
+        // The same face the rest of the app writes in, chosen by the language
+        // rather than by which one the developer speaks. It is needed before the
+        // window is made, because the words on the buttons decide how wide it is.
+        let face = crate::i18n::ui_face();
+        let fonts = Fonts {
+            title: font(s, 11.5, FW_NORMAL.0 as i32, face),
+            edit: font(s, 13.5, FW_NORMAL.0 as i32, face),
+            button: font(s, 12.5, FW_SEMIBOLD.0 as i32, face),
+            ghost: font(s, 12.0, FW_NORMAL.0 as i32, face),
+        };
+        let row = button_row(fonts.button, s);
+        let width = row_width(s, &row);
+        if width > (WIDTH * s).round() as i32 {
+            crate::log!("the tag popover grew to {width}px to hold the words of this language");
+        }
         let height = (HEIGHT * s).round() as i32;
         let work = monitor.work;
         let (want_x, want_y) = match anchor {
@@ -246,20 +270,9 @@ pub fn open(
             let _ = SetWindowRgn(hwnd, Some(region), true);
         }
 
-        let face = if crate::i18n::is_chinese() {
-            w!("Microsoft YaHei UI")
-        } else {
-            w!("Segoe UI")
-        };
-        let fonts = Fonts {
-            title: font(s, 11.5, FW_NORMAL.0 as i32, face),
-            edit: font(s, 13.5, FW_NORMAL.0 as i32, face),
-            button: font(s, 12.5, FW_SEMIBOLD.0 as i32, face),
-            ghost: font(s, 12.0, FW_NORMAL.0 as i32, face),
-        };
         let field = CreateSolidBrush(rgb(FIELD));
 
-        let layout = layout(s);
+        let layout = layout(s, width, &row);
         let edit_x = layout.field.left + (12.0 * s).round() as i32;
         let edit_w = (layout.field.right - layout.field.left) - (24.0 * s).round() as i32;
         // A stock single-line edit draws its line from the top of its client
@@ -318,6 +331,8 @@ pub fn open(
             edit,
             original: initial.to_string(),
             scale: s,
+            width,
+            row,
             fonts,
             field,
             hover: Hit::None,
@@ -532,17 +547,62 @@ pub fn close_saving() {
     }
 }
 
-fn layout(s: f32) -> Layout {
+/// The three buttons, as wide as the words they carry. A popover that cuts
+/// "Убрать метку" down to "Убрать мет…" has thrown away the thing the button is
+/// for, so the words set the width and not the other way round.
+unsafe fn button_row(font: HFONT, s: f32) -> [i32; 3] {
+    let inset = (BUTTON_X * s).round() as i32;
+    let min = |logical: f32| (logical * s).round() as i32;
+    let word = |key: &str| text_width(font, t(key)) + 2 * inset;
+    [
+        min(CLEAR_W).max(word("tag_clear")),
+        min(CANCEL_W).max(word("tag_cancel")),
+        min(SAVE_W).max(word("tag_ok")),
+    ]
+}
+
+/// The popover: the card-sized width it ships with, or wider when a language
+/// needs the room for its three words.
+fn row_width(s: f32, row: &[i32; 3]) -> i32 {
+    let pad = (PAD * s).round() as i32;
+    let gap = (BUTTON_GAP * s).round() as i32;
+    let flex = (ROW_FLEX * s).round() as i32;
+    let needed = pad * 2 + row[0] + flex + row[1] + gap + row[2];
+    ((WIDTH * s).round() as i32).max(needed)
+}
+
+/// How wide `text` comes out in `font`, in device pixels.
+unsafe fn text_width(font: HFONT, text: &str) -> i32 {
+    unsafe {
+        let dc = GetDC(None);
+        if dc.is_invalid() {
+            return (text.chars().count() as f32 * 7.0) as i32;
+        }
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let ok = GetTextExtentPoint32W(dc, &wide, &mut size).as_bool();
+        let _ = SelectObject(dc, old);
+        let _ = ReleaseDC(None, dc);
+        if ok {
+            size.cx
+        } else {
+            (wide.len() as f32 * 7.0) as i32
+        }
+    }
+}
+
+fn layout(s: f32, width: i32, row: &[i32; 3]) -> Layout {
     let pad = (PAD * s).round() as i32;
     let title_h = (TITLE_H * s).round() as i32;
     let field_top = pad + title_h + (FIELD_GAP * s).round() as i32;
     let field_h = (FIELD_H * s).round() as i32;
     let button_h = (BUTTON_H * s).round() as i32;
     let button_top = (HEIGHT * s).round() as i32 - pad - button_h;
-    let right = (WIDTH * s).round() as i32 - pad;
-    let save_w = (SAVE_W * s).round() as i32;
-    let cancel_w = (CANCEL_W * s).round() as i32;
-    let clear_w = (CLEAR_W * s).round() as i32;
+    let right = width - pad;
+    let save_w = row[2];
+    let cancel_w = row[1];
+    let clear_w = row[0];
     let gap = (BUTTON_GAP * s).round() as i32;
     Layout {
         title: RECT {
@@ -663,7 +723,7 @@ fn clear(hwnd: HWND) {
 
 fn hit_test(state: &Dialog, point: (i32, i32)) -> Hit {
     let text = read_edit(state.edit);
-    let l = layout(state.scale);
+    let l = layout(state.scale, state.width, &state.row);
     let inside =
         |r: &RECT| point.0 >= r.left && point.0 < r.right && point.1 >= r.top && point.1 < r.bottom;
     if inside(&l.save) {
@@ -702,7 +762,7 @@ unsafe fn paint(hwnd: HWND) {
         FillRect(hdc, &client, paper);
         let _ = DeleteObject(paper.into());
 
-        let l = layout(state.scale);
+        let l = layout(state.scale, state.width, &state.row);
         let text = read_edit(state.edit);
         let colour = tag_color(&text);
         let base = colour.as_tuple();

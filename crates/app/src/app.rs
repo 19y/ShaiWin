@@ -589,6 +589,11 @@ impl App {
         unsafe {
             let hinst: HINSTANCE = GetModuleHandleW(None).ok()?.into();
             let settings = Settings::load();
+            // Before anything is drawn or said: the language. Then the shipped
+            // languages are written out into the folder, so a person who wants a
+            // third has a file with every line in it already filled in.
+            crate::i18n::activate(&settings.lang);
+            crate::i18n::export_templates();
             let window_icon = ico::load(ico::large_size()).unwrap_or_default();
             let tray_icon = ico::load(ico::small_size()).unwrap_or_default();
             register_class(hinst, window_icon, tray_icon);
@@ -798,12 +803,9 @@ impl App {
             SetTimer(Some(self.hwnd), TIMER_POLL, 50, None);
         }
         if !failed.is_empty() && !self.tray_icon.is_invalid() {
-            let body = format!(
-                "{}：{}。可以在托盘菜单的「设置」里换一个组合。",
-                t("hotkey_failed"),
-                failed.join("、")
-            );
-            tray::balloon(self.hwnd, self.tray_icon, t("app_name"), &body, true);
+            let list = failed.join(", ");
+            let body = crate::i18n::t_fmt("hotkey_failed_body", &[("{list}", list.as_str())]);
+            tray::balloon(self.hwnd, self.tray_icon, t("hotkey_failed"), &body, true);
         }
         self.recover();
         self.sync_journal();
@@ -1388,11 +1390,8 @@ impl App {
                     if current.is_empty() {
                         add(CMD_TAG_EDIT, t("tag_menu"), MF_ENABLED);
                     } else {
-                        add(
-                            CMD_TAG_EDIT,
-                            &format!("{}{}", t("tag_current"), current),
-                            MF_ENABLED,
-                        );
+                        let labelled = crate::i18n::t_fmt("tag_current", &[("{tag}", current)]);
+                        add(CMD_TAG_EDIT, &labelled, MF_ENABLED);
                         add(CMD_TAG_CLEAR, t("tag_clear"), MF_ENABLED);
                     }
                     sep();
@@ -3740,15 +3739,16 @@ impl App {
     /// Called by the settings window once the user presses Save. The hotkeys
     /// are re-registered first: if one is taken, nothing else changes and the
     /// window stays open with the old shortcut still working.
-    pub(crate) fn apply_settings(
-        &mut self,
-        hang: (u32, u32),
-        toggle: (u32, u32),
-        sag_percent: f32,
-        always_on: bool,
-        drag_hang: bool,
-        stay_hung: bool,
-    ) -> Result<(), String> {
+    pub(crate) fn apply_settings(&mut self, draft: settings::Draft) -> Result<(), String> {
+        let settings::Draft {
+            hang,
+            toggle,
+            sag_percent,
+            always_on,
+            drag_hang,
+            stay_hung,
+            lang,
+        } = draft;
         self.apply_hotkeys(hang.0, hang.1, toggle.0, toggle.1)?;
         self.settings.hang_mods = hang.0;
         self.settings.hang_vk = hang.1;
@@ -3763,7 +3763,24 @@ impl App {
         self.settings.drag_hang = drag_hang;
         let was_stay = self.settings.stay_hung;
         self.settings.stay_hung = stay_hung;
+        // Applied here and not at the next start: the tray, the rope and every
+        // card read the same table, and a setting that waits until you restart is
+        // a setting nobody believes.
+        let lang = crate::i18n::lang_tag(&lang);
+        let was_lang = std::mem::replace(&mut self.settings.lang, lang.clone());
         self.settings.save();
+        if was_lang != lang {
+            crate::i18n::activate(&lang);
+            // A sprite is keyed by the shape of the card and the picture in it,
+            // not by the words drawn on it, so the cached ones go and every card
+            // is rasterised again with the new strings.
+            self.painter.forget_sprites();
+            self.tray_tip = crate::i18n::tray_tip(self.line.live_count());
+            if !self.tray_icon.is_invalid() {
+                tray::set_tip(self.hwnd, &self.tray_tip);
+            }
+            crate::log!("language is now {lang}");
+        }
         // Applying the mode immediately is the difference between a setting and
         // a promise: turning "keep the line on screen" on should bring it down,
         // and turning it off should hand the line over to the short-visit rules.
@@ -4894,7 +4911,7 @@ fn app_name(exe: &str) -> String {
     let mut chars = stem.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => "Window".to_string(),
+        None => t("untitled_window").to_string(),
     }
 }
 

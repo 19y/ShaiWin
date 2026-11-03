@@ -27,6 +27,8 @@ if (-not ("Win.Print" -as [type])) {
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr lp);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)]
     public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
 '@
 }
 
@@ -62,6 +64,19 @@ function Get-Box([IntPtr]$h) {
   $t = $r.Bottom - $r.Top
   if ($w -lt 2 -or $t -lt 2) { Fail "the control has no size ($w x $t)" }
   return @{ w = $w; t = $t }
+}
+
+function Get-Text([IntPtr]$h) {
+  $sb = New-Object System.Text.StringBuilder 512
+  [void][Win.Print]::GetWindowTextW($h, $sb, 512)
+  return $sb.ToString()
+}
+
+# The buttons are found by the word on them, never by index: which language the
+# panel speaks decides how many there are and what they say, and a test that
+# counted them would be testing its own arithmetic.
+function Get-Button-ByText([IntPtr]$parent, [string]$want) {
+  @(Get-Children $parent "ShaiWin.Settings.Button" | Where-Object { (Get-Text $_) -eq $want })
 }
 
 function Click-At([IntPtr]$h, [int]$x, [int]$y) {
@@ -156,6 +171,7 @@ Stop-ShaiwinWithEverythingDown
 $session = Open-Settings "shipped" "$base`nsag=-1"
 try {
   Save-Shot $session.wnd (Join-Path $shotDir "settings-shipped.png")
+  Assert-NoCut $session.state "in the language it ships"
 
   Write-Host "== the shortcut box, clicked =="
   $keys = Get-Children-Sorted $session.wnd "ShaiWin.Settings.Key"
@@ -324,6 +340,94 @@ try {
   Close-Settings $session
   Remove-Fixtures
   Remove-Item $stillRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "== the language row, a folder pack, and picking another language =="
+Stop-ShaiwinWithEverythingDown
+$langRoot = Join-Path $env:TEMP "shaiwin-settings-lang"
+$state = New-Sandbox $langRoot "$base`nsag=-1`nlang=auto"
+$langDir = Join-Path $state "ShaiWin\languages"
+New-Item -ItemType Directory -Force $langDir | Out-Null
+
+# Spelled from code points, not literals: these files carry no byte-order mark,
+# so Windows PowerShell reads them in the ANSI code page and a non-ASCII string
+# here would arrive at the app already mangled.
+$frenchName = "Fran$([char]0xE7)ais"
+$frenchSave = "Enregistrer"
+$zhName = "$([char]0x7B80)$([char]0x4F53)$([char]0x4E2D)$([char]0x6587)"
+$enFolder = "Language files$([char]0x2026)"
+
+# A language the program does not ship, found in the folder the panel opens. The
+# two lines it carries are enough to prove the file was read and named.
+$pack = "_name = $frenchName`nsettings_save = $frenchSave`n"
+[System.IO.File]::WriteAllText((Join-Path $langDir "fr.txt"), $pack, (New-Object System.Text.UTF8Encoding $true))
+
+$proc = Start-Shaiwin $Exe $state
+Start-Sleep -Milliseconds 2200
+$app = Get-Overlay
+if (-not (Test-Window $app)) { Fail "the app window is not there" }
+Invoke-Wm $app ([uint32](0x8000 + 15)) ([IntPtr]::Zero) ([IntPtr]::Zero)
+if (-not (Wait-Until { Test-Window (Find-By-Class "ShaiWin.Settings") } 5000)) {
+  Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+  Fail "the settings window never opened"
+}
+Start-Sleep -Milliseconds 900
+$session = @{ state = $state; proc = $proc; wnd = Find-By-Class "ShaiWin.Settings" }
+try {
+  Save-Shot $session.wnd (Join-Path $shotDir "settings-language.png")
+
+  # Starting up fills the folder with a complete copy of every shipped language,
+  # which is what a new translation is written into rather than typed out.
+  # Read as UTF-8 on purpose: this shell's default code page is 936, and a GBK
+  # reading of a Chinese pack eats the `=` off the end of half its lines.
+  foreach ($shipped in "en.txt", "zh-CN.txt") {
+    $file = Join-Path $langDir $shipped
+    if (-not (Test-Path $file)) { Fail "startup left no $shipped in the folder" }
+    $lines = [System.IO.File]::ReadAllLines($file, [System.Text.Encoding]::UTF8)
+    $entries = @($lines | Where-Object { $_.Trim() -ne "" -and -not $_.StartsWith("#") })
+    $assign = @($entries | Where-Object { $_ -match "=" })
+    if ($assign.Count -lt 60) { Fail "$shipped is not a full pack ($($assign.Count) lines)" }
+    if ($entries.Count -ne $assign.Count) { Fail "$shipped has a line that is neither a comment nor a key" }
+  }
+  Write-Host "  the shipped languages were exported to the folder"
+
+  # The row offers the system, both shipped languages and the file in the folder,
+  # and every one of them is named the way it names itself.
+  foreach ($name in "English", $zhName, $frenchName) {
+    $row = Get-Button-ByText $session.wnd $name
+    if ($row.Count -ne 1) { Fail "the language row has $name of them: $($row.Count)" }
+  }
+  Write-Host "  the row offers the system, both shipped languages and the folder's"
+
+  Write-Host "== picking English and saving =="
+  Click-Middle ((Get-Button-ByText $session.wnd "English")[0])
+  $buttons = Get-Children-Sorted $session.wnd "ShaiWin.Settings.Button"
+  $save = ($buttons | Sort-Object { (Get-Rect $_).Left })[-1]
+  Click-Middle $save
+  Start-Sleep -Milliseconds 800
+  $saved = Get-Content (Join-Path $session.state "ShaiWin\settings.txt") -Raw
+  if ($saved -notmatch "lang=en") { Fail "the language pick was not saved:`n$saved" }
+  $log = Get-Content (Join-Path $session.state "ShaiWin\shaiwin.log") -Raw -ErrorAction SilentlyContinue
+  if ($log -notmatch "language is now en") { Fail "the switch was not logged:`n$log" }
+  Write-Host "  saved lang=en"
+
+  # A reopened panel is drawn in the language it just chose, which is the whole
+  # claim of switching without a restart: the tray tip, the rope and this window
+  # read one table.
+  Invoke-Wm (Get-Overlay) ([uint32](0x8000 + 15)) ([IntPtr]::Zero) ([IntPtr]::Zero)
+  if (-not (Wait-Until { Test-Window (Find-By-Class "ShaiWin.Settings") } 5000)) {
+    Fail "the settings window never reopened"
+  }
+  Start-Sleep -Milliseconds 900
+  $session.wnd = Find-By-Class "ShaiWin.Settings"
+  Save-Shot $session.wnd (Join-Path $shotDir "settings-english.png")
+  Assert-NoCut $session.state "in English"
+  if ((Get-Button-ByText $session.wnd "Save").Count -ne 1) { Fail "the panel is still not speaking English" }
+  if ((Get-Button-ByText $session.wnd $enFolder).Count -ne 1) { Fail "the door to the language files has no English name" }
+  Write-Host "  the panel came back in English"
+} finally {
+  Close-Settings $session
+  Remove-Item $langRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "done: $shotDir"

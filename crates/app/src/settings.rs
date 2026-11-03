@@ -77,6 +77,10 @@ pub struct Settings {
     /// Off, a click is a take-down: the card comes off the line and the hook
     /// catches the window again when it is minimized.
     pub stay_hung: bool,
+    /// The language the interface is drawn in: `auto` follows the system, and
+    /// anything else is the name of a pack in the languages folder. Kept as text
+    /// rather than an enum because the folder decides what exists.
+    pub lang: String,
 }
 
 /// A tag the card can actually carry. Tabs and line breaks would break the
@@ -92,6 +96,26 @@ pub fn clean_tag(tag: &str) -> String {
         .chars()
         .take(24)
         .collect()
+}
+
+/// What the settings window is asking for, before any of it is made true.
+///
+/// The panel drafts seven decisions - two shortcuts, the curve, three switches
+/// and the language - and either all of them land or none do, because a save
+/// that stops at a taken shortcut must leave the rest of the line as it was.
+/// They travel as one value so a half-applied save cannot be an accident of the
+/// argument list.
+#[derive(Clone, Debug)]
+pub struct Draft {
+    pub hang: (u32, u32),
+    pub toggle: (u32, u32),
+    /// Negative means the shipped curve, same as in [`Settings::sag_percent`].
+    pub sag_percent: f32,
+    pub always_on: bool,
+    pub drag_hang: bool,
+    pub stay_hung: bool,
+    /// A pack tag, or `auto` to follow the system.
+    pub lang: String,
 }
 
 impl Default for Settings {
@@ -111,6 +135,7 @@ impl Default for Settings {
             drag_hang: true,
             auto_hide_secs: 1,
             stay_hung: true,
+            lang: crate::i18n::AUTO.to_string(),
         }
     }
 }
@@ -164,6 +189,7 @@ impl Settings {
                 "toggle_mods" => s.toggle_mods = parse_mods(value),
                 "toggle_vk" => s.toggle_vk = parse_vk(value),
                 "sag" => s.sag_percent = parse_sag(value),
+                "lang" => s.lang = crate::i18n::lang_tag(value),
                 _ => {}
             }
         }
@@ -179,7 +205,7 @@ impl Settings {
             "welcomed={}\nreduced_motion={}\n\
              hang_mods={}\nhang_vk={}\ntoggle_mods={}\ntoggle_vk={}\n\
              sag={}\nhook_taught={}\nraise_known={}\nalways_on={}\ndrag_hang={}\n\
-             auto_hide_secs={}\nstay_hung={}\nexcluded={}\n",
+             auto_hide_secs={}\nstay_hung={}\nlang={}\nexcluded={}\n",
             u8::from(self.welcomed),
             u8::from(self.reduced_motion),
             self.hang_mods,
@@ -197,6 +223,7 @@ impl Settings {
             u8::from(self.drag_hang),
             self.auto_hide_secs,
             u8::from(self.stay_hung),
+            self.lang,
             self.excluded.join(",")
         );
         let _ = fs::write(file, text);
@@ -339,6 +366,8 @@ mod tests {
         assert!(s.stay_hung);
         // Nothing has been explained yet on a fresh install.
         assert!(!s.raise_known);
+        // And the language is the system's until somebody says otherwise.
+        assert_eq!(s.lang, crate::i18n::AUTO);
     }
 
     #[test]

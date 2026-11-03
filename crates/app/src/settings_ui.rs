@@ -1,9 +1,9 @@
 //! The settings window.
 //!
-//! A paper panel, hand-painted: two group headings, a hairline rule between
-//! them, the rope, and two switches. The rope is the thing worth remembering,
-//! so it is the only warm colour in the window, and it is the only control you
-//! operate by dragging rather than by reading a number.
+//! A paper panel, hand-painted: three group headings with a hairline rule before
+//! each, the rope, two switches and a row of language buttons. The rope is the
+//! thing worth remembering, so it is the only warm colour in the window, and it
+//! is the only control you operate by dragging rather than by reading a number.
 //!
 //! The curve is deliberately not a slider. "1.4% of the monitor width" is not
 //! something a person has an opinion about; bending a rope is. Pulling the
@@ -33,12 +33,14 @@ use shaiwin_core::layout::SAG_PERCENT_MAX;
 use shaiwin_platform_win::monitor::Monitor;
 use tiny_skia::{Color, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
-    InvalidateRect, LineTo, MoveToEx, RoundRect, SelectObject, SetBkMode, SetTextColor,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+    GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_GUI_FONT,
     DEFAULT_PITCH, DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
     DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_TOP, DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC,
@@ -53,14 +55,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_HOME, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE,
     VK_TAB, VK_UP,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW,
     GetWindowRect, IsDialogMessageW, KillTimer, LoadCursorW, MessageBoxW, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, BM_CLICK,
-    BN_CLICKED, CS_DBLCLKS, DLGC_BUTTON, DLGC_WANTALLKEYS, DLGC_WANTARROWS, DLGC_WANTCHARS,
-    DM_GETDEFID, GWLP_USERDATA, HICON, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW, MB_ICONWARNING,
-    MB_OK, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    BM_CLICK, BN_CLICKED, CS_DBLCLKS, DLGC_BUTTON, DLGC_WANTALLKEYS, DLGC_WANTARROWS,
+    DLGC_WANTCHARS, DM_GETDEFID, GWLP_USERDATA, HICON, HMENU, ICON_BIG, ICON_SMALL, IDC_ARROW,
+    MB_ICONWARNING, MB_OK, MSG, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS,
     WM_SETICON, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WNDPROC, WS_CAPTION, WS_CHILD,
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
@@ -78,12 +81,18 @@ const BUTTON_CLASS: PCWSTR = w!("ShaiWin.Settings.Button");
 
 const SAVE_ID: i32 = 1;
 const CANCEL_ID: i32 = 2;
+/// The quiet button that opens the folder the language files live in. It is a
+/// door, not a decision: nothing it opens can be undone by pressing it.
+const FOLDER_ID: i32 = 3;
 const HANG_ID: i32 = 101;
 const TOGGLE_ID: i32 = 102;
 const ROPE_ID: i32 = 103;
 const ALWAYS_ID: i32 = 104;
 const DRAG_ID: i32 = 105;
 const STAY_ID: i32 = 106;
+/// The language buttons are numbered by their place in the list on offer, so a
+/// click reports which one without the control having to remember anything.
+const LANG_BASE: i32 = 201;
 
 // --- the panel -----------------------------------------------------------------
 //
@@ -127,6 +136,20 @@ const BUTTON_H: f32 = 32.0;
 const BUTTON_GAP: f32 = 10.0;
 const FIELD_W: f32 = 208.0;
 const FIELD_H: f32 = 28.0;
+/// The row of language buttons. Four to a row because that is as narrow as a
+/// name stays readable at 13 logical pixels in a 472-pixel column, and three
+/// rows because a panel taller than the screen is a panel you cannot save from.
+const SEG_H: f32 = 32.0;
+const SEG_GAP: f32 = 8.0;
+const SEG_ROW_GAP: f32 = 6.0;
+const SEG_PER_ROW: usize = 4;
+const MAX_LANG_ROW: usize = 3;
+/// The air between the last row of language buttons and the line that says how
+/// to add one more.
+const LANG_NOTE_GAP: f32 = 8.0;
+/// The door to the language files. It is not a setting: it opens the folder the
+/// strings live in, which is the only way a third language gets written.
+const FOLDER_W: f32 = 150.0;
 /// The box the × of a shortcut field lives in: wide enough to hit without
 /// aiming, narrow enough that the combination still reads.
 const CLEAR_W: f32 = 26.0;
@@ -139,7 +162,9 @@ const SWITCH_BOX_W: f32 = 48.0;
 const SWITCH_BOX_H: f32 = 26.0;
 const GAP_LABEL: f32 = 14.0;
 
-const LOGICAL_H: f32 = PAD
+/// Everything the panel holds apart from the language group, whose height
+/// depends on how many languages the folder is offering today.
+const LOGICAL_H_REST: f32 = PAD
     + HEAD_H
     + HEAD_GAP
     + ROW_H
@@ -164,6 +189,30 @@ const LOGICAL_H: f32 = PAD
     + FOOT_GAP
     + BUTTON_H
     + PAD_BOTTOM;
+
+/// Rows of language buttons for `langs` choices, counting the "follow the
+/// system" one.
+fn lang_rows(langs: usize) -> usize {
+    langs.div_ceil(SEG_PER_ROW).clamp(1, MAX_LANG_ROW)
+}
+
+/// The group's own height: the space before its rule, the rule, the heading,
+/// the rows of buttons and the one line that tells you how to add a language.
+fn lang_group_h(rows: usize) -> f32 {
+    GROUP_GAP
+        + RULE_H
+        + RULE_GAP
+        + HEAD_H
+        + HEAD_GAP
+        + rows as f32 * SEG_H
+        + SEG_ROW_GAP * (rows - 1) as f32
+        + LANG_NOTE_GAP
+        + NOTE_H
+}
+
+fn logical_h(langs: usize) -> f32 {
+    LOGICAL_H_REST + lang_group_h(lang_rows(langs))
+}
 
 /// Where the rope is tied inside the tile, and how far it may hang. The bottom
 /// leaves room for a card to hang from the deepest curve, because a tile whose
@@ -214,6 +263,16 @@ struct State {
     always: HWND,
     drag_hang: HWND,
     stay: HWND,
+    /// The language buttons, in the order `lang_tags` lists them.
+    lang_buttons: Vec<HWND>,
+    /// `auto`, then each language the program and the folder offer, with the name
+    /// the pack gives itself. A button is the row it stands for, so the two are
+    /// always the same length.
+    lang_tags: Vec<(String, String)>,
+    /// The choice being drafted: `auto` or a tag. A language changes everything on
+    /// screen, so it is only applied when the panel is saved.
+    lang: String,
+    folder: HWND,
     save: HWND,
     cancel: HWND,
     /// The curve as it was when the window opened, for putting it back if the
@@ -248,6 +307,15 @@ struct Layout {
     stay_title: RECT,
     stay_note: RECT,
     switch_stay: RECT,
+    rule_c: RECT,
+    head_lang: RECT,
+    /// The language buttons, filled from the front by `measure` for as many as
+    /// the folder offers. Slots past `lang_count` are empty bands.
+    lang: [RECT; SEG_PER_ROW * MAX_LANG_ROW],
+    lang_count: usize,
+    /// The line under the buttons: how a language that is not offered gets here.
+    lang_note: RECT,
+    folder: RECT,
     save: RECT,
     cancel: RECT,
 }
@@ -261,10 +329,10 @@ fn band(x0: f32, x1: f32, y: f32, h: f32) -> RECT {
     }
 }
 
-/// The one place the rows are laid out, top to bottom. `LOGICAL_H` is this walk
+/// The one place the rows are laid out, top to bottom. [`logical_h`] is this walk
 /// with the same constants, so the window is exactly as tall as its content.
 #[allow(clippy::field_reassign_with_default)] // each band needs the running `y`
-fn measure(client_w: i32, s: f32) -> Layout {
+fn measure(client_w: i32, s: f32, langs: usize) -> Layout {
     let x0 = PAD * s;
     let x1 = client_w as f32 - PAD * s;
     // Controls are right-aligned on one vertical line.
@@ -320,7 +388,36 @@ fn measure(client_w: i32, s: f32) -> Layout {
         y + (TITLE_H - SWITCH_BOX_H) / 2.0 * s,
         SWITCH_BOX_H * s,
     );
-    y += ITEM_H * s + FOOT_GAP * s;
+    y += ITEM_H * s;
+
+    // --- the language group ----------------------------------------------------
+    y += GROUP_GAP * s;
+    l.rule_c = band(x0, x1, y, RULE_H * s);
+    y += (RULE_H + RULE_GAP) * s;
+    l.head_lang = band(x0, x1, y, HEAD_H * s);
+    y += (HEAD_H + HEAD_GAP) * s;
+    let offered = langs.min(SEG_PER_ROW * MAX_LANG_ROW);
+    let rows = lang_rows(offered);
+    let grid_top = y;
+    for row in 0..rows {
+        // The choices in a row share its width, so three languages are not one
+        // wide button and two narrow ones, and the last row is never a stretch.
+        let first = row * SEG_PER_ROW;
+        let in_row = (offered - first).min(SEG_PER_ROW);
+        let step = (x1 - x0) / in_row as f32;
+        let y_row = grid_top + row as f32 * (SEG_H + SEG_ROW_GAP) * s;
+        for column in 0..in_row {
+            let at = first + column;
+            let sx0 = x0 + column as f32 * step;
+            l.lang[at] = band(sx0, sx0 + step - SEG_GAP * s, y_row, SEG_H * s);
+        }
+        y = y_row + SEG_H * s;
+    }
+    l.lang_count = offered;
+    y += LANG_NOTE_GAP * s;
+    l.lang_note = band(x0, x1, y, NOTE_H * s);
+    y += NOTE_H * s;
+    y += FOOT_GAP * s;
 
     let w = BUTTON_W * s;
     l.save = band(x1 - w, x1, y, BUTTON_H * s);
@@ -330,6 +427,9 @@ fn measure(client_w: i32, s: f32) -> Layout {
         y,
         BUTTON_H * s,
     );
+    // The way out to the language files, on the same baseline and on the far
+    // side, so it is never mistaken for the two decisions on the right.
+    l.folder = band(x0, x0 + FOLDER_W * s, y, BUTTON_H * s);
     l
 }
 
@@ -434,6 +534,27 @@ fn sag_auto_on(monitor: &Monitor) -> f32 {
     shaiwin_core::layout::classic_sag(width, monitor.scale) / width * 100.0
 }
 
+/// The buttons on the language row: "follow the system" first, then every
+/// language the program ships or the folder offers.
+///
+/// A stored tag nobody offers - a file deleted since - is kept anyway. It is the
+/// user's own choice, and a row that silently moved to another button would say
+/// the panel had decided something it had not.
+fn offered_langs(stored: &str) -> Vec<(String, String)> {
+    let mut langs = vec![(crate::i18n::AUTO.to_string(), t("lang_auto").to_string())];
+    langs.extend(
+        crate::i18n::languages()
+            .into_iter()
+            .map(|lang| (lang.tag, lang.name)),
+    );
+    if !langs.iter().any(|(tag, _)| tag == stored) {
+        let stored = stored.to_string();
+        langs.push((stored.clone(), stored));
+    }
+    langs.truncate(SEG_PER_ROW * MAX_LANG_ROW);
+    langs
+}
+
 /// Opens the settings window. The caller keeps the returned handle to focus an
 /// existing window instead of making a second one.
 pub fn open(
@@ -446,11 +567,12 @@ pub fn open(
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).ok()?.into();
         let scale = monitor.scale.max(1.0);
+        let langs = offered_langs(&settings.lang);
         let mut frame = RECT {
             left: 0,
             top: 0,
             right: (LOGICAL_W * scale).round() as i32,
-            bottom: (LOGICAL_H * scale).round() as i32,
+            bottom: (logical_h(langs.len()) * scale).round() as i32,
         };
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
         let _ = AdjustWindowRectExForDpi(
@@ -492,7 +614,7 @@ pub fn open(
             scale,
             monitor,
             fonts: make_fonts(scale),
-            layout: measure(client.right, scale),
+            layout: measure(client.right, scale, langs.len()),
             hwnd,
             hang: HWND::default(),
             toggle: HWND::default(),
@@ -500,6 +622,10 @@ pub fn open(
             always: HWND::default(),
             drag_hang: HWND::default(),
             stay: HWND::default(),
+            lang_buttons: Vec::new(),
+            lang_tags: langs,
+            lang: settings.lang.clone(),
+            folder: HWND::default(),
             save: HWND::default(),
             cancel: HWND::default(),
             initial_sag: settings.sag_percent,
@@ -508,6 +634,7 @@ pub fn open(
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
         (*ptr).build(hwnd, settings);
+        warn_cut(&(*ptr));
         SETTINGS_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(hwnd);
@@ -557,6 +684,16 @@ impl State {
             );
             self.drag_hang = self.switch(hwnd, l.switch_drag, DRAG_ID, settings.drag_hang, reduced);
             self.stay = self.switch(hwnd, l.switch_stay, STAY_ID, settings.stay_hung, reduced);
+            // One button per language on offer, and the one being used is the one
+            // that looks pressed. They are ordinary buttons rather than radio
+            // buttons because a name you can read is the whole control.
+            for (at, (tag, name)) in self.lang_tags.clone().iter().enumerate() {
+                let selected = *tag == self.lang;
+                let hwnd_button =
+                    self.button(hwnd, name, LANG_BASE + at as i32, l.lang[at], selected);
+                self.lang_buttons.push(hwnd_button);
+            }
+            self.folder = self.button(hwnd, t("lang_folder"), FOLDER_ID, l.folder, false);
             self.save = self.button(hwnd, t("settings_save"), SAVE_ID, l.save, true);
             self.cancel = self.button(hwnd, t("settings_cancel"), CANCEL_ID, l.cancel, false);
 
@@ -682,6 +819,11 @@ impl State {
     ) -> HWND {
         unsafe {
             let hwnd = self.child(parent, BUTTON_CLASS, rect, id, WINDOW_STYLE(0));
+            // The word is painted by hand, but it is also the window text: a
+            // caption nobody can read out of the window is a control a screen
+            // reader - or a test - has to guess at.
+            let wide = wstr(text);
+            let _ = SetWindowTextW(hwnd, PCWSTR(wide.as_ptr()));
             let ctrl = Box::into_raw(Box::new(Button {
                 hwnd,
                 parent,
@@ -803,6 +945,24 @@ impl State {
                 l.stay_note,
                 DT_TOP | DT_LEFT,
             );
+            // The buttons answer which language, not where a language comes from.
+            // That is the one thing the row of names cannot say for itself.
+            self.text(
+                hdc,
+                t("settings_lang"),
+                F_HEAD,
+                MUTED,
+                l.head_lang,
+                DT_TOP | DT_LEFT,
+            );
+            self.text(
+                hdc,
+                t("settings_lang_note"),
+                F_NOTE,
+                MUTED,
+                l.lang_note,
+                DT_TOP | DT_LEFT,
+            );
 
             let _ = DeleteObject(paper.into());
             let _ = DeleteObject(rule.into());
@@ -863,16 +1023,18 @@ impl State {
     /// Tab and Shift-Tab out of a shortcut box. While a box is listening it takes
     /// every key, so the dialog manager never gets the Tab that ends the listening.
     fn focus_stop(&self, current: HWND, backward: bool) {
-        let stops = [
+        // Creation order is the reading order, and the language buttons are part
+        // of it: a stop that skips them would jump past a whole row.
+        let mut stops = vec![
             self.hang,
             self.toggle,
             self.rope,
             self.always,
             self.drag_hang,
             self.stay,
-            self.save,
-            self.cancel,
         ];
+        stops.extend(self.lang_buttons.iter().copied());
+        stops.extend([self.folder, self.save, self.cancel]);
         let Some(at) = stops.iter().position(|stop| *stop == current) else {
             return;
         };
@@ -913,18 +1075,20 @@ impl State {
                 return false;
             }
             let sag = self.sag();
-            match (*self.app).apply_settings(
-                (hang_mods, hang_vk),
-                (toggle_mods, toggle_vk),
-                sag,
-                self.checked(self.always),
+            let draft = settings::Draft {
+                hang: (hang_mods, hang_vk),
+                toggle: (toggle_mods, toggle_vk),
+                sag_percent: sag,
+                always_on: self.checked(self.always),
                 // The switch reads "拖到屏幕顶端就挂上", which is the stored
                 // value itself: what you see is what the setting says.
-                self.checked(self.drag_hang),
+                drag_hang: self.checked(self.drag_hang),
                 // Same here: "点开后卡片仍挂在绳上" is on when the line is the
                 // kind that keeps its cards.
-                self.checked(self.stay),
-            ) {
+                stay_hung: self.checked(self.stay),
+                lang: self.lang.clone(),
+            };
+            match (*self.app).apply_settings(draft) {
                 Ok(()) => {
                     self.saved = true;
                     true
@@ -934,6 +1098,41 @@ impl State {
                     false
                 }
             }
+        }
+    }
+
+    /// The row answers a click by moving which button looks pressed, not by
+    /// changing the app: a language changes every word on screen, so like the rest
+    /// of this window it waits for Save.
+    fn choose_lang(&mut self, at: usize) {
+        self.lang = self.lang_tags[at].0.clone();
+        for (index, button) in self.lang_buttons.iter().enumerate() {
+            unsafe {
+                let ptr = GetWindowLongPtrW(*button, GWLP_USERDATA) as *mut Button;
+                if !ptr.is_null() {
+                    (*ptr).primary = index == at;
+                    let _ = InvalidateRect(Some(*button), None, false);
+                }
+            }
+        }
+    }
+
+    /// The language files are text somebody has to edit, so the door to them is
+    /// part of the setting. Making sure the folder exists first is what puts a
+    /// finished, fill-in-the-blanks copy inside it.
+    unsafe fn open_language_folder(&self) {
+        unsafe {
+            crate::i18n::export_templates();
+            let path = crate::i18n::languages_dir().display().to_string();
+            let wide = wstr(&path);
+            let _ = ShellExecuteW(
+                Some(self.hwnd),
+                w!("open"),
+                PCWSTR(wide.as_ptr()),
+                PCWSTR::null(),
+                None,
+                SW_SHOWNORMAL,
+            );
         }
     }
 
@@ -966,6 +1165,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // notification at all, so both spellings mean the same thing.
                 if id == CANCEL_ID && (notification == BN_CLICKED || notification == 0) {
                     let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
+                }
+                if id == FOLDER_ID && notification == BN_CLICKED {
+                    state.open_language_folder();
+                    return LRESULT(0);
+                }
+                if id >= LANG_BASE && notification == BN_CLICKED {
+                    let at = (id - LANG_BASE) as usize;
+                    if at < state.lang_tags.len() {
+                        state.choose_lang(at);
+                    }
                     return LRESULT(0);
                 }
                 LRESULT(0)
@@ -2296,11 +2506,9 @@ unsafe fn send(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
 }
 
 fn make_fonts(scale: f32) -> [HFONT; 4] {
-    let face = if crate::i18n::is_chinese() {
-        w!("Microsoft YaHei UI")
-    } else {
-        w!("Segoe UI")
-    };
+    // The face comes from the language in force, which knows whether its own
+    // strings need Chinese glyphs and whether a pack asked for something else.
+    let face = crate::i18n::ui_face();
     [
         font(scale, 13.0, FW_NORMAL.0 as i32, face),
         font(scale, 11.5, FW_NORMAL.0 as i32, face),
@@ -2335,6 +2543,118 @@ fn font(scale: f32, size: f32, weight: i32, face: PCWSTR) -> HFONT {
     }
 }
 
+/// One log line per string the panel has to cut. A shortened sentence and a
+/// truncated one look the same to somebody who does not read the language, so the
+/// alternative to guessing is to say which key went over its band.
+fn warn_cut(state: &State) {
+    let l = state.layout;
+    let rows: Vec<(&str, String, RECT, usize)> = vec![
+        (
+            "settings_group_keys",
+            t("settings_group_keys").into(),
+            l.head_keys,
+            F_HEAD,
+        ),
+        (
+            "settings_group_line",
+            t("settings_group_line").into(),
+            l.head_line,
+            F_HEAD,
+        ),
+        (
+            "settings_lang",
+            t("settings_lang").into(),
+            l.head_lang,
+            F_HEAD,
+        ),
+        (
+            "settings_hang",
+            t("settings_hang").into(),
+            l.label_hang,
+            F_TITLE,
+        ),
+        (
+            "settings_toggle",
+            t("settings_toggle").into(),
+            l.label_toggle,
+            F_TITLE,
+        ),
+        (
+            "settings_sag_note",
+            t("settings_sag_note").into(),
+            l.sag_note,
+            F_NOTE,
+        ),
+        (
+            "settings_always_note",
+            t("settings_always_note").into(),
+            l.always_note,
+            F_NOTE,
+        ),
+        (
+            "settings_drag_note",
+            t("settings_drag_note").into(),
+            l.drag_note,
+            F_NOTE,
+        ),
+        (
+            "settings_stay_note",
+            t("settings_stay_note").into(),
+            l.stay_note,
+            F_NOTE,
+        ),
+        (
+            "settings_lang_note",
+            t("settings_lang_note").into(),
+            l.lang_note,
+            F_NOTE,
+        ),
+        ("lang_folder", t("lang_folder").into(), l.folder, F_BUTTON),
+        ("settings_save", t("settings_save").into(), l.save, F_BUTTON),
+        (
+            "settings_cancel",
+            t("settings_cancel").into(),
+            l.cancel,
+            F_BUTTON,
+        ),
+    ]
+    .into_iter()
+    .chain(
+        state
+            .lang_tags
+            .iter()
+            .take(l.lang_count)
+            .enumerate()
+            .map(|(at, (_, name))| ("_name", name.clone(), l.lang[at], F_BUTTON)),
+    )
+    .collect();
+    // A caption that reaches the rounded corner of a button reads as cut even
+    // when the last letter is still there.
+    let button_room = (RADIUS * 2.0 * state.scale).round() as i32;
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return;
+        }
+        for (key, text, rect, font) in rows {
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let old = SelectObject(dc, HGDIOBJ(state.fonts[font].0));
+            let mut size = SIZE::default();
+            let measured = GetTextExtentPoint32W(dc, &wide, &mut size).as_bool();
+            SelectObject(dc, old);
+            let spare = if font == F_BUTTON { button_room } else { 0 };
+            let band = rect.right - rect.left - spare;
+            if measured && band > 0 && size.cx > band {
+                crate::log!(
+                    "the panel has no room for {key}: {cx}px in {band}px",
+                    cx = size.cx
+                );
+            }
+        }
+        let _ = DeleteDC(dc);
+    }
+}
+
 fn message(parent: HWND, text: &str) {
     let text = wstr(text);
     let title = wstr(t("settings_title"));
@@ -2359,23 +2679,26 @@ mod tests {
     use super::*;
     use tiny_skia::{IntSize, PixmapPaint};
 
-    /// The measure is the window: `LOGICAL_H` is `measure` walked with the same
+    /// The measure is the window: `logical_h` is `measure` walked with the same
     /// constants, so the panel can never outgrow its own frame or float inside a
     /// taller one. Checked at the scales a person actually runs.
     #[test]
     fn the_window_is_exactly_as_tall_as_its_rows() {
+        // Three languages is what the folder offers on a fresh install: the
+        // system plus the two the program ships.
+        const LANGS: usize = 3;
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
-            let l = measure((LOGICAL_W * scale).round() as i32, scale);
+            let l = measure((LOGICAL_W * scale).round() as i32, scale, LANGS);
             assert_eq!(l.head_keys.top, (PAD * scale).round() as i32);
             // The walk and the sum are the same content; they can only part
             // company by the rounding of their parts. A row missing from
             // `LOGICAL_H`, or one the panel stopped drawing, is off by tens.
             let measured = l.save.bottom as f32 + PAD_BOTTOM * scale;
             assert!(
-                (measured - LOGICAL_H * scale).abs() <= 1.0,
+                (measured - logical_h(LANGS) * scale).abs() <= 1.0,
                 "the panel is not the height it claims at scale {scale}: the rows end at \
                  {measured}, the window is {}",
-                LOGICAL_H * scale
+                logical_h(LANGS) * scale
             );
 
             // Rows go down the page and never run into each other.
@@ -2391,6 +2714,10 @@ mod tests {
                 l.always_title,
                 l.drag_title,
                 l.stay_title,
+                l.rule_c,
+                l.head_lang,
+                l.lang[0],
+                l.lang_note,
                 l.save,
             ];
             for pair in rows.windows(2) {
@@ -2405,12 +2732,46 @@ mod tests {
             assert!(l.switch_stay.left >= l.stay_title.right);
             assert_eq!(l.save.bottom, l.cancel.bottom);
             assert!(l.cancel.right < l.save.left);
+            assert_eq!(l.folder.top, l.save.top);
+            // The door to the language files is on the left, so it cannot be read
+            // as a third decision button beside Save.
+            assert!(l.folder.right < l.cancel.left);
             // The note is the second line of its item, so it must still be
             // inside the band the item was given.
             assert!(l.always_note.bottom <= l.always_title.top + (ITEM_H * scale).round() as i32);
             assert!(l.drag_note.bottom <= l.drag_title.top + (ITEM_H * scale).round() as i32);
             assert!(l.stay_note.bottom <= l.stay_title.top + (ITEM_H * scale).round() as i32);
         }
+    }
+
+    /// The language buttons divide the row they are given, and a folder holding a
+    /// new one makes the panel taller rather than the buttons narrower.
+    #[test]
+    fn the_language_row_divides_what_it_is_given() {
+        let width = (LOGICAL_W).round() as i32;
+        let three = measure(width, 1.0, 3);
+        assert_eq!(three.lang[0].left, (PAD).round() as i32);
+        // Three choices fill one row between them: the row is shared, so the
+        // last button ends where the panel's content area does.
+        assert!(three.lang[1].left >= three.lang[0].right);
+        assert!(three.lang[2].right <= width - PAD as i32 + SEG_GAP as i32);
+        // A row holds SEG_PER_ROW, so the fifth choice - not the fourth - is what
+        // starts the second row and makes the panel taller.
+        let four = measure(width, 1.0, 4);
+        assert_eq!(lang_rows(4), 1);
+        assert_eq!(four.lang[3].top, four.lang[0].top);
+        let five = measure(width, 1.0, 5);
+        assert_eq!(lang_rows(5), 2);
+        assert_eq!(five.lang[4].top, five.lang[0].bottom + SEG_ROW_GAP as i32);
+        assert!(logical_h(5) > logical_h(4));
+        // Every button stays inside the group it was drawn for.
+        for at in 0..4 {
+            assert!(four.lang[at].bottom <= four.head_lang.bottom + (lang_group_h(1)) as i32);
+        }
+        // A folder nobody has touched offers the shipped two plus the system.
+        assert_eq!(lang_rows(3), 1);
+        assert_eq!(lang_rows(0), 1);
+        assert_eq!(lang_rows(99), MAX_LANG_ROW);
     }
 
     /// The box tells "nothing is set" from "I am listening" from "this is what is

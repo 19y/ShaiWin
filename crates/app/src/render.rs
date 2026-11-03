@@ -121,6 +121,20 @@ impl Painter {
         self.sprites.remove(&id);
     }
 
+    /// Every cached picture, for the one change that alters what a card says
+    /// without altering its shape: the language. A sprite is keyed by thumbnail,
+    /// size and tag, and a label by the words, their size and their colour - none
+    /// of which is the *face* they were drawn with. Switch from a Chinese line to
+    /// a Russian one and "ShaiWin" is the same text in the same size in the same
+    /// colour, so both caches have to go.
+    pub fn forget_sprites(&mut self) {
+        self.sprites.clear();
+        self.labels.clear();
+        if let Some(text) = self.text.as_mut() {
+            text.forget_fonts();
+        }
+    }
+
     /// Text rendered once and reused. The key is the text, the size and the colour.
     fn label(&mut self, text: &str, px: f32, rgb: (u8, u8, u8)) -> Option<&Pixmap> {
         let key = format!("{text}|{px:.2}|{rgb:?}");

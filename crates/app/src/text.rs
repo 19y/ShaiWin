@@ -14,13 +14,12 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GdiFlush,
-    GetTextExtentPoint32W, GetTextMetricsW, SelectObject, SetBkMode, SetTextColor, TextOutW,
-    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS,
+    GetStockObject, GetTextExtentPoint32W, GetTextMetricsW, SelectObject, SetBkMode, SetTextColor,
+    TextOutW, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HDC,
-    HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT,
+    HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, SYSTEM_FONT, TEXTMETRICW, TRANSPARENT,
 };
 
-const FACE: windows::core::PCWSTR = w!("Microsoft YaHei UI");
 const FALLBACK_FACE: windows::core::PCWSTR = w!("Segoe UI");
 const PAD: i32 = 2;
 
@@ -46,6 +45,21 @@ impl Text {
         })
     }
 
+    /// The fonts are per size and weight, and the face they were made with is
+    /// the language's. A switch asks for new ones, so this drops them - after
+    /// putting a stock font back in the DC, because a font that is still selected
+    /// cannot be deleted.
+    pub fn forget_fonts(&mut self) {
+        unsafe {
+            SelectObject(self.dc, GetStockObject(SYSTEM_FONT));
+        }
+        for (_, (font, _)) in self.fonts.drain() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(font.0));
+            }
+        }
+    }
+
     /// The font for `px` and the height of its cell. Selecting it into the DC
     /// is part of getting it, because both measuring and drawing read the
     /// selected font.
@@ -57,7 +71,7 @@ impl Text {
             }
             return Some(*cell);
         }
-        let mut font = unsafe { make_font(key.0, weight, FACE) };
+        let mut font = unsafe { make_font(key.0, weight, crate::i18n::ui_face()) };
         if font.is_invalid() {
             font = unsafe { make_font(key.0, weight, FALLBACK_FACE) };
         }

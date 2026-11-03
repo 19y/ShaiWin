@@ -18,6 +18,7 @@ public static class W {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
@@ -169,8 +170,10 @@ function Find-By-Title([string]$want) {
 }
 
 # A handle is never true or false to PowerShell on its own: IntPtr.Zero is
-# truthy, so every comparison against it has to be spelled out.
-function Test-Window([IntPtr]$h) { return $h -ne [IntPtr]::Zero }
+# truthy, so every comparison against it has to be spelled out. And a handle the
+# app has already destroyed is a perfectly good number - so a test that asks
+# "did that window go away" has to ask Windows, not the variable.
+function Test-Window([IntPtr]$h) { return ($h -ne [IntPtr]::Zero) -and [W]::IsWindow($h) }
 
 function Get-Overlay { Find-By-Class "ShaiWin.Line" }
 
@@ -449,6 +452,16 @@ function Wait-Visibility([IntPtr]$h, [bool]$want, [int]$timeoutMs) {
 # inhibits the very write it is waiting for - it then sees a record that is only
 # still there because of the test. CreateFile with all three sharing modes is
 # what a bystander means to do.
+function Assert-NoCut([string]$state, [string]$where) {
+  # The settings panel measures every line before it draws and logs the ones it
+  # has to cut, so a translation that overflows is a failing test rather than a
+  # sentence the reader has to guess the end of.
+  $log = @(Read-SharedText (Join-Path $state "ShaiWin\shaiwin.log"))
+  $cut = @($log | Where-Object { $_ -match "has no room" })
+  if ($cut.Count -gt 0) { Fail "$where cut a line:`n$($cut -join "`n")" }
+  Write-Host "  nothing was cut $where"
+}
+
 function Read-SharedText([string]$path) {
   if (-not (Test-Path $path)) { return @() }
   # 1 = FILE_READ_DATA, 7 = read|write|delete sharing, 3 = OPEN_EXISTING,
@@ -494,6 +507,8 @@ function Read-Journal([string]$path) {
       # with its card still hanging: nothing is waiting to be put back.
       Shown = ($f.Length -ge 19 -and $f[18] -eq "1")
       Fields = $f
+      # The card's own word, when the user wrote one. Column 18.
+      Tag = $(if ($f.Length -ge 18) { $f[17] } else { "" })
     }
   })
 }
